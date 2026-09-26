@@ -4,7 +4,7 @@ A stripped fork of [tezuka_fw](https://github.com/F5OEO/tezuka_fw) for
 **PlutoSky R2** and **LibreSDR** (Zynq-7020 + AD936x). It turns one of these
 boards into:
 
-* a **headless remote transceiver** (SQTRV): SSB, CW and data modes over
+* a **headless remote transceiver** (SQTRX): SSB, CW and data modes over
   **TCI** and **Hamlib rigctld** (FT8 is left to WSJT-X on the PC), with
   on-board Q65/PI4 decoders and a live CW decoder, published to **MQTT**, and
   low-rate **DATV** (DVB-S2 from and to the browser's camera; docs/DATV.md); or

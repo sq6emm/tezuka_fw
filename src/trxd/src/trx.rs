@@ -228,9 +228,13 @@ pub struct Trx {
     rx_quiet_until: Option<Instant>,
     modulator: Option<Box<dyn Modulator>>,
     datv: Option<Datv>,
+    /// DATV mode (the web UI's DATV button): no voice chain; the DVB-S2
+    /// receiver runs, and a browser may send.
+    datv_mode: bool,
     /// DATV reception (DVB-S2 receiver thread), when switched on.
     datv_rx: Option<crate::dvbs2::rx::RxThread>,
     datv_rx_stats: crate::dvbs2::rx::Stats,
+    datv_rx_log: Instant,
     duc: Duc,
     tx_nco: Nco,
     keyer: CwKeyer,
@@ -423,8 +427,10 @@ impl Trx {
             rx_quiet_until: None,
             modulator: None,
             datv: None,
+            datv_mode: false,
             datv_rx: None,
             datv_rx_stats: Default::default(),
+            datv_rx_log: Instant::now(),
             duc: Duc::new(CH_RATE, rate),
             tx_nco: Nco::new(0.0, rate),
             keyer: CwKeyer::new(CH_RATE, CW_PITCH_HZ, cfg.trx.cw_wpm as f32),
@@ -797,6 +803,36 @@ impl Trx {
             return;
         }
         info!(sr, rate = rate.label(), pilots, ts_rate = ts_rate.round(), video_bps = video_bps.round(), ?profile, "DATV on");
+    }
+
+    /// Start (or restart) the DVB-S2 receiver on the RX frequency.
+    fn datv_rx_start(&mut self, sr: f64, rate: &str, pilots: bool) {
+        use crate::dvbs2::{Params, Rate};
+        self.datv_rx = None;
+        self.datv_rx_stats = Default::default();
+        let sps = self.rate / sr;
+        match Rate::parse(rate) {
+            Some(rate) if DATV_RATES.contains(&sr) && (sps - sps.round()).abs() < 1e-9 => {
+                let p = Params { rate, pilots, rolloff: 0.35 };
+                info!(sr, rate = rate.label(), "DATV receive on");
+                self.datv_rx = Some(crate::dvbs2::rx::RxThread::start(p, self.rate, sr, self.rx_eff() - self.center));
+            }
+            _ => warn!(sr, rate, "DATV receive: symbol rate or code rate not offered"),
+        }
+    }
+
+    /// Out of DATV mode: receiver off, a DATV transmission ends.
+    fn datv_leave(&mut self) {
+        if !self.datv_mode {
+            return;
+        }
+        self.datv_mode = false;
+        self.datv_rx = None;
+        self.datv_rx_stats = Default::default();
+        if matches!(self.tx_on, Some(TxSource::Datv(_))) {
+            self.unkey();
+        }
+        info!("DATV mode off");
     }
 
     fn datv_json(&self) -> serde_json::Value {
@@ -1172,7 +1208,11 @@ impl Trx {
             nb.process(&mut self.chan);
         }
         self.audio.clear();
-        if self.narrow {
+        if self.datv_mode {
+            // DATV mode: nothing to demodulate (the DVB-S2 receiver has the IQ);
+            // silence of the same length keeps the rest of the chain in step.
+            self.audio.resize(if self.narrow { self.chan.len() / 4 } else { self.chan.len() }, 0.0);
+        } else if self.narrow {
             self.chan12.clear();
             self.dec4.process(&self.chan, &mut self.chan12);
             self.demod.process(&self.chan12, &mut self.audio);
@@ -1195,20 +1235,20 @@ impl Trx {
             let reading = self.s_dbfs as f64 - self.hw_gain_db;
             self.reading_db += (reading - self.reading_db) * 0.03;
         }
-        if let Some(n) = &mut self.notch {
+        if let Some(n) = self.notch.as_mut().filter(|_| !self.datv_mode) {
             n.process(&mut self.audio);
         }
-        if let Some(n) = &mut self.nr {
+        if let Some(n) = self.nr.as_mut().filter(|_| !self.datv_mode) {
             n.process(&mut self.audio);
         }
-        if self.mode == Mode::Cw && self.tx_on.is_none() {
+        if self.mode == Mode::Cw && self.tx_on.is_none() && !self.datv_mode {
             self.cw_audio.clear();
             self.cw_audio.extend_from_slice(&self.audio);
             self.cw_agc.process(&mut self.cw_audio);
             self.cwlive.set_band(self.filter.0, self.filter.1);
             self.cwlive.audio(&self.cw_audio);
         }
-        if !quiet {
+        if !quiet && !self.datv_mode {
             self.agc.process(&mut self.audio);
         }
         // Squelch on the channel power, 2 dB of hysteresis.
@@ -1238,7 +1278,7 @@ impl Trx {
                 self.web_audio.resize(self.web_audio.len() + self.audio12.len(), 0.0);
             }
             if self.web_audio.len() >= 480 {
-                if let Some(w) = &self.web {
+                if let Some(w) = self.web.as_ref().filter(|_| !self.datv_mode) {
                     w.send_audio(&self.web_audio);
                 }
                 self.web_audio.clear();
@@ -1633,6 +1673,7 @@ impl Trx {
             "scope_center": self.scope_center,
             "mute_at_tx": self.settings.mute_at_tx,
             "datv": self.datv_json(),
+            "datv_mode": self.datv_mode,
             "datv_rx": self.datv_rx.as_ref().map(|r| serde_json::json!({"sr": r.sr, "rate": r.params.rate.label(), "pilots": r.params.pilots})),
             "xvtr": self.xvtr.as_ref().map(|t| t.name.clone()),
             "xvtrs": self.settings.transverters,
@@ -1666,6 +1707,25 @@ impl Trx {
         if let Some(r) = &self.datv_rx {
             let (stats, msgs) = r.take();
             self.datv_rx_stats = stats;
+            // A trace in the log every 10 s: how a reception went, afterwards.
+            if self.datv_rx_log.elapsed() >= Duration::from_secs(10) {
+                self.datv_rx_log = Instant::now();
+                let s = &stats;
+                info!(
+                    locked = s.locked,
+                    esn0 = format!("{:.1}", s.esn0_db),
+                    mer = format!("{:.1}", s.data_esn0_db),
+                    carrier_hz = s.freq_hz.round(),
+                    frames = s.frames,
+                    bad = s.frames_bad,
+                    skipped = s.frames_skipped,
+                    fec_busy = s.frames_fec_busy,
+                    iq_dropped = s.blocks_dropped,
+                    demod_pct = (100.0 * s.other_s / s.wall_s.max(1e-9)).round(),
+                    fec_pct = (100.0 * s.ldpc_s / s.wall_s.max(1e-9)).round(),
+                    "DATV receive"
+                );
+            }
             if w.clients() > 0 {
                 for m in msgs {
                     w.send_bin(m);
@@ -1685,6 +1745,7 @@ impl Trx {
             let datv = self.datv.as_ref().map(|d| serde_json::json!({"backlog": (d.mux.backlog_s() * 10.0).round() / 10.0, "dropped": d.mux.dropped_frames}));
             let s = &self.datv_rx_stats;
             let datv_rx = self.datv_rx.as_ref().map(|_| serde_json::json!({"locked": s.locked, "esn0": (s.esn0_db * 10.0).round() / 10.0,
+                "mer": (s.data_esn0_db * 10.0).round() / 10.0,
                 "freq": s.freq_hz.round(), "frames": s.frames, "bad": s.frames_bad, "packets": s.packets,
                 "dropped": s.blocks_dropped, "skipped": s.frames_skipped, "busy": s.frames_fec_busy,
                 "demod_pct": (100.0 * s.other_s / s.wall_s.max(1e-9)).round(), "fec_pct": (100.0 * s.ldpc_s / s.wall_s.max(1e-9)).round()}));
@@ -1714,6 +1775,8 @@ impl Trx {
                 }
             }
             "mode" => {
+                // Any voice mode leaves DATV mode.
+                self.datv_leave();
                 if let Some(md) = m["mode"].as_str().and_then(sdroxide_rigctld::from_hamlib_mode) {
                     self.set_mode(md);
                 }
@@ -1724,8 +1787,9 @@ impl Trx {
                 }
             }
             // DATV has its own start/stop (and stops when its page goes
-            // quiet); voice PTT, pressed or released, leaves it alone.
-            "ptt" if matches!(self.tx_on, Some(TxSource::Datv(_))) => {
+            // quiet); voice PTT, pressed or released, leaves it alone. In DATV
+            // mode there is no voice to send.
+            "ptt" if matches!(self.tx_on, Some(TxSource::Datv(_))) || self.datv_mode => {
                 debug!("PTT ignored: DATV is transmitting");
             }
             "ptt" => {
@@ -1746,21 +1810,19 @@ impl Trx {
                 }
             }
             "tune" => self.apply(Command::SetTune(on)),
+            "datv_mode" => {
+                if on {
+                    self.datv_mode = true;
+                    self.datv_rx_start(num("sr").unwrap_or(64_000.0), m["rate"].as_str().unwrap_or("1/2"), m["pilots"].as_bool().unwrap_or(true));
+                } else {
+                    self.datv_leave();
+                }
+            }
             "datv_rx" => {
                 self.datv_rx = None;
                 self.datv_rx_stats = Default::default();
                 if on {
-                    use crate::dvbs2::{Params, Rate};
-                    let sr = num("sr").unwrap_or(64_000.0);
-                    let sps = self.rate / sr;
-                    match Rate::parse(m["rate"].as_str().unwrap_or("1/2")) {
-                        Some(rate) if DATV_RATES.contains(&sr) && (sps - sps.round()).abs() < 1e-9 => {
-                            let p = Params { rate, pilots: m["pilots"].as_bool().unwrap_or(true), rolloff: 0.35 };
-                            info!(sr, rate = rate.label(), "DATV receive on");
-                            self.datv_rx = Some(crate::dvbs2::rx::RxThread::start(p, self.rate, sr, self.rx_eff() - self.center));
-                        }
-                        _ => warn!(sr, "DATV receive: symbol rate or code rate not offered"),
-                    }
+                    self.datv_rx_start(num("sr").unwrap_or(64_000.0), m["rate"].as_str().unwrap_or("1/2"), m["pilots"].as_bool().unwrap_or(true));
                 }
             }
             "datv" => {

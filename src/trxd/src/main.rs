@@ -103,6 +103,16 @@ fn main() -> ExitCode {
                     }
                 };
             }
+            "--ldpc-file" => {
+                let rest: Vec<String> = args.by_ref().collect();
+                return match dvbs2::ldpc::file_cli(&rest) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        error!("{e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
             "--ldpc-helper" => {
                 let rest: Vec<String> = args.by_ref().collect();
                 return match dvbs2::ldpc::helper_cli(&rest) {

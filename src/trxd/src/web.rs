@@ -10,7 +10,10 @@
 //!   - binary frames in: `[3][u8...]` 12 kHz mu-law microphone audio;
 //!     `[4][flags][i64 us][H.264]` and `[5][i64 us][Opus]` DATV video and
 //!     audio (see [`crate::dvbs2::ts::Media::from_ws`]), from the client
-//!     that holds the transmitter only.
+//!     that holds the transmitter only;
+//!   - binary frames out for DATV reception: `[6]` video, `[7]` audio (see
+//!     [`crate::dvbs2::ts::Demux`]), `[8][i8 re, i8 im]...` the constellation
+//!     of the last frame (ideal QPSK points at +-40).
 //! * Port 80 only redirects to HTTPS: browsers give the microphone to secure
 //!   pages alone.
 //!

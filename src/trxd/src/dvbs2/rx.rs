@@ -104,6 +104,11 @@ pub struct Receiver {
     fec: FecMode,
     llr: Vec<f32>,
     pub stats: Stats,
+    /// Constellation of the last frame: about 256 corrected, descrambled data
+    /// symbols, scaled so the ideal QPSK points are (+-40, +-40).
+    pub constellation: Vec<[i8; 2]>,
+    /// Frames the constellation has been taken from (to see a new one).
+    pub constellation_seq: u64,
 }
 
 /// LDPC + BBFRAME -> TS: the expensive part, which can run on its own core.
@@ -228,6 +233,8 @@ impl Receiver {
             fec: FecMode::Inline(Fec::new(p)),
             llr: vec![0.0; NLDPC],
             stats: Stats::default(),
+            constellation: Vec::new(),
+            constellation_seq: 0,
         }
     }
 
@@ -536,6 +543,8 @@ impl Receiver {
         // Data symbols: derotate, descramble, LLRs (positive = 0).
         let scale = 2.0 * std::f32::consts::SQRT_2 * amp / sigma2 * a * std::f32::consts::SQRT_2;
         let (mut dd_sig, mut dd_err) = (0f32, 0f32);
+        self.constellation.clear();
+        let unit = 40.0 / (amp * a).max(1e-9);
         let mut n = 0usize; // data symbol index
         let mut k = SLOT; // position in the frame
         let mut pilot = 1usize;
@@ -553,16 +562,29 @@ impl Receiver {
             let dec = Complex32::new(amp * a * d.re.signum(), amp * a * d.im.signum());
             dd_sig += dec.norm_sqr();
             dd_err += (d - dec).norm_sqr();
+            if n % 32 == 0 {
+                let q = |v: f32| (v * unit).round().clamp(-127.0, 127.0) as i8;
+                self.constellation.push([q(d.re), q(d.im)]);
+            }
             n += 1;
             k += 1;
         }
         self.stats.data_esn0_db = 10.0 * (dd_sig / dd_err.max(1e-9)).log10();
+        self.constellation_seq += 1;
         self.stats.frames += 1;
         // Far below what this rate decodes (no signal, carrier wrong): the
         // decoder would only burn CPU. It counts as a failure.
         let hopeless = self.stats.esn0_db < hopeless_below(self.p.rate);
         let fails = match &mut self.fec {
             FecMode::Inline(f) => {
+                // Debug: DVBS2_DUMP_LLR=<file> appends each frame's LLRs (f32 LE).
+                if let Some(path) = std::env::var_os("DVBS2_DUMP_LLR") {
+                    use std::io::Write;
+                    if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                        let b: Vec<u8> = self.llr.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        let _ = fh.write_all(&b);
+                    }
+                }
                 if hopeless {
                     self.stats.frames_bad += 1;
                     self.stats.frames_skipped += 1;
@@ -677,9 +699,10 @@ impl RxThread {
     pub fn start(p: Params, fs: f64, sr: f64, center_hz: f64) -> Self {
         use std::sync::{Arc, Mutex, atomic::AtomicU32, atomic::Ordering};
         let (tx, rx) = crossbeam_channel::bounded::<(Vec<Complex32>, f64)>(64);
-        // A few frames of slack between demodulator and decoder: if decoding
-        // falls behind, whole frames are skipped and timing stays intact.
-        let (ftx, frx) = crossbeam_channel::bounded::<Vec<f32>>(4);
+        // Slack between demodulator and decoder: about 2 s at 64 kS/s absorbs
+        // bursts of hard frames near the threshold (4 was too few over the
+        // air); beyond it whole frames are skipped and timing stays intact.
+        let (ftx, frx) = crossbeam_channel::bounded::<Vec<f32>>(16);
         let fails = Arc::new(AtomicU32::new(0));
         let shared = Arc::new(Mutex::new(RxShared::default()));
         let fec_stats = Arc::new(Mutex::new(Stats::default()));
@@ -719,10 +742,20 @@ impl RxThread {
                 let mut r = Receiver::new(p, fs, sr, center_hz);
                 r.fec = FecMode::Thread { tx: ftx, fails };
                 let mut none = Vec::new();
+                let mut seen = 0;
                 for (iq, center) in rx {
                     r.set_center(center);
                     r.process(&iq, &mut none);
-                    sh.lock().unwrap().stats = r.stats;
+                    let mut s = sh.lock().unwrap();
+                    s.stats = r.stats;
+                    // The constellation, for the browser: [8][re, im as i8]...
+                    if r.constellation_seq != seen {
+                        seen = r.constellation_seq;
+                        let mut m = Vec::with_capacity(1 + 2 * r.constellation.len());
+                        m.push(8u8);
+                        m.extend(r.constellation.iter().flat_map(|p| [p[0] as u8, p[1] as u8]));
+                        s.msgs.push_back(m);
+                    }
                 }
             })
             .expect("spawn datv-rx");

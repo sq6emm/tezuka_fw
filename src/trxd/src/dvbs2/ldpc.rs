@@ -27,6 +27,40 @@ fn corr(x: f32) -> f32 {
     t.get((x * STEP) as usize).copied().unwrap_or(0.0)
 }
 
+/// phi(x) = -ln(tanh(x / 2)) = ln((e^x + 1) / (e^x - 1)), its own inverse:
+/// the check rule is phi(sum of phi(|L|)) over the other edges. Tables in
+/// the middle (steps of 1/1024 below 1, where phi is steep; 1/64 up to 16);
+/// outside them it is computed, in f64:
+/// - above 16, phi(x) = 2 e^-x: a table that returned 0 there made every
+///   strong edge vanish from the sum, and a check with only strong other
+///   edges then sent the cap (40) instead of about the weakest of them;
+/// - below 1/1024, phi(x) = ln(2 / x): a table value capped every message
+///   at 8.3.
+/// Real LLRs reach 100; with either shortcut half the frames of a real
+/// recording failed that box-plus decoded.
+#[inline]
+fn phi(x: f64) -> f64 {
+    const FINE: f64 = 1024.0;
+    const COARSE: f64 = 64.0;
+    static TABLES: std::sync::OnceLock<(Vec<f32>, Vec<f32>)> = std::sync::OnceLock::new();
+    let f = |x: f64| (-(x / 2.0).tanh().ln()) as f32;
+    let (fine, coarse) = TABLES.get_or_init(|| {
+        (
+            (0..FINE as usize).map(|i| f((i as f64 + 0.5) / FINE)).collect(),
+            (0..16 * COARSE as usize).map(|i| f((i as f64 + 0.5) / COARSE)).collect(),
+        )
+    });
+    if x < 1.0 / FINE {
+        (2.0 / x.max(1e-300)).ln().min(LLR_MAX as f64)
+    } else if x < 1.0 {
+        fine[(x * FINE) as usize] as f64
+    } else if x < 16.0 {
+        coarse[(x * COARSE) as usize] as f64
+    } else {
+        2.0 * (-x).exp()
+    }
+}
+
 /// L(a xor b) from L(a) and L(b), exactly.
 #[inline]
 fn boxplus(a: f32, b: f32) -> f32 {
@@ -44,8 +78,18 @@ pub struct Decoder {
     post: Vec<f32>,
     fwd: Vec<f32>,
     ext: Vec<f32>,
+    extd: Vec<f64>,
     pub max_iter: usize,
+    /// Normalized min-sum instead of the exact rule: half the work, but it
+    /// costs 1.5 dB at 1/2 and 3-4 dB at 1/4 and 1/3 (measured). Off.
+    pub min_sum: bool,
+    /// The exact rule in its phi (tanh) form: one table look-up per edge in
+    /// and one out, instead of four for the forward/backward box-plus.
+    pub phi: bool,
 }
+
+/// Min-sum normalization.
+const ALPHA: f32 = 0.75;
 
 impl Decoder {
     pub fn new(rate: Rate) -> Self {
@@ -84,7 +128,10 @@ impl Decoder {
             post: vec![0.0; NLDPC],
             fwd: vec![0.0; dmax],
             ext: vec![0.0; dmax],
+            extd: vec![0.0; dmax],
             max_iter: 50,
+            min_sum: std::env::var("DVBS2_LDPC").is_ok_and(|v| v == "minsum"),
+            phi: !std::env::var("DVBS2_LDPC").is_ok_and(|v| v == "boxplus" || v == "minsum"),
         }
     }
 
@@ -100,6 +147,57 @@ impl Decoder {
         for it in 1..=self.max_iter {
             for j in 0..checks {
                 let (a, b) = (self.start[j] as usize, self.start[j + 1] as usize);
+                if self.min_sum {
+                    let (mut min1, mut min2, mut idx, mut neg) = (f32::MAX, f32::MAX, 0usize, false);
+                    for e in a..b {
+                        let v = self.vars[e] as usize;
+                        let t = self.post[v] - self.msg[e];
+                        self.post[v] = t;
+                        let m = t.abs();
+                        neg ^= t < 0.0;
+                        if m < min1 {
+                            min2 = min1;
+                            min1 = m;
+                            idx = e;
+                        } else if m < min2 {
+                            min2 = m;
+                        }
+                    }
+                    let (m1, m2) = (ALPHA * min1, ALPHA * min2);
+                    for e in a..b {
+                        let v = self.vars[e] as usize;
+                        let t = self.post[v];
+                        let mag = if e == idx { m2 } else { m1 };
+                        let r = if neg ^ (t < 0.0) { -mag } else { mag };
+                        self.msg[e] = r;
+                        self.post[v] = t + r;
+                    }
+                    continue;
+                }
+                if self.phi {
+                    // The sum in f64: "sum - own" for the one weak edge among
+                    // strong ones must keep the others' tiny terms (1e-7),
+                    // which f32 cancels to 0 (a message of 40 instead of ~15).
+                    let (mut sum, mut neg) = (0f64, false);
+                    for e in a..b {
+                        let v = self.vars[e] as usize;
+                        let t = (self.post[v] - self.msg[e]).clamp(-LLR_MAX, LLR_MAX);
+                        self.post[v] = t;
+                        let f = phi(t.abs() as f64);
+                        self.extd[e - a] = f;
+                        sum += f;
+                        neg ^= t < 0.0;
+                    }
+                    for e in a..b {
+                        let v = self.vars[e] as usize;
+                        let t = self.post[v];
+                        let mag = phi((sum - self.extd[e - a]).max(0.0)) as f32;
+                        let r = if neg ^ (t < 0.0) { -mag } else { mag };
+                        self.msg[e] = r;
+                        self.post[v] = t + r;
+                    }
+                    continue;
+                }
                 let d = b - a;
                 // Variable-to-check messages, and their running box-plus from the left.
                 for i in 0..d {
@@ -152,6 +250,32 @@ impl Decoder {
             })
             .count()
     }
+}
+
+/// `trxd --ldpc-file LLRS RATE`: decode a dump of LLR frames (f32 LE, 16200
+/// a frame) with each algorithm; a debugging aid.
+pub fn file_cli(args: &[String]) -> Result<(), String> {
+    let path = args.first().ok_or("LLRS")?;
+    let rate = args.get(1).and_then(|s| Rate::parse(s)).ok_or("RATE")?;
+    let raw = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let llr: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    for (ms, ph, name) in [(false, false, "box-plus"), (false, true, "phi"), (true, false, "min-sum")] {
+        let mut dec = Decoder::new(rate);
+        dec.min_sum = ms;
+        dec.phi = ph;
+        let mut bits = vec![0u8; NLDPC];
+        let (mut ok, mut fails) = (0, Vec::new());
+        for (i, f) in llr.chunks_exact(NLDPC).enumerate() {
+            if dec.decode(f, &mut bits).is_some() {
+                ok += 1;
+            } else {
+                fails.push(i);
+            }
+        }
+        let big = llr.iter().fold(0f32, |m, v| m.max(v.abs()));
+        eprintln!("{name:>8}: {ok} decoded, failed {:?} (max |LLR| {big:.1})", &fails[..fails.len().min(12)]);
+    }
+    Ok(())
 }
 
 /// `trxd --ldpc-helper --modcod N [--shortframes]` for leandvb.
@@ -267,14 +391,55 @@ mod tests {
         }
     }
 
+    /// Real receivers hand over large LLRs (up to 100) and now and then a
+    /// strongly wrong bit; the phi decoder once capped its messages and failed
+    /// half of such frames (a real recording at Es/N0 8.5 dB). Every variant
+    /// that decodes these must fix them.
+    #[test]
+    fn strong_and_strongly_wrong_llrs_still_decode() {
+        let rate = Rate::R1_2;
+        let fec = Fec::new(rate);
+        let sigma = (10f32.powf(-(8.5 - 3.0) / 10.0) / 2.0).sqrt();
+        let mut seed = 11u64;
+        for f in 0..8usize {
+            let bb: Vec<u8> = (0..rate.kbch() / 8).map(|i| (i * 29 + f * 3 + 1) as u8).collect();
+            let cw = fec.encode(&bb);
+            let mut llr: Vec<f32> = cw
+                .iter()
+                .map(|&b| {
+                    let y = if b == 0 { 1.0 } else { -1.0 } + sigma * gauss(&mut seed);
+                    6.0 * 2.0 * y / (sigma * sigma) // overconfident: |LLR| around 75
+                })
+                .collect();
+            // A few bits confidently wrong (a burst, an impulse).
+            for k in 0..25usize {
+                let i = (k * 641 + f * 97) % NLDPC;
+                llr[i] = if cw[i] == 0 { -40.0 } else { 40.0 };
+            }
+            for (ms, ph) in [(false, false), (false, true)] {
+                let mut dec = Decoder::new(rate);
+                dec.min_sum = ms;
+                dec.phi = ph;
+                let mut bits = vec![0u8; NLDPC];
+                let ok = dec.decode(&llr, &mut bits).is_some() && bits == cw;
+                assert!(ok, "frame {f}, {}", if ph { "phi" } else { "box-plus" });
+            }
+        }
+    }
+
     /// Frame error rate against Es/N0 (QPSK): `cargo test fer_sweep -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn fer_sweep() {
         for rate in [Rate::R1_4, Rate::R1_3, Rate::R1_2, Rate::R2_3] {
+          for (ms, ph) in [(false, false), (false, true), (true, false)] {
             let fec = Fec::new(rate);
             let mut dec = Decoder::new(rate);
-            let mut line = format!("{:>4}:", rate.label());
+            dec.min_sum = ms;
+            dec.phi = ph;
+            let t0 = std::time::Instant::now();
+            let mut decoded = 0usize;
+            let mut line = format!("{:>4} {}:", rate.label(), if ms { "min-sum " } else if ph { "phi     " } else { "box-plus" });
             for tenth in (-30..=50).step_by(5) {
                 let esn0 = tenth as f32 / 10.0;
                 let sigma = (10f32.powf(-(esn0 - 3.0) / 10.0) / 2.0).sqrt();
@@ -291,6 +456,7 @@ mod tests {
                         })
                         .collect();
                     let mut bits = vec![0u8; NLDPC];
+                    decoded += 1;
                     if dec.decode(&llr, &mut bits).is_none() || bits != cw {
                         bad += 1;
                     }
@@ -300,8 +466,61 @@ mod tests {
                     break;
                 }
             }
-            eprintln!("{line}   (frames failed of 40, by Es/N0 dB)");
+            eprintln!("{line}   (frames failed of 40, by Es/N0 dB; {:.2} ms a frame)", t0.elapsed().as_secs_f64() * 1e3 / decoded as f64);
+          }
         }
+    }
+
+    /// Time per converging frame, 2 dB above each threshold:
+    /// `cargo test --release decoder_speed -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn decoder_speed() {
+        for (rate, esn0) in [(Rate::R1_4, -0.5f32), (Rate::R1_3, 0.5), (Rate::R1_2, 2.5), (Rate::R2_3, 5.5)] {
+            let fec = Fec::new(rate);
+            let sigma = (10f32.powf(-(esn0 - 3.0) / 10.0) / 2.0).sqrt();
+            let mut seed = 3u64;
+            let frames: Vec<(Vec<u8>, Vec<f32>)> = (0..30usize)
+                .map(|f| {
+                    let bb: Vec<u8> = (0..rate.kbch() / 8).map(|i| (i * 13 + f * 5 + 9) as u8).collect();
+                    let cw = fec.encode(&bb);
+                    let llr = cw.iter().map(|&b| { let y = if b == 0 { 1.0 } else { -1.0 } + sigma * gauss(&mut seed); 2.0 * y / (sigma * sigma) }).collect();
+                    (cw, llr)
+                })
+                .collect();
+            for (ms, ph, name) in [(false, false, "box-plus"), (false, true, "phi"), (true, false, "min-sum")] {
+                let mut dec = Decoder::new(rate);
+                dec.min_sum = ms;
+                dec.phi = ph;
+                let mut bits = vec![0u8; NLDPC];
+                let (t0, mut ok, mut its) = (std::time::Instant::now(), 0, 0);
+                for (cw, llr) in &frames {
+                    if let Some(i) = dec.decode(llr, &mut bits) {
+                        its += i;
+                        ok += (&bits == cw) as usize;
+                    }
+                }
+                eprintln!("{:>4} at {esn0:+.1} dB {name:>8}: {:.2} ms a frame, {ok}/30 ok, {:.1} iterations", rate.label(), t0.elapsed().as_secs_f64() * 1e3 / 30.0, its as f64 / ok.max(1) as f64);
+            }
+        }
+    }
+
+    /// The phi table's values and a checksum: `-- --ignored phi_table --nocapture`.
+    #[test]
+    #[ignore]
+    fn phi_table() {
+        let xs = [0.0f64, 0.0004, 0.01, 0.2, 0.5, 0.9999, 1.0, 1.5, 3.0, 8.0, 15.9, 16.5, 100.0];
+        let vals: Vec<String> = xs.iter().map(|&x| format!("phi({x})={:.6e}", phi(x))).collect();
+        eprintln!("{}", vals.join(" "));
+        let (mut sum, mut bad) = (0f64, 0);
+        for i in 0..20_000 {
+            let v = phi(i as f64 / 1000.0);
+            if !v.is_finite() || v < 0.0 {
+                bad += 1;
+            }
+            sum += v as f64 * (i % 7 + 1) as f64;
+        }
+        eprintln!("checksum {sum:.9e}, non-finite or negative: {bad}");
     }
 
     #[test]

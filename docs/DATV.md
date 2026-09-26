@@ -46,7 +46,7 @@ fills idle slots with PCR-only or null packets. With over 1 s of video queued
 it drops non-key frames and asks the browser for a keyframe; over 3 s it
 flushes.
 
-The TS carries an SDT: service name = the callsign from SET, provider SQTRV.
+The TS carries an SDT: service name = the callsign from SET, provider SQTRX.
 Opus in TS follows ffmpeg (registration descriptor "Opus", control header per
 access unit); ffprobe, ffmpeg and VLC read it.
 

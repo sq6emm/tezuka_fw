@@ -369,7 +369,7 @@ impl Mux {
     }
 
     fn sdt(&self) -> Vec<u8> {
-        let provider = b"SQTRV";
+        let provider = b"SQTRX";
         let name = self.service.as_bytes();
         let mut d = vec![0x48, (3 + provider.len() + name.len()) as u8, 0x01, provider.len() as u8];
         d.extend_from_slice(provider);
