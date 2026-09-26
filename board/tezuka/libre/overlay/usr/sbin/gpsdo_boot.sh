@@ -19,6 +19,8 @@
 #      center_dac = code + old_center - live_dac compensates the loop's
 #      integrator, which cannot be cleared at runtime. The loop tracks drift
 #      from there. Nothing is stored; every boot re-acquires.
+#   5. keeps running: if the reference goes away or the DAC runs to a rail, it
+#      returns to manual hold at the last good code and waits for step 2 again.
 #
 # Log: /tmp/gpsdo_boot.log and syslog (tag gpsdo). Registers: GPSDO_plan.md
 # Section 4. Tunables may be overridden in /etc/default/gpsdo (firmware) or
@@ -33,7 +35,6 @@ SETTLE=2.5             # seconds between a DAC write and reading freq_error (> o
 MAX_ITER=6             # secant steps before giving up (normally 2-3 are needed)
 WAIT_REF=10            # seconds between reference checks while waiting
 XO_NOMINAL=40000000    # xo_correction while the reference steers the crystal
-COUNTER_WAIT=30        # seconds to wait for freq_error to leave its reset value 0
 
 [ -f /etc/default/gpsdo ] && . /etc/default/gpsdo
 [ -f /boot/gpsdo/gpsdo.conf ] && . /boot/gpsdo/gpsdo.conf
@@ -76,15 +77,36 @@ reference_ok() {
     [ "$(abs $((e1 - e2)))" -le "$GATE_STABLE" ]
 }
 
+# One instance: a restart replaces the running one (S22gpsdo stop kills it).
+PIDFILE=/var/run/gpsdo_boot.pid
+[ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
+echo $$ > "$PIDFILE"
+
 : > /tmp/gpsdo_boot.log
 log "start (default $CENTER_DEFAULT, $CODES_PER_COUNT codes/count)"
 [ -w "$XO_SYSFS" ] && echo "$XO_NOMINAL" > "$XO_SYSFS"
 wr $R_REF 0x00000000
 
+# The counter really measures a reference only if freq_error follows the
+# DAC. With nothing on the input it can read a stale 0 that passes every
+# other gate (2026-09-26, a unit with no reference: the loop went on, the
+# DAC ran to 65535, the crystal was 15 ppm off). Step the DAC by PROBE_COUNTS
+# worth of codes and back; a live counter moves by about that much.
+PROBE_COUNTS=4
+counter_alive() {
+    set_manual "$(clamp $(( $1 + CODES_PER_COUNT * PROBE_COUNTS )))"; sleep "$SETTLE"; e1=$(err)
+    set_manual "$1"; sleep "$SETTLE"; e2=$(err)
+    [ "$(abs $((e1 - e2)))" -ge $((PROBE_COUNTS / 2)) ]
+}
+
 # fast path: already disciplining within FAST_OK counts
 if [ "$(manual_mode)" -eq 0 ] && [ "$(locked)" -eq 1 ]; then
     e=$(err)
-    if [ "$(abs "$e")" -le "$FAST_OK" ]; then log "already locked, err $e, dac $(dac): nothing to do"; exit 0; fi
+    if [ "$(abs "$e")" -le "$FAST_OK" ] && [ "$(dac)" -gt 0 ] && [ "$(dac)" -lt 65535 ]; then
+        log "already locked, err $e, dac $(dac): supervising"
+        code=$(dac)
+        skip_acquire=1
+    fi
 fi
 
 # best starting code: the live DAC if the loop was running, locked and not
@@ -92,30 +114,48 @@ fi
 # away from its reset value (10240): no better a guess than 0 (on the
 # 2026-09-25 unit it put the reference about 12 ppm off, and the loop needed
 # over an hour to pull it in). Only a locked loop's DAC is worth starting from.
-code=$CENTER_DEFAULT
-if [ "$(manual_mode)" -eq 0 ] && [ "$(locked)" -eq 1 ]; then
-    d=$(dac); [ "$d" -gt 0 ] && [ "$d" -lt 65535 ] && code=$d
+if [ -z "$skip_acquire" ]; then
+    code=$CENTER_DEFAULT
+    if [ "$(manual_mode)" -eq 0 ] && [ "$(locked)" -eq 1 ]; then
+        d=$(dac); [ "$d" -gt 0 ] && [ "$d" -lt 65535 ] && code=$d
+    fi
 fi
-set_manual "$code"
-log "manual hold at $code, waiting for a usable reference"
-until reference_ok; do sleep "$WAIT_REF"; done
-# freq_error reads 0 until the counter has finished its first windows on the
-# reference, and a stale 0 passes both the stability gate and the |error| <= 1
-# test below: acquisition would end at iteration 0 on whatever code it held.
-# Wait for a real reading (a true 0 at the held code just times out harmlessly).
-t=0
-while [ "$(err)" -eq 0 ] && [ "$t" -lt "$COUNTER_WAIT" ]; do sleep 1; t=$((t + 1)); done
-log "reference present and stable, acquiring"
 
-i=0
-while [ "$i" -lt "$MAX_ITER" ]; do
-    set_manual "$code"; sleep "$SETTLE"; e=$(err)
-    log "iter $i: code $code err $e"
-    [ "$(abs "$e")" -le 1 ] && break
-    code=$(clamp $(( code - CODES_PER_COUNT * e )))
-    i=$((i + 1))
+while :; do
+    if [ -z "$skip_acquire" ]; then
+        set_manual "$code"
+        log "manual hold at $code, waiting for a usable reference"
+        until reference_ok && counter_alive "$code"; do sleep "$WAIT_REF"; done
+        log "reference present, stable and measured, acquiring"
+        i=0; e=999
+        while [ "$i" -lt "$MAX_ITER" ]; do
+            set_manual "$code"; sleep "$SETTLE"; e=$(err)
+            log "iter $i: code $code err $e"
+            [ "$(abs "$e")" -le 1 ] && break
+            code=$(clamp $(( code - CODES_PER_COUNT * e )))
+            i=$((i + 1))
+        done
+        # Only a converged acquisition on a reference that is still there
+        # hands over to the loop; anything else holds and tries again.
+        if [ "$(abs "$e")" -gt 1 ] || ! reference_ok; then
+            log "acquisition did not converge (err $e) or the reference went: holding at $code"
+            sleep "$WAIT_REF"
+            continue
+        fi
+        set_loop "$code"
+        sleep 3
+        log "loop on: target $code, dac $(dac), err $(err), locked $(locked), center register $(center)"
+    fi
+    skip_acquire=
+    # Supervise: the loop needs the reference. Gone, or the DAC at a rail
+    # (steering on nonsense): back to manual hold at the last good code.
+    while :; do
+        sleep "$WAIT_REF"
+        d=$(dac)
+        if [ "$(present)" -eq 0 ] || [ "$d" -le 0 ] || [ "$d" -ge 65535 ]; then
+            log "reference lost or DAC at a rail (present $(present), dac $d): holding at $code"
+            break
+        fi
+        [ "$(locked)" -eq 1 ] && code=$d
+    done
 done
-set_loop "$code"
-sleep 3
-log "loop on: target $code, dac $(dac), err $(err), locked $(locked), center register $(center)"
-exit 0

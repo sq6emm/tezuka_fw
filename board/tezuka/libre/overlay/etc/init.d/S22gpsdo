@@ -14,6 +14,8 @@ case "$1" in
 	echo "OK"
 	;;
   stop)
+	[ -f /var/run/gpsdo_boot.pid ] && kill "$(cat /var/run/gpsdo_boot.pid)" 2>/dev/null
+	rm -f /var/run/gpsdo_boot.pid
 	;;
   restart|reload)
 	"$0" start
