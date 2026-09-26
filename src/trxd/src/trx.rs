@@ -249,6 +249,10 @@ pub struct Trx {
     tx_sink: Sender<Vec<Complex32>>,
     /// Speech compressor (controlled-envelope SSB) and its drive, dB.
     comp: Option<Cessb>,
+    /// Mic meter and speech compressor (SSB only) ahead of the modulator.
+    speech: crate::speech::SpeechProc,
+    /// Peak TX envelope sent since the meter last read it (1.0 = DAC full scale).
+    tx_peak: f32,
     comp_db: f32,
     mic_gain: f32,
     /// CW semi break-in: stay keyed this long after the last element.
@@ -392,6 +396,8 @@ impl Trx {
             hw_gain: None,
             temps: Default::default(),
             comp: None,
+            speech: Default::default(),
+            tx_peak: 0.0,
             comp_db: 10.0,
             mic_gain: 1.0,
             cw_hang: CW_HANG,
@@ -657,6 +663,12 @@ impl Trx {
         }
     }
 
+    /// The COMP depth when it applies: on, and SSB voice (never data modes).
+    fn ssb_comp(&self) -> Option<f32> {
+        let ssb = matches!(self.mode, Mode::Usb | Mode::Lsb) && !self.datv_mode;
+        self.comp.as_ref().filter(|_| ssb).map(|_| self.comp_db)
+    }
+
     /// The speech compressor for the current filter, at the set drive.
     fn make_comp(&self) -> Cessb {
         let (a, b) = (self.filter.0.abs(), self.filter.1.abs());
@@ -887,6 +899,7 @@ impl Trx {
         }
         self.tx_on = Some(source);
         self.tx_since = Some(Instant::now());
+        self.speech.reset();
         // Nothing more of the other station while we send: settle its tail.
         self.cwlive.flush();
         if let (TxSource::Web(client) | TxSource::Datv(client), Some(w)) = (source, &self.web) {
@@ -1488,6 +1501,8 @@ impl Trx {
                 let mut audio = Vec::with_capacity(n48);
                 self.mic_up.process(&self.mic_buf, &mut audio);
                 audio.resize(n48, 0.0);
+                let comp = self.ssb_comp();
+                self.speech.process(&mut audio, comp);
                 match &mut self.modulator {
                     Some(m) => m.process(&audio, &mut self.tx_bb),
                     None => self.tx_bb.extend(audio.iter().map(|&a| Complex32::new(a, 0.0))),
@@ -1521,7 +1536,9 @@ impl Trx {
                 while self.tx_fifo.len() > 24_000 {
                     self.tx_fifo.pop_front();
                 }
-                let audio: Vec<f32> = (0..n48).map(|_| self.tx_fifo.pop_front().unwrap_or(0.0)).collect();
+                let mut audio: Vec<f32> = (0..n48).map(|_| self.tx_fifo.pop_front().unwrap_or(0.0)).collect();
+                let comp = self.ssb_comp();
+                self.speech.process(&mut audio, comp);
                 match &mut self.modulator {
                     Some(m) => m.process(&audio, &mut self.tx_bb),
                     None => self.tx_bb.extend(audio.iter().map(|&a| Complex32::new(a, 0.0))),
@@ -1533,8 +1550,10 @@ impl Trx {
             }
         }
 
-        // Speech processing for voice (not CW, not the tune carrier).
-        if let (Some(c), Some(TxSource::Web(_) | TxSource::Tci | TxSource::Ptt)) = (&mut self.comp, self.tx_on) {
+        // CESSB for SSB voice only: never on data (it would distort the
+        // digital signal), CW, AM/FM or the tune carrier.
+        let ssb = matches!(self.mode, Mode::Usb | Mode::Lsb) && !self.datv_mode;
+        if let (true, Some(c), Some(TxSource::Web(_) | TxSource::Tci | TxSource::Ptt)) = (ssb, &mut self.comp, self.tx_on) {
             if !self.tx_bb.is_empty() {
                 c.process(&mut self.tx_bb);
             }
@@ -1561,6 +1580,8 @@ impl Trx {
         }
         if self.tx_on.is_none() {
             self.tx_out.clear();
+        } else {
+            self.tx_peak = block.iter().fold(self.tx_peak, |m, z| m.max(z.norm()));
         }
         // An inverting transverter mirrors what it sends as well.
         if self.xvtr.as_ref().is_some_and(|t| t.inverted) {
@@ -1738,6 +1759,15 @@ impl Trx {
         if self.web_meter_at.elapsed() >= Duration::from_millis(100) {
             self.web_meter_at = Instant::now();
             let tx = self.tx_on.is_some();
+            // TX meters: mic peak (before the compressor), gain reduction, and
+            // the envelope actually sent relative to DAC full scale.
+            let comp_on = self.ssb_comp().is_some();
+            let txm = tx.then(|| {
+                let po = std::mem::take(&mut self.tx_peak);
+                serde_json::json!({"mic_db": (self.speech.take_peak_db() * 10.0).round() / 10.0,
+                    "gr_db": comp_on.then(|| (self.speech.take_gr_db() * 10.0).round() / 10.0),
+                    "po": (po * 1000.0).round() / 1000.0})
+            });
             let cw = self.cwlive.readout().map(|r| {
                 serde_json::json!({"tone_hz": r.tone_hz.round(), "wpm": r.wpm.round(), "snr_db": r.snr_db.round(), "locked": r.locked})
             });
@@ -1749,7 +1779,7 @@ impl Trx {
                 "freq": s.freq_hz.round(), "frames": s.frames, "bad": s.frames_bad, "packets": s.packets,
                 "dropped": s.blocks_dropped, "skipped": s.frames_skipped, "busy": s.frames_fec_busy,
                 "demod_pct": (100.0 * s.other_s / s.wall_s.max(1e-9)).round(), "fec_pct": (100.0 * s.ldpc_s / s.wall_s.max(1e-9)).round()}));
-            w.send_json(&serde_json::json!({"type": "meter", "s_dbfs": self.s_dbfs, "tx": tx, "rx_gain_db": self.hw_gain_db, "cw": cw, "datv": datv, "datv_rx": datv_rx,
+            w.send_json(&serde_json::json!({"type": "meter", "s_dbfs": self.s_dbfs, "tx": tx, "rx_gain_db": self.hw_gain_db, "cw": cw, "datv": datv, "datv_rx": datv_rx, "txm": txm,
                 "dbm": (dbm * 10.0).round() / 10.0, "s": crate::settings::s_units(self.rx_eff(), dbm),
                 "reading": (self.reading_db * 10.0).round() / 10.0, "sq": self.squelch_open}));
         }

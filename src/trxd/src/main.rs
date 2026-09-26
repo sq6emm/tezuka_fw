@@ -25,6 +25,7 @@ mod radio;
 mod refclock;
 mod scope;
 mod slots;
+mod speech;
 mod stream;
 mod trx;
 mod web;

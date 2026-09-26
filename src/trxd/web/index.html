@@ -145,6 +145,11 @@ table.xv input[type=text] { width: 100%; min-width: 60px; padding: 3px 5px; text
 /* DATV mode: the voice controls go, the DATV ones come. */
 body:not(.datv-mode) .datv-only { display: none !important; }
 body.datv-mode .voice-only { display: none !important; }
+body:not(.cw-mode) .cw-only, body:not(.ssb-mode) .ssb-only, body.cw-mode .no-cw { display: none !important; }
+.txm { display: grid; grid-template-columns: auto 1fr auto; gap: 6px; align-items: center; font-size: 12px; color: var(--dim); }
+.txm .bar { height: 8px; }
+.txm .bar > i { background: linear-gradient(90deg, #2bd46a, #2bd46a 70%, #d9ef44 85%, #ff5a3c 93%); }
+.txm b { color: var(--text); font-weight: 600; font-family: ui-monospace, Menlo, monospace; min-width: 11ch; text-align: right; }
 @media (min-width: 1101px) { body.datv-mode #deck { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 2.2fr); } }
 .datv-panes { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start; }
 .datv-panes > div { display: grid; gap: 6px; width: 320px; max-width: 100%; align-content: start; }
@@ -251,6 +256,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <div class="label"><span id="m-name">S</span><b id="m-val">—</b></div>
       <div class="bar"><i id="m-bar"></i><em id="m-peak"></em></div>
       <div class="scale" id="m-scale"></div>
+      <div class="txm hidden" id="txm" title="Microphone peak level before the compressor (aim for -10..-3 dBFS), and how much COMP is turning the voice down"><span>MIC</span><div class="bar"><i id="mic-bar"></i><em id="mic-peak"></em></div><b id="mic-val">—</b></div>
       <div class="label"><span>RF gain <b id="rfg-show">—</b></span><span>Drive <b id="drv-show">—</b></span><span>ATT <b id="att-show">—</b></span></div>
     </div>
   </section>
@@ -357,19 +363,19 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       </div>
       <div class="slider">Drive<input type="range" id="drv" min="0" max="100" value="100"><b id="drv-v">100</b></div>
       <div class="slider">TX att<input type="range" id="att" min="0" max="89" value="20"><b id="att-v">20</b></div>
-      <div class="slider voice-only">MIC<input type="range" id="micg" min="0" max="200" value="100"><b id="micg-v">100%</b></div>
-      <div class="slider voice-only"><button class="k" id="comp" style="min-width:0;padding:2px 6px;font-size:11px">COMP</button><input type="range" id="compl" min="0" max="20" value="10"><b id="compl-v">10 dB</b></div>
-      <div class="row voice-only">
+      <div class="slider voice-only no-cw">MIC<input type="range" id="micg" min="0" max="200" value="100"><b id="micg-v">100%</b></div>
+      <div class="slider voice-only ssb-only" title="Speech compressor + CESSB: SSB only, never applied in data, CW, AM or FM"><button class="k" id="comp" style="min-width:0;padding:2px 6px;font-size:11px">COMP</button><input type="range" id="compl" min="0" max="20" value="10"><b id="compl-v">10 dB</b></div>
+      <div class="row voice-only cw-only">
         <input type="text" id="cwtext" placeholder="CW text, Enter sends" maxlength="200">
         <button class="k" id="cwsend">SEND</button><button class="k" id="cwstop">STOP</button>
       </div>
-      <div class="row voice-only" id="macros"></div>
-      <div class="slider voice-only">CW WPM<input type="range" id="wpm" min="5" max="45" value="20"><b id="wpm-v">20</b></div>
-      <div class="slider voice-only">BK-IN<input type="range" id="hang" min="50" max="2000" step="50" value="400"><b id="hang-v">400 ms</b></div>
-      <h3 class="voice-only">CW <span class="note">live copy in CW mode: click the signal to put it on the pitch</span>
+      <div class="row voice-only cw-only" id="macros"></div>
+      <div class="slider voice-only cw-only">CW WPM<input type="range" id="wpm" min="5" max="45" value="20"><b id="wpm-v">20</b></div>
+      <div class="slider voice-only cw-only">BK-IN<input type="range" id="hang" min="50" max="2000" step="50" value="400"><b id="hang-v">400 ms</b></div>
+      <h3 class="voice-only cw-only">CW <span class="note">live copy in CW mode: click the signal to put it on the pitch</span>
         <span id="cw-read"></span> <button class="k" id="cw-clear" style="float:right;padding:0 8px;font-size:11px;min-width:0">CLEAR</button>
 </h3>
-      <div id="cwbox" class="voice-only"><span id="cw-text"></span><span class="pend" id="cw-pend"></span></div>
+      <div id="cwbox" class="voice-only cw-only"><span id="cw-text"></span><span class="pend" id="cw-pend"></span></div>
       <h3 class="voice-only">DECODES <span class="note">switch on what you need: each costs CPU on the board</span></h3>
       <div class="row voice-only" id="decoders">
         <button class="k" data-dec="q65">Q65</button>
@@ -434,7 +440,7 @@ const S = {
   muted: false,
   pttLatched: false,
   row: null, rowCenter: 0, rowSpan: 1,
-  meterPeak: -160, meterPeakAt: 0,
+  meterPeak: -160, meterPeakAt: 0, micPeak: 0, micPeakAt: 0,
 };
 // [name, first tune, mode, band from, band to] (IARU R1 edges).
 const BANDS = [
@@ -675,6 +681,8 @@ function renderState() {
   $("callsign").textContent = st.call || "";
   renderFreq();
   $("t-vfo").textContent = "VFO " + st.active;
+  document.body.classList.toggle("cw-mode", !st.datv_mode && st.mode === "CW");
+  document.body.classList.toggle("ssb-mode", !st.datv_mode && (st.mode === "USB" || st.mode === "LSB"));
   $("t-mode").textContent = st.datv_mode ? "DATV" : st.mode === "PKTUSB" ? "DATA" : st.mode;
   $("t-mode").className = "tag on";
   if (!S.filIdx) S.filIdx = store.get("filidx", {});
@@ -749,9 +757,10 @@ function renderMeter(m) {
   const tx = m.tx;
   let frac, val;
   if (tx) {
+    // Peak envelope actually sent, as a share of the DAC's full scale.
     $("m-name").textContent = "Po";
-    frac = S.st ? S.st.drive / 100 : 0;
-    val = Math.round(frac * 100) + " %";
+    frac = m.txm ? clamp(m.txm.po, 0, 1) : 0;
+    val = Math.round(frac * 100) + " % pk";
     $("m-scale").innerHTML = ["0", "25", "50", "75", "100%"].map((s) => `<span>${s}</span>`).join("");
   } else {
     $("m-name").textContent = "S";
@@ -769,6 +778,14 @@ function renderMeter(m) {
     $("m-scale").innerHTML = S_SCALE.map((x, i) => `<span class="${i > 4 ? "hi" : ""}">${x}</span>`).join("");
   }
   $("m-val").textContent = val;
+  $("txm").classList.toggle("hidden", !m.txm || !!m.datv);
+  if (m.txm) {
+    const f = clamp((m.txm.mic_db + 40) / 40, 0, 1), now = performance.now();
+    $("mic-bar").style.width = (f * 100).toFixed(1) + "%";
+    if (f >= S.micPeak || now - S.micPeakAt > 1500) { S.micPeak = f; S.micPeakAt = now; }
+    $("mic-peak").style.left = (S.micPeak * 100).toFixed(1) + "%";
+    $("mic-val").textContent = (m.txm.mic_db <= -60 ? "—" : (m.txm.mic_db > 0 ? "+" : "") + m.txm.mic_db.toFixed(0) + " dBFS") + (m.txm.gr_db != null ? " · COMP −" + m.txm.gr_db.toFixed(0) : "");
+  }
   if (m.cw) {
     const r = $("cw-read");
     r.textContent = `${m.cw.tone_hz} Hz · ${m.cw.wpm} WPM · SNR ${m.cw.snr_db} dB`;
@@ -1073,7 +1090,7 @@ function renderDecodes() {
       <td>${Math.round(d.snr_db)}</td><td>${(d.freq_hz / 1e6).toFixed(4)}</td><td class="msg">${escapeHtml(d.message)}</td></tr>`;
   });
   $("dec-body").innerHTML = rows.length ? rows.join("")
-    : `<tr><td class="empty">Q65 / PI4 decodes appear here when switched on (CW is read in the box above).</td></tr>`;
+    : `<tr><td class="empty">Q65 / PI4 decodes appear here when switched on.</td></tr>`;
 }
 // "144.3" MHz, "144300" kHz, "144300000" Hz, or an explicit k / M / Hz suffix.
 function parseFreq(t) {
