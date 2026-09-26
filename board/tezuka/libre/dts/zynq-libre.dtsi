@@ -58,6 +58,14 @@
 			no-map;
 			reg = <0x16000000 0x40000>;
 		};
+
+		/* DATV: the DDC's output (2 samples per symbol, 16-bit IQ) in a
+		 * ring written by the Maia recorder's DMA; trxd reads it through
+		 * /dev/mem behind the recorder's committed_address. */
+		maia_sdr_datv_ring: maia_sdr_datv_ring@16100000 {
+			no-map;
+			reg = <0x16100000 0x100000>;
+		};
 	};
 };
 
