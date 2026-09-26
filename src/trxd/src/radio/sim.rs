@@ -34,6 +34,7 @@ pub struct SimControl {
     rate: f64,
     lo_offset_hz: f64,
     gain_db: f64,
+    port: u8,
 }
 
 impl RadioControl for SimControl {
@@ -65,6 +66,13 @@ impl RadioControl for SimControl {
     }
     fn rx_gain_db(&mut self) -> f64 {
         self.gain_db
+    }
+    fn port(&self) -> Option<u8> {
+        Some(self.port)
+    }
+    fn set_port(&mut self, n: u8) -> Result<(), String> {
+        self.port = n.clamp(1, 2);
+        Ok(())
     }
 }
 
@@ -172,6 +180,7 @@ pub fn open(cfg: &RadioConfig) -> Radio {
             rate,
             lo_offset_hz: cfg.lo_offset_hz,
             gain_db: cfg.rx_gain_db,
+            port: 1,
         }),
         rx: Box::new(SimRx {
             shared: shared.clone(),

@@ -30,6 +30,15 @@ pub trait RadioControl: Send {
     /// (an SPI round trip, ~70 ms): never call it on the sample path; see
     /// [`RadioControl::rx_gain_reader`].
     fn rx_gain_db(&mut self) -> f64;
+    /// The RX/TX socket pair in use (1 or 2); `None` when it cannot be switched.
+    fn port(&self) -> Option<u8> {
+        None
+    }
+    /// Move to the RX1/TX1 (1) or RX2/TX2 (2) sockets. Slow (a chip
+    /// re-initialisation on the AD936x): never while transmitting.
+    fn set_port(&mut self, _n: u8) -> Result<(), String> {
+        Err("this radio has one port pair".into())
+    }
     /// A way to read the gain from another thread, if the backend has one.
     fn rx_gain_reader(&self) -> Option<Box<dyn FnMut() -> Option<f64> + Send>> {
         None

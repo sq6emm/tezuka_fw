@@ -145,7 +145,7 @@ table.xv input[type=text] { width: 100%; min-width: 60px; padding: 3px 5px; text
 /* DATV mode: the voice controls go, the DATV ones come. */
 body:not(.datv-mode) .datv-only { display: none !important; }
 body.datv-mode .voice-only { display: none !important; }
-body:not(.cw-mode) .cw-only, body:not(.ssb-mode) .ssb-only, body.cw-mode .no-cw { display: none !important; }
+body:not(.cw-mode) .cw-only, body:not(.ssb-mode) .ssb-only, body:not(.data-mode) .data-only, body.cw-mode .no-cw { display: none !important; }
 .txm { display: grid; grid-template-columns: auto 1fr auto; gap: 6px; align-items: center; font-size: 12px; color: var(--dim); }
 .txm .bar { height: 8px; }
 .txm .bar > i { background: linear-gradient(90deg, #2bd46a, #2bd46a 70%, #d9ef44 85%, #ff5a3c 93%); }
@@ -228,7 +228,10 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
     </div>
     <h3>TRANSVERTERS <span class="note">RF range on the air and the IF that RF from lands on; tick LO above for a mirrored band</span></h3>
     <table id="xv-table" class="xv"><thead><tr><th>Name</th><th>RF from MHz</th><th>RF to MHz</th><th>IF at RF from, MHz</th><th>LO above</th><th>TX</th><th></th></tr></thead><tbody id="xv-body"></tbody></table>
-    <div class="row"><button class="k" id="xv-add">ADD</button><button class="k" id="xv-save">SAVE</button><button class="k" id="set-close">CLOSE</button></div>
+    <div class="row"><button class="k" id="xv-add">ADD</button><button class="k" id="xv-save">SAVE</button></div>
+    <h3>ANTENNA SOCKETS <span class="note">which pair each band (or transverter) is wired to; taken on entering the band. Manual: keep the pair picked by hand</span></h3>
+    <div class="row" id="ports-body"></div>
+    <div class="row"><button class="k" id="set-close">CLOSE</button></div>
   </div>
 
   <section id="lcd">
@@ -242,6 +245,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
         <span class="tag" id="t-txrx">RX</span>
         <span class="tag" id="t-src"></span>
         <span class="tag hidden" id="t-xvtr"></span>
+        <span class="tag hidden" id="t-port" title="Antenna sockets in use: RX1/TX1 or RX2/TX2">ANT1</span>
         <span class="tag hidden" id="t-lock">LOCK</span>
       </div>
       <div id="freq" title="Scroll or drag a digit to tune it; click a digit to set the tuning step"></div>
@@ -350,7 +354,8 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <div class="slider">AF<input type="range" id="af" min="0" max="100" value="60"><b id="af-v">60</b></div>
       <div class="slider">RF gain<input type="range" id="rfg" min="0" max="73" value="40"><b id="rfg-v">AUTO</b></div>
       <div class="row"><button class="k" id="audio" title="Receive audio in this browser: on / off">AUDIO</button>
-        <button class="k" id="rfg-auto" title="Front-end (AD9361) gain: AUTO = the chip's own AGC, MAN = the RF gain slider">RF AUTO</button></div>
+        <button class="k" id="rfg-auto" title="Front-end (AD9361) gain: AUTO = the chip's own AGC, MAN = the RF gain slider">RF AUTO</button>
+        <button class="k hidden" id="port" title="Which antenna sockets: RX1/TX1 or RX2/TX2. Switching re-initialises the AD936x (about a second, not while transmitting). SET can tie a band to a pair.">RX1·TX1</button></div>
     </div>
 
     <div class="card wide">
@@ -376,13 +381,13 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
         <span id="cw-read"></span> <button class="k" id="cw-clear" style="float:right;padding:0 8px;font-size:11px;min-width:0">CLEAR</button>
 </h3>
       <div id="cwbox" class="voice-only cw-only"><span id="cw-text"></span><span class="pend" id="cw-pend"></span></div>
-      <h3 class="voice-only">DECODES <span class="note">switch on what you need: each costs CPU on the board</span></h3>
-      <div class="row voice-only" id="decoders">
+      <h3 class="voice-only data-only">DECODES <span class="note">switch on what you need: each costs CPU on the board</span></h3>
+      <div class="row voice-only data-only" id="decoders">
         <button class="k" data-dec="q65">Q65</button>
         <button class="k" data-dec="pi4">PI4</button>
         <button class="k" id="dec-clear">CLEAR</button>
       </div>
-      <div id="decodes" class="voice-only"><table><tbody id="dec-body"></tbody></table></div>
+      <div id="decodes" class="voice-only data-only"><table><tbody id="dec-body"></tbody></table></div>
       <div class="datv-panes datv-only">
         <div>
           <h3>RECEIVE <span class="note">on the RX frequency, while in DATV mode</span></h3>
@@ -667,7 +672,18 @@ function openSettings() {
   $("set-call").value = st.call || "";
   $("xv-body").innerHTML = "";
   (st.xvtrs || []).forEach(addXvRow);
+  renderPorts(st);
   renderCal(st);
+}
+// Band -> sockets. Keys as the board names bands (upper case) or the transverter's name.
+function renderPorts(st) {
+  const box = $("ports-body");
+  if (st.port == null) { box.innerHTML = `<span class="note">this radio cannot switch sockets (needs the AD936x in 1R1T mode)</span>`; return; }
+  const keys = BANDS.map(([n]) => n.toUpperCase()).concat((st.xvtrs || []).map((t) => t.name), ["GEN"]);
+  const map = st.ports || {};
+  box.innerHTML = keys.map((k) => `<label class="note" style="display:inline-flex;gap:4px;align-items:center;margin-right:10px">${k === "GEN" ? "other" : k}
+    <select data-port-band="${k}">${[[0, "manual"], [1, "RX1·TX1"], [2, "RX2·TX2"]].map(([v, l]) => `<option value="${v}"${(map[k] || 0) === v ? " selected" : ""}>${l}</option>`).join("")}</select></label>`).join("");
+  box.querySelectorAll("select").forEach((sel) => sel.onchange = () => send({ cmd: "port_map", band: sel.dataset.portBand, port: +sel.value }));
 }
 function renderCal(st) {
   $("cal-band").textContent = st.cal_band || "—";
@@ -682,6 +698,7 @@ function renderState() {
   renderFreq();
   $("t-vfo").textContent = "VFO " + st.active;
   document.body.classList.toggle("cw-mode", !st.datv_mode && st.mode === "CW");
+  document.body.classList.toggle("data-mode", !st.datv_mode && st.mode === "PKTUSB");
   document.body.classList.toggle("ssb-mode", !st.datv_mode && (st.mode === "USB" || st.mode === "LSB"));
   $("t-mode").textContent = st.datv_mode ? "DATV" : st.mode === "PKTUSB" ? "DATA" : st.mode;
   $("t-mode").className = "tag on";
@@ -730,6 +747,9 @@ function renderState() {
   setSlider("drv", st.drive); setSlider("att", Math.round(st.tx_att_db)); setSlider("wpm", Math.round(st.cw_wpm));
   $("rfg-v").textContent = st.rx_gain_mode === "manual" ? Math.round(st.rx_gain_db) + " dB" : "AUTO";
   $("rfg-auto").classList.toggle("on", st.rx_gain_mode !== "manual");
+  $("port").classList.toggle("hidden", st.port == null);
+  if (st.port != null) { $("port").textContent = `RX${st.port}·TX${st.port}`; $("port").classList.toggle("on", st.port === 2); }
+  $("t-port").classList.toggle("hidden", st.port == null); $("t-port").textContent = "ANT" + st.port;
   $("rfg-auto").textContent = st.rx_gain_mode === "manual" ? "RF MAN" : "RF AUTO";
   $("rfg-show").textContent = st.rx_gain_mode === "manual" ? Math.round(st.rx_gain_db) + " dB" : "AUTO";
   $("drv-show").textContent = Math.round(st.drive) + " %";
@@ -1212,6 +1232,7 @@ function buildStatic() {
   slider("att", (v) => send({ cmd: "txatt", value: v }));
   slider("wpm", (v) => send({ cmd: "cw_wpm", value: v }));
   // RF AUTO: the AD936x AGC, or the RF gain slider.
+  $("port").onclick = () => { if (S.st && S.st.port != null) send({ cmd: "port", port: S.st.port === 1 ? 2 : 1 }); };
   $("rfg-auto").onclick = () => send(S.st && S.st.rx_gain_mode !== "manual" ? { cmd: "rxgain", mode: "manual", db: +$("rfg").value } : { cmd: "rxgain", mode: "slow" });
   $("audio").onclick = () => audioToggle();
 

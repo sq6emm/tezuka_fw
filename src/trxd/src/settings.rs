@@ -64,11 +64,29 @@ pub struct Settings {
     /// Per band (band label, or transverter name): points sorted by reading.
     #[serde(default)]
     pub smeter: std::collections::BTreeMap<String, Vec<CalPoint>>,
+    /// The RX/TX socket pair last chosen by hand (1: RX1/TX1, 2: RX2/TX2).
+    #[serde(default = "one")]
+    pub port: u8,
+    /// Per band (band label, or transverter name): the socket pair it is
+    /// wired to, taken whenever the receiver moves into that band.
+    #[serde(default)]
+    pub ports: std::collections::BTreeMap<String, u8>,
+}
+
+fn one() -> u8 {
+    1
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { callsign: None, mute_at_tx: true, transverters: Vec::new(), smeter: Default::default() }
+        Settings {
+            callsign: None,
+            mute_at_tx: true,
+            transverters: Vec::new(),
+            smeter: Default::default(),
+            port: 1,
+            ports: Default::default(),
+        }
     }
 }
 

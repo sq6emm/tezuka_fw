@@ -249,6 +249,8 @@ pub struct Trx {
     tx_sink: Sender<Vec<Complex32>>,
     /// Speech compressor (controlled-envelope SSB) and its drive, dB.
     comp: Option<Cessb>,
+    /// The band whose socket mapping was last applied (see `follow_port`).
+    port_band: Option<String>,
     /// Mic meter and speech compressor (SSB only) ahead of the modulator.
     speech: crate::speech::SpeechProc,
     /// Peak TX envelope sent since the meter last read it (1.0 = DAC full scale).
@@ -396,6 +398,7 @@ impl Trx {
             hw_gain: None,
             temps: Default::default(),
             comp: None,
+            port_band: None,
             speech: Default::default(),
             tx_peak: 0.0,
             comp_db: 10.0,
@@ -560,6 +563,7 @@ impl Trx {
     /// AD936x is set to its IF, and an LO above the band mirrors the spectrum
     /// (undone by conjugating the samples both ways).
     fn retune(&mut self, force: bool) {
+        self.follow_port();
         let half = self.rate * 0.4;
         let rx = self.rx_eff();
         let tx = self.tx_eff();
@@ -635,6 +639,43 @@ impl Trx {
         self.apply_offsets();
     }
 
+    /// Into a band wired to the other sockets (SET > ports): switch to them.
+    /// Inside a band the hand-picked pair stays.
+    fn follow_port(&mut self) {
+        if self.tx_on.is_some() {
+            return;
+        }
+        let band = self.cal_band();
+        if self.port_band.as_deref() == Some(band.as_str()) {
+            return;
+        }
+        if let Some(&p) = self.settings.ports.get(&band) {
+            self.set_port(p);
+        }
+        self.port_band = Some(band);
+    }
+
+    /// Move to the RX1/TX1 (1) or RX2/TX2 (2) sockets. The AD936x keeps the
+    /// LO and gains across the switch (the backend restores them).
+    fn set_port(&mut self, p: u8) {
+        let p = p.clamp(1, 2);
+        if self.radio.port().is_none_or(|now| now == p) {
+            return;
+        }
+        if self.tx_on.is_some() {
+            warn!(port = p, "port switch refused while transmitting");
+            return;
+        }
+        match self.radio.set_port(p) {
+            Ok(()) => {
+                info!(port = p, "RX/TX sockets switched");
+                self.settings.port = p;
+                self.settings.save(&self.settings_dir);
+            }
+            Err(e) => warn!(port = p, "port switch: {e}"),
+        }
+    }
+
     fn apply_offsets(&mut self) {
         self.ddc.set_offset_hz(self.rx_eff() - self.center);
         let tx_off = self.tx_eff() - self.center;
@@ -694,6 +735,14 @@ impl Trx {
     fn set_mode(&mut self, mode: Mode) {
         if mode == self.mode {
             return;
+        }
+        if self.mode == Mode::Digu || mode == Mode::Digu {
+            // The slot decoders pause outside DATA: start their slots afresh.
+            for (kind, rec) in &mut self.slots {
+                if let Some(r) = slot_recorder(*kind) {
+                    *rec = r;
+                }
+            }
         }
         self.mode = mode;
         self.filter = mode.default_filter();
@@ -1334,7 +1383,8 @@ impl Trx {
             }
         }
         self.lap(4, &mut mark);
-        if !self.slots.is_empty() {
+        // Q65 / PI4 listen in DATA mode only.
+        if !self.slots.is_empty() && self.mode == Mode::Digu && !self.datv_mode {
             let dial = self.rx_eff();
             for (kind, rec) in &mut self.slots {
                 for slot in rec.push(b.t0, &self.audio12) {
@@ -1693,6 +1743,8 @@ impl Trx {
             "cw_hang_ms": self.cw_hang.as_millis() as u64,
             "scope_center": self.scope_center,
             "mute_at_tx": self.settings.mute_at_tx,
+            "port": self.radio.port(),
+            "ports": self.settings.ports,
             "datv": self.datv_json(),
             "datv_mode": self.datv_mode,
             "datv_rx": self.datv_rx.as_ref().map(|r| serde_json::json!({"sr": r.sr, "rate": r.params.rate.label(), "pilots": r.params.pilots})),
@@ -1951,6 +2003,30 @@ impl Trx {
                 self.settings.save(&self.settings_dir);
                 info!(on, "mute the receiver at TX");
             }
+            "port" => {
+                if let Some(p) = num("port") {
+                    self.set_port(p as u8);
+                }
+            }
+            "port_map" => {
+                // A band (label or transverter name) to sockets 1 or 2; 0 forgets it.
+                let band = m["band"].as_str().unwrap_or("").trim().to_string();
+                if let (false, Some(p)) = (band.is_empty(), num("port")) {
+                    match p as u8 {
+                        1 | 2 => {
+                            self.settings.ports.insert(band.clone(), p as u8);
+                        }
+                        _ => {
+                            self.settings.ports.remove(&band);
+                        }
+                    }
+                    self.settings.save(&self.settings_dir);
+                    info!(band, port = p, "band sockets");
+                    // Apply at once if it is the band we are in.
+                    self.port_band = None;
+                    self.follow_port();
+                }
+            }
             "scope_center" => {
                 self.scope_center = on;
                 self.web_center = 0.0;
@@ -2031,6 +2107,11 @@ impl Trx {
     pub fn run(mut self, rx: Receiver<RxBlock>) {
         crate::stream::realtime_thread();
         info!(freq = self.rx_vfo(), mode = mode_name(self.mode), rate = self.rate, "transceiver running");
+        // Sockets: the band's own pair (SET), else the last one used.
+        let band = self.cal_band();
+        let p = self.settings.ports.get(&band).copied().unwrap_or(self.settings.port);
+        self.set_port(p);
+        self.port_band = Some(band);
         let mut loads = LoadMeter::new();
         for b in rx {
             let t = Instant::now();

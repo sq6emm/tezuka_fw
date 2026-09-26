@@ -65,6 +65,17 @@ pub struct IioControl {
     ptt_gpio: Option<PathBuf>,
     stream_rate: f64,
     tx_rf: Option<bool>,
+    /// The phy's debugfs directory (1R1T channel choice, re-initialisation).
+    debug: Option<PathBuf>,
+    /// RX/TX pair in use, 1 or 2, and what a re-initialisation must restore.
+    port: u8,
+    adc_rate: u32,
+    rf_bandwidth: u32,
+    /// `Some(on)` on real hardware: the FPGA filter bits to put back.
+    fpga_decimation: Option<bool>,
+    lo: Option<String>,
+    gain: Option<(GainMode, f64)>,
+    atten: Option<String>,
 }
 
 impl RadioControl for IioControl {
@@ -75,7 +86,9 @@ impl RadioControl for IioControl {
     fn set_lo(&mut self, hz: f64) -> Result<(), String> {
         let v = format!("{}", hz.round() as u64);
         write_attr(&self.phy, "out_altvoltage0_RX_LO_frequency", &v)?;
-        write_attr(&self.phy, "out_altvoltage1_TX_LO_frequency", &v)
+        write_attr(&self.phy, "out_altvoltage1_TX_LO_frequency", &v)?;
+        self.lo = Some(v);
+        Ok(())
     }
 
     fn set_rx_gain(&mut self, mode: GainMode, db: f64) -> Result<(), String> {
@@ -83,13 +96,66 @@ impl RadioControl for IioControl {
         if mode == GainMode::Manual {
             write_attr(&self.phy, "in_voltage0_hardwaregain", &format!("{db:.0}"))?;
         }
+        self.gain = Some((mode, db));
         Ok(())
     }
 
     fn set_tx_attenuation(&mut self, db: f64) -> Result<(), String> {
         // Attenuation in 0.25 dB steps, written as a negative gain.
         let q = (db.clamp(0.0, 89.75) * 4.0).round() / 4.0;
-        write_attr(&self.phy, "out_voltage0_hardwaregain", &format!("{:.2}", -q))
+        let v = format!("{:.2}", -q);
+        write_attr(&self.phy, "out_voltage0_hardwaregain", &v)?;
+        self.atten = Some(v);
+        Ok(())
+    }
+
+    fn port(&self) -> Option<u8> {
+        self.debug.as_ref().map(|_| self.port)
+    }
+
+    /// The AD936x runs 1R1T; which of its two receivers and transmitters
+    /// (RX1/TX1 or RX2/TX2 sockets) carries that one channel is a chip
+    /// set-up choice. The driver takes it through debugfs and a full
+    /// re-initialisation (about a second, with fresh calibrations), after
+    /// which everything the chip forgot is written again.
+    fn set_port(&mut self, n: u8) -> Result<(), String> {
+        let n = n.clamp(1, 2);
+        if n == self.port {
+            return Ok(());
+        }
+        let dbg = self.debug.clone().ok_or("no AD936x debugfs: port switching unavailable")?;
+        let xo = read_attr(&self.phy, "xo_correction").ok();
+        write_attr(&dbg, "adi,1rx-1tx-mode-use-rx-num", &n.to_string())?;
+        write_attr(&dbg, "adi,1rx-1tx-mode-use-tx-num", &n.to_string())?;
+        self.port = n;
+        let t0 = std::time::Instant::now();
+        write_attr(&dbg, "initialize", "1")?;
+        info!(port = n, ms = t0.elapsed().as_millis() as u64, "AD936x re-initialised on RX{n}/TX{n}");
+        if let Some(xo) = xo {
+            let _ = write_attr(&self.phy, "xo_correction", &xo);
+        }
+        let _ = write_attr(&self.phy, "ensm_mode", "fdd");
+        write_attr(&self.phy, "in_voltage_sampling_frequency", &self.adc_rate.to_string())?;
+        write_attr(&self.phy, "in_voltage_rf_bandwidth", &self.rf_bandwidth.to_string())?;
+        write_attr(&self.phy, "out_voltage_rf_bandwidth", &self.rf_bandwidth.to_string())?;
+        if let Some(Err(e)) = self.fpga_decimation.map(set_fpga_filters) {
+            warn!("FPGA filter bits after re-init: {e}");
+        }
+        if let Some(v) = self.lo.clone() {
+            write_attr(&self.phy, "out_altvoltage0_RX_LO_frequency", &v)?;
+            write_attr(&self.phy, "out_altvoltage1_TX_LO_frequency", &v)?;
+        }
+        if let Some((mode, db)) = self.gain {
+            self.set_rx_gain(mode, db)?;
+        }
+        if let Some(v) = self.atten.clone() {
+            write_attr(&self.phy, "out_voltage0_hardwaregain", &v)?;
+        }
+        // The LO comes back powered: put it back as it was.
+        let rf = self.tx_rf.take().unwrap_or(false);
+        write_attr(&self.phy, "out_altvoltage1_TX_LO_powerdown", if rf { "0" } else { "1" })?;
+        self.tx_rf = Some(rf);
+        Ok(())
     }
 
     fn set_tx_rf(&mut self, on: bool) -> Result<(), String> {
@@ -276,9 +342,34 @@ pub fn open(cfg: &RadioConfig) -> Result<Radio, String> {
         .map_err(|e| format!("TX buffer: {e}"))?;
 
     let ptt_gpio = (!cfg.ptt_gpio.is_empty()).then(|| PathBuf::from(&cfg.ptt_gpio));
-    info!(phy = %phy.display(), rate = cfg.stream_rate(), "AD936x ready");
+    // Port switching needs 1R1T and the driver's debugfs knobs.
+    let debug = phy
+        .file_name()
+        .map(|n| Path::new(&cfg.debugfs_root).join(n))
+        .filter(|d| d.join("adi,1rx-1tx-mode-use-rx-num").exists())
+        .filter(|d| read_attr(d, "adi,2rx-2tx-mode-enable").map_or(true, |v| v == "0"));
+    let port = debug
+        .as_ref()
+        .and_then(|d| read_attr(d, "adi,1rx-1tx-mode-use-rx-num").ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let switchable = debug.is_some();
+    info!(phy = %phy.display(), rate = cfg.stream_rate(), port, switchable, "AD936x ready");
     Ok(Radio {
-        control: Box::new(IioControl { phy, ptt_gpio, stream_rate: cfg.stream_rate(), tx_rf: None }),
+        control: Box::new(IioControl {
+            phy,
+            ptt_gpio,
+            stream_rate: cfg.stream_rate(),
+            tx_rf: None,
+            debug,
+            port,
+            adc_rate: cfg.adc_rate,
+            rf_bandwidth: cfg.rf_bandwidth,
+            fpga_decimation: (cfg.iio_root == "/sys/bus/iio/devices").then_some(cfg.fpga_decimation),
+            lo: None,
+            gain: None,
+            atten: None,
+        }),
         rx: Box::new(IioRx { dev: rx, raw: Vec::new() }),
         tx: Box::new(IioTx { dev: tx, raw: Vec::new() }),
     })
@@ -359,5 +450,41 @@ mod tests {
         let q = i16::from_le_bytes([tx[2], tx[3]]);
         assert_eq!(i, (TX_SCALE) as i16);
         assert_eq!(q, -(TX_SCALE as i16));
+    }
+
+    #[test]
+    fn switches_to_the_second_port_pair_and_restores_the_settings() {
+        let (t, mut cfg) = fake_tree();
+        let dbg = t.path().join("debug/iio:device0");
+        fs::create_dir_all(&dbg).unwrap();
+        for (a, v) in [("adi,1rx-1tx-mode-use-rx-num", "1"), ("adi,1rx-1tx-mode-use-tx-num", "1"), ("adi,2rx-2tx-mode-enable", "0"), ("initialize", "")] {
+            fs::write(dbg.join(a), v).unwrap();
+        }
+        cfg.debugfs_root = t.path().join("debug").to_string_lossy().into();
+        let mut radio = open(&cfg).unwrap();
+        assert_eq!(radio.control.port(), Some(1));
+        radio.control.set_lo(432_100_000.0).unwrap();
+        radio.control.set_tx_attenuation(30.0).unwrap();
+        let phy = t.path().join("sys/iio:device0");
+        // What a re-initialisation does to the attributes.
+        fs::write(phy.join("out_altvoltage0_RX_LO_frequency"), "2400000000").unwrap();
+        fs::write(phy.join("out_voltage0_hardwaregain"), "0.00").unwrap();
+        radio.control.set_port(2).unwrap();
+        let rd = |p: &Path, a: &str| fs::read_to_string(p.join(a)).unwrap();
+        assert_eq!(rd(&dbg, "adi,1rx-1tx-mode-use-rx-num"), "2");
+        assert_eq!(rd(&dbg, "adi,1rx-1tx-mode-use-tx-num"), "2");
+        assert_eq!(rd(&dbg, "initialize"), "1");
+        assert_eq!(rd(&phy, "out_altvoltage0_RX_LO_frequency"), "432100000");
+        assert_eq!(rd(&phy, "out_voltage0_hardwaregain"), "-30.00");
+        assert_eq!(rd(&phy, "out_altvoltage1_TX_LO_powerdown"), "1");
+        assert_eq!(radio.control.port(), Some(2));
+    }
+
+    #[test]
+    fn no_debugfs_no_port_switch() {
+        let (_t, cfg) = fake_tree();
+        let mut radio = open(&RadioConfig { debugfs_root: "/nonexistent".into(), ..cfg }).unwrap();
+        assert_eq!(radio.control.port(), None);
+        assert!(radio.control.set_port(2).is_err());
     }
 }

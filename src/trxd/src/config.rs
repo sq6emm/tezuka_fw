@@ -114,6 +114,8 @@ pub struct RadioConfig {
     pub iio_root: String,
     /// Where the IIO buffer character devices live (`/dev`).
     pub dev_root: String,
+    /// The IIO debugfs root (`/sys/kernel/debug/iio`): AD936x port switching.
+    pub debugfs_root: String,
     /// Samples per DMA block at the post-FPGA rate.
     pub buffer_samples: usize,
     /// Simulated radio: pace blocks to real time (off only for tests).
@@ -137,6 +139,7 @@ impl Default for RadioConfig {
             ptt_delay_ms: 20,
             iio_root: "/sys/bus/iio/devices".into(),
             dev_root: "/dev".into(),
+            debugfs_root: "/sys/kernel/debug/iio".into(),
             buffer_samples: 3_840,
             sim_realtime: true,
         }
