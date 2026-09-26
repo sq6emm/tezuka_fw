@@ -93,11 +93,16 @@ const ALPHA: f32 = 0.75;
 
 impl Decoder {
     pub fn new(rate: Rate) -> Self {
-        let k = rate.kldpc();
-        let nk = NLDPC - k;
+        Self::from_table(rate.table(), NLDPC, rate.kldpc())
+    }
+
+    /// Any DVB-S2 IRA code: `table` (Annex B/C), codeword `n`, message `k`
+    /// (normal frames too: n = 64800).
+    pub fn from_table(table: &[&[u16]], n: usize, k: usize) -> Self {
+        let nk = n - k;
         let q = nk / 360;
         let mut checks: Vec<Vec<u32>> = vec![Vec::new(); nk];
-        for (row, addrs) in rate.table().iter().enumerate() {
+        for (row, addrs) in table.iter().enumerate() {
             for m in 0..360 {
                 let v = (row * 360 + m) as u32;
                 for &x in addrs.iter() {
@@ -121,11 +126,11 @@ impl Decoder {
         let edges = vars.len();
         let dmax = start.windows(2).map(|w| (w[1] - w[0]) as usize).max().unwrap_or(0);
         Decoder {
-            n: NLDPC,
+            n,
             vars,
             start,
             msg: vec![0.0; edges],
-            post: vec![0.0; NLDPC],
+            post: vec![0.0; n],
             fwd: vec![0.0; dmax],
             ext: vec![0.0; dmax],
             extd: vec![0.0; dmax],

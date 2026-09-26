@@ -15,6 +15,7 @@
 pub mod ddc;
 pub mod fpga;
 pub mod fpga_tx;
+pub mod ldpc_fpga;
 mod tables;
 pub mod ldpc;
 pub mod rx;
