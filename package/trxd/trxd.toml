@@ -1,0 +1,57 @@
+# trxd configuration. Copy to /mnt/jffs2/trxd.toml (or put trxd.toml on the
+# USB drive before first boot) and edit; restart with /etc/init.d/S80trxd restart.
+# Every key is optional. `trxd --config FILE --check` prints the result.
+
+# trx | beacon-tx | beacon-rx
+role = "trx"
+callsign = "N0CALL"
+locator = "JO81AA"
+
+[radio]
+# rx_gain_mode: manual | slow_attack | fast_attack | hybrid
+rx_gain_mode = "slow_attack"
+rx_gain_db = 40
+# Output power goes DOWN as this goes up (0..89.75 dB).
+tx_attenuation_db = 20
+# Optional PA / T-R relay line held high while transmitting:
+# ptt_gpio = "/sys/class/gpio/gpio960/value"
+ptt_delay_ms = 20
+
+[trx]
+freq_hz = 144174000
+mode = "USB"            # USB LSB CW AM FM PKTUSB
+tci_port = 40001        # TCI (WSJT-X/JTDX/MSHV/sdroxide): ws://<board>:40001
+rigctl_port = 4532      # Hamlib: rigctl -m 2 -r <board>:4532
+allow_tx = true
+max_tx_seconds = 180
+decoders = []           # started at boot: q65 | pi4 (web UI toggles them; CW always runs)
+q65_submode = "D"
+cw_engine = "timing"    # live CW box: timing (instant, light) | neural (DeepCW: too heavy for the A9 live)
+
+
+[beacon]                # role = "beacon-tx"
+freq_hz = 1296872000    # carrier; digital tone 0 and CW key-down sit here
+digital = "q65-60d"     # none | pi4 | q65-60a .. q65-60e
+cw_wpm = 12
+cw_space_shift_hz = 400 # F1A key-up shift; 0 = on/off keying
+require_time_sync = true
+
+[beacon_rx]             # role = "beacon-rx"
+freq_hz = 1296872000
+audio_offset_hz = 800
+decoders = ["pi4", "q65", "cw"]
+q65_submode = "D"
+# wav_dir = "/mnt/sd/beacon"
+
+[mqtt]
+host = "127.0.0.1"
+port = 1883
+topic_prefix = "trxd/{hostname}"
+
+[reference]             # see docs/REFERENCE.md
+mode = "auto"           # auto | pps | chrony | 10mhz | off
+
+[web]                   # https://<board>/  (role = "trx")
+https_port = 443
+http_port = 80          # redirects to HTTPS; 0 = off
+password = "testing"    # static for now; "" = generate one into /mnt/jffs2/trxd-web/password

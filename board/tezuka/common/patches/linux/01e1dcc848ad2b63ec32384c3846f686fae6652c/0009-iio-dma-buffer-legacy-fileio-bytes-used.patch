@@ -1,0 +1,24 @@
+From: Dawid SQ6EMM <dawszy@arhea.pl>
+Subject: [PATCH] iio: buffer-dma: set block.bytes_used for fileio with MMAP_LEGACY
+
+With CONFIG_IIO_DMA_BUF_MMAP_LEGACY, iio_dma_buffer_io() limits each
+read/write by block->block.bytes_used, but request_update() only resets
+block->bytes_used. Output blocks are never submitted before the first
+write, so block.bytes_used stays 0: every write() copies nothing and
+returns 0, iio_buffer_write() retries forever in the kernel, and the
+DAC DMA never starts (no TX at all, one CPU core busy).
+
+---
+--- a/drivers/iio/buffer/industrialio-buffer-dma.c	2026-09-25 20:29:03.030740531 +0200
++++ b/drivers/iio/buffer/industrialio-buffer-dma.c	2026-09-25 20:29:03.042468110 +0200
+@@ -445,6 +445,10 @@
+ 		 * block's so that iio_dma_buffer_io() will work.
+ 		 */
+ 		block->bytes_used = block->size;
++#ifdef CONFIG_IIO_DMA_BUF_MMAP_LEGACY
++		/* iio_dma_buffer_io() bounds fileio by block.bytes_used here. */
++		block->block.bytes_used = block->size;
++#endif
+ 
+ 		/*
+ 		 * If it's an input buffer, mark the block as queued, and

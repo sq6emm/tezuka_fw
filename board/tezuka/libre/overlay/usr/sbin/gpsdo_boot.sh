@@ -33,6 +33,7 @@ SETTLE=2.5             # seconds between a DAC write and reading freq_error (> o
 MAX_ITER=6             # secant steps before giving up (normally 2-3 are needed)
 WAIT_REF=10            # seconds between reference checks while waiting
 XO_NOMINAL=40000000    # xo_correction while the reference steers the crystal
+COUNTER_WAIT=30        # seconds to wait for freq_error to leave its reset value 0
 
 [ -f /etc/default/gpsdo ] && . /etc/default/gpsdo
 [ -f /boot/gpsdo/gpsdo.conf ] && . /boot/gpsdo/gpsdo.conf
@@ -86,12 +87,24 @@ if [ "$(manual_mode)" -eq 0 ] && [ "$(locked)" -eq 1 ]; then
     if [ "$(abs "$e")" -le "$FAST_OK" ]; then log "already locked, err $e, dac $(dac): nothing to do"; exit 0; fi
 fi
 
-# best starting code: the live DAC if the loop was running and not railed
+# best starting code: the live DAC if the loop was running, locked and not
+# railed. At power-on the IP already reports loop mode, with the DAC walking
+# away from its reset value (10240): no better a guess than 0 (on the
+# 2026-09-25 unit it put the reference about 12 ppm off, and the loop needed
+# over an hour to pull it in). Only a locked loop's DAC is worth starting from.
 code=$CENTER_DEFAULT
-if [ "$(manual_mode)" -eq 0 ]; then d=$(dac); [ "$d" -gt 0 ] && [ "$d" -lt 65535 ] && code=$d; fi
+if [ "$(manual_mode)" -eq 0 ] && [ "$(locked)" -eq 1 ]; then
+    d=$(dac); [ "$d" -gt 0 ] && [ "$d" -lt 65535 ] && code=$d
+fi
 set_manual "$code"
 log "manual hold at $code, waiting for a usable reference"
 until reference_ok; do sleep "$WAIT_REF"; done
+# freq_error reads 0 until the counter has finished its first windows on the
+# reference, and a stale 0 passes both the stability gate and the |error| <= 1
+# test below: acquisition would end at iteration 0 on whatever code it held.
+# Wait for a real reading (a true 0 at the held code just times out harmlessly).
+t=0
+while [ "$(err)" -eq 0 ] && [ "$t" -lt "$COUNTER_WAIT" ]; do sleep 1; t=$((t + 1)); done
 log "reference present and stable, acquiring"
 
 i=0

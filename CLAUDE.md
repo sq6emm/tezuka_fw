@@ -1,230 +1,122 @@
 # CLAUDE.md
 
 ## Communication
-- Always respond in English, even if the prompt is written in French.
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+- Always respond in English.
 
 ## Project overview
 
-**tezuka_fw** is a Buildroot `BR2_EXTERNAL` tree that builds firmware for Zynq-7000/AD9363 SDR boards (PlutoSDR family and compatible hardware). It is not a standalone project — it requires Buildroot alongside it and acts purely as an overlay of board definitions, packages, and configs.
+**tezuka_fw_simple** is a stripped fork of tezuka_fw (a Buildroot
+`BR2_EXTERNAL` tree for Zynq-7000/AD936x SDRs), turning a PlutoSky R2 or
+LibreSDR into a headless remote transceiver (TCI + rigctld, SSB/CW/data, Q65/PI4,
+neural CW skimmer) or an IARU-R1 MGM beacon transmitter/receiver with MQTT
+output. See `docs/PLAN.md` for architecture and `docs/REFERENCE.md` for the
+frequency-reference design.
 
-## Setup (first time)
+Boards: `plutoskyr2`, `libre` (both xc7z020). `boards.json` is the single
+source of truth for `build.sh` and CI.
 
-```bash
-./getbuildroot.sh        # downloads Buildroot 2026.02 into buildroot/
-source sourceme.first    # sets BR2_EXTERNAL; required before any manual make
-```
-
-`buildroot.version` is the single source of truth for the Buildroot version and checksum.
-
-## Build commands
-
-```bash
-# Build one board
-./build.sh fishball
-
-# Build multiple boards
-./build.sh pluto plutoplus e310
-
-# Build all boards
-./build.sh all
-
-# With parallel jobs and clean output first
-./build.sh -j8 -c fishball
-
-# List all boards (and groups) and their defconfigs
-./build.sh -h
-```
-
-Output lands in `output/<board>/images/`, and `build/<board>.zip` is produced automatically.
-
-**Supported boards** are defined in `boards.json` (single source of truth for both `build.sh` and CI):
-`pluto`, `plutoplus`, `e200`, `e310`, `libre`, `fishball`, `fishball7020`, `fishball_mini_7010`, `fishball_mini_7020`, `nano`, `plutoskyr2`, `signalsdrpro`, `pciesdr7010`, `opensdrlab7010mini`
-
-**Board groups**: `fishball_mini_7010`/`fishball_mini_7020` are flash-only builds (QSPI `.frm`/`.dfu`, no SD image — they use `postimage-qspi.sh` only) for the same physical hardware as `fishball`/`fishball7020`. Rather than shipping as their own release artifacts, each one's `boards.json` entry carries `"artifact"` pointing at its full-size counterpart (`fishball_mini_7010` → `"artifact": "fishball"`, `fishball_mini_7020` → `"artifact": "fishball7020"`) — the group name is the primary board's own name, not a synthetic label. `./build.sh fishball` builds *both* `fishball_maiasdr_defconfig` and `fishball_mini_defconfig` and merges them into one `build/fishball.zip`: since each build only ever populates one of `images/flash/` or `images/sdimg/` (the full build fills `sdimg/`, the mini build fills `flash/` — never both), the merge is a plain union with nothing to collide, no per-variant subfolder needed. This means `./build.sh fishball` now does more work than building just that one defconfig — it's a deliberate behavior change, since the merged zip is the intended release shape, not a one-off. `./build.sh fishball_mini_7010` alone still builds just that variant, unmerged, standalone. CI mirrors this: each board is its own matrix row/artifact upload (grouping only ever happens via `boards.json`'s `artifact` field, defaulting to the board's own name), and the release job's "Merge grouped board artifacts" step folds a group together — only when every member was actually built in that run (a `workflow_dispatch` for just the mini board ships its zip standalone instead).
-
-### Manual Buildroot invocation
-
-It depends of board name.
-
-```bash
-source sourceme.first
-make -C buildroot O=output/pluto pluto_maiasdr_defconfig && make -C buildroot O=output/pluto
-```
-
-### CMake policy workaround
-
-For CMake 3.27+ compatibility with older packages:
-```bash
-CMAKE_POLICY_VERSION_MINIMUM=3.5 make -C buildroot O=output/<board>
-```
-
-## Architecture
-
-### BR2_EXTERNAL layout
+## Layout
 
 | Path | Purpose |
-|------|---------|
-| `configs/<board>_defconfig` | Buildroot defconfigs, one per board |
-| `board/tezuka/common/` | Shared scripts, kernel config, U-Boot config, rootfs overlays |
-| `board/tezuka/<board>/` | Board-specific DTS, U-Boot DTS, bitstream, patches, uboot-env |
-| `package/<name>/` | Custom Buildroot packages (`.mk` + `Config.in`) |
-| `app/` | Host-side C utilities for development/testing |
-| `tools/` | Development helper scripts |
+|---|---|
+| `configs/<board>_defconfig` | Buildroot defconfigs |
+| `board/tezuka/common/` | Shared kernel/u-boot config, overlays (`overlay_base`, `overlay_tezuka`), image scripts |
+| `board/tezuka/<board>/` | DTS, u-boot DTS, `bitstream/simple.xsa`, board overlay |
+| `package/board-fpga` | Extracts `system_top.bit` from `bitstream/simple.xsa` |
+| `package/trxd` | Buildroot package + init script + default config for trxd |
+| `src/trxd` | The daemon (Rust) |
+| `docs/` | Design notes |
 
-### Firmware image flow (`board/tezuka/common/post-image.sh`)
-
-`post-image.sh` runs after the Buildroot image step and produces:
-- **`pluto.frm` / `pluto.dfu`** — flash-update files (IIO FIT image + MD5)
-- **`boot.frm` / `boot.dfu`** — U-Boot + FSBL for flash update
-- **`sdimg/`** — SD card boot files: `BOOT.bin` (FSBL+bitstream+U-Boot), `uImage`, `uramdisk.image.xz`, `devicetree.dtb`, `uEnv.txt`
-- **`tezuka.zip`** — all of the above, copied to `build/<board>.zip`
-
-Boot process: FSBL → U-Boot → Linux (ADI kernel fork) → rootfs (cpio.xz ramdisk).
-
-### Rootfs overlays (layered, applied in order in defconfig)
-
-1. `overlay_base` — base init scripts, networking, USB gadget
-2. `overlay_tezuka` — tezuka-specific services (mosquitto, gpsd, NFS mount, sweep scripts)
-3. `overlay_maia` — Maia-SDR integration
-4. `overlay_iqengine` — IQEngine integration
-
-### FPGA bitstream management
-
-Bitstreams are binary blobs stored in git at `board/tezuka/<board>/bitstream/maia-iio/system_top.xsa`. The `board-fpga` package extracts `system_top.bit` from the `.xsa` zip during build.
-
-Updated bitstreams are built from a separate project, the user's `maia-sdr` fork, checked out at `/home/hp-z2-dev/prog/maia-sdr` (origin: `F5OEO/maia-sdr`, upstream: `maia-sdr/maia-sdr`).
+## Build
 
 ```bash
-# In the maia-sdr checkout
-source /home/hp-z2-dev/prog/maia-sdr/sourceme.first   # Vivado 2023.1, oss-cad-suite PATH, ADI_IGNORE_VERSION_CHECK
-
-# Build bitstreams for all boards
-make -C /home/hp-z2-dev/prog/maia-sdr/maia-hdl/projects
-
-# Build a single board
-cd /home/hp-z2-dev/prog/maia-sdr/maia-hdl/projects/tezuka && PROJECT_NAME=<board> make all
+./getbuildroot.sh            # once; or hardlink an existing buildroot/ tree
+./build.sh -j16 plutoskyr2   # or libre, or all
 ```
 
-Always pass the `all` target explicitly (`make all`, not bare `make`) — the Makefile's implicit default target only builds the Vivado project (`build_project`), it does not build `ip_cores` first or run `install` to copy the `.xsa` out. `make all` runs `ip_cores build_project install` in that order and copies `<board>.sdk/system_top.xsa` straight into `board/tezuka/<board>/bitstream/maia-iio/system_top.xsa` in this repo (`DEST` in the Makefile), so no manual copy step is needed afterward. Then test it:
+Output: `output/<board>/images/`, `build/<board>.zip`: `flash/` (A/B QSPI:
+`firmware.itb`, `model.bin`, `uboot-ab.env`, `SHA256SUMS`; the build fails if
+the FIT exceeds a 12.25 MB slot) and `sdimg/` (SD boot, same A/B idea).
+Flash layout, update and rollback: docs/FLASH.md. Install/update over SSH:
+`tools/fw-push.sh [--migrate] <ip> build/<board>.zip` -> `/usr/sbin/fw-update`.
+
+trxd is built by rustup's cargo pinned by `src/trxd/rust-toolchain.toml`
+(Buildroot 2026.02's Rust 1.88 is too old for rten/kstring). The package
+passes `--locked`, so `src/trxd/Cargo.lock` must be committed and current.
+
+### trxd on a PC
 
 ```bash
-make -C buildroot O=output/<board> board-fpga-reconfigure   # re-extract system_top.bit into BINARIES_DIR
-make -C buildroot O=output/<board>                          # rebuild final images via post-image.sh
+cd src/trxd
+cargo test                       # 40+ tests incl. Q65/PI4/CW round trips
+cargo run --release -- --sim     # simulated radio; TCI :40001, rigctld :4532
 ```
 
-#### Adding a new board's FPGA project
+`--sim` loops TX back into RX and adds a keyed CW test signal. The web UI
+(`src/trxd/web/index.html`, compiled in; server `src/trxd/src/web.rs`) is
+reachable at https://127.0.0.1:<web.https_port>/ when running the sim - set
+`[web] https_port = 8443, http_port = 0, password = "...", state_dir = <tmp>`.
+Headless-Chrome check of the UI: drive Chrome over CDP (`--remote-debugging-port`,
+`--ignore-certificate-errors`, `--use-fake-device-for-media-stream`).
 
-A new board needs, in the maia-sdr checkout:
-- `maia-hdl/projects/tezuka/system_project.tcl`: a `switch` case setting `p_device` (e.g. `xc7z010clg400-1`).
-- `maia-hdl/projects/tezuka/system_bd.tcl`: a matching `switch` case (even if empty) setting any board flags it needs (`lvds`, `vctcxo`, `txfir`, `dac_dds`, `dvb`, `uartlite` — see existing boards for what each enables); a board with no case here falls through to `default` and aborts with "project name not recognized".
-- `maia-hdl/projects/boards/<board>/`: `ps7.tcl` (PS7 IP config — DDR/UART/USB/SD/ENET/etc.), `ports.tcl` (board-specific block-design ports/IP instances), `system_top.v` (top-level Verilog port list matching `ports.tcl`), `system_constr.xdc` (pin LOCs/IOSTANDARDs + timing constraints). Clone the closest existing board electrically and adjust pin-by-pin from the schematic — `boards/plutoskyr2` is the reference for RGMII-over-EMIO (PL-pin-attached Ethernet PHY, vs. the `MIO 16..27` PS-pin attachment every other board uses).
+The DeepCW model is not in the binary: `trxd --pack-model model.onnx
+package/trxd/deepcw-model.bin` (tools/pack-deepcw-model.sh) produces the blob
+for the `model` flash partition; `cw_model = "<file>"` loads one on a PC. Cross build as
+in `package/trxd/trxd.mk` (target `armv7-unknown-linux-gnueabihf`, linker =
+the board output's `host/bin/arm-linux-gcc`).
 
-### DATV backend (pluto-ori-ps)
+### sdroxide dependency
 
-The DATV/DVB-S2 MQTT command and streaming backend behind the Dashboard's DATV Controller page (`cmd/pluto/<call>/...` / `dt/pluto/<call>/...` topics) is a separate project, not part of this repo: `pluto-ori-ps`, branch `tezukadvb` (https://github.com/F5OEO/pluto-ori-ps/tree/tezukadvb), checked out at `/home/hp-z2-dev/prog/pluto-ori-ps`. It builds `pluto_mqtt_ctrl` (generic IIO/MQTT control) and `pluto_stream` (DVB-S2 TX/RX streaming), started at boot by `S96plutostream`. `board/tezuka/common/overlay_tezuka/root/api_controller.sh` is a separate, unrelated MQTT handler for the non-call-rooted `cmd/#`/`state/#` tree (rx/tx frequency, gain, sweep, etc.) — it does not touch the DATV topic tree.
+trxd reuses sdroxide crates (DSP, TCI server, rigctld server, DeepCW skimmer)
+pinned by git rev in `src/trxd/Cargo.toml`. A `[patch]` section currently
+points all of them at the local worktree `../sdroxide-vhf` (branch
+`vhf-cw-segments`, uncommitted): VHF+ CW segments (the skimmer never spotted
+above 30 MHz without them) and sdroxide-deepcw's `embedded-model` feature +
+`set_weights()` (model in flash). Remove it once that branch is pushed and bump
+the rev.
 
-### Cross-compiling companion projects with the Buildroot SDK
+## FPGA
 
-To cross-compile an external project (e.g. pluto-ori-ps) against this firmware's toolchain and libraries, source a board's generated SDK environment rather than hand-rolling a toolchain:
+Bitstreams come from the `simple` project in the maia-sdr fork
+(`/home/dawszy/git/my/maia-sdr`, branch `simple`,
+`maia-hdl/projects/simple`): AD9361 + DMA + x8 FIR decimator/interpolator,
+`refmeter` (reference counter vs 1PPS / software snapshots, 0x43C10000), and
+Maia's spectrometer only (`maia_scope.tcl`, 0x7C460000, ring at
+0x16000000 - the web UI's wide scope, read by `src/trxd/src/maia.rs`), and
+on Libre `vctcxo_lock` + `iq_xo_corrector`.
 
 ```bash
-source output/<board>/host/environment-setup
+cd /home/dawszy/git/my/maia-sdr/maia-hdl/projects/simple
+source /home/dawszy/git/my/maia-sdr/sourceme.local
+PROJECT_NAME=plutoskyr2 make all   # installs board/tezuka/plutoskyr2/bitstream/simple.xsa here
 ```
 
-This exports `CC`/`CXX` (`arm-linux-gcc`/`arm-linux-g++`), `CROSS_COMPILE=arm-linux-`, and `STAGING_DIR` pointing at that board's sysroot (`output/<board>/host/arm-buildroot-linux-gnueabihf/sysroot`), which already contains this firmware's built libraries and headers (libiio, mosquitto, libgse, NE10, civetweb, ...) — no separate SDK install needed.
+Pass `PROJECT_NAME` in the environment, not as a make argument (ADI's
+makefile turns command-line variables into a sub-directory). Each build starts
+with `rm -rf *.log *.runs ...` in the project directory, so keep build logs
+elsewhere, and build boards one after another.
 
-Pick a board whose output already has the dependencies the external project needs — not every board builds every optional package. For pluto-ori-ps (needs libgse, NE10, civetweb, libiio, mosquitto): `output/pluto` is missing libgse/NE10 (`package/pluto_stream` in this repo isn't wired into any board defconfig yet), but `output/fishball7020` already has all of them built.
-
-```bash
-cd /home/hp-z2-dev/prog/pluto-ori-ps
-source /media/hp-z2-dev/Variste/Doc/prog/tezuka_fw/output/fishball7020/host/environment-setup
-make pluto_stream   # or: make   (builds pluto_mqtt_ctrl, pluto_stream, iio_ws_proxy)
-```
-
-### Testing a binary on a physical board (scp/ssh)
-
-For quick verification without a full firmware reflash, there's a physical test board reachable over the network — root/analog over SSH (password auth). The board's IP can change between sessions (DHCP), so confirm it with the user rather than assuming a previously-used address still applies. If unsure, `iio_info -S` lists reachable IIO contexts including each board's mDNS hostname/IP (e.g. `192.168.2.1 (PCIeSDR (Z7010-AD9361)) [pciesdr7010.local]`), which is a fast way to (re)discover a board's address without asking.
-
-The on-target binary is usually already running, so `scp` straight to `/usr/bin/<binary>` fails with "Text file busy". Copy to a temp name and `mv` into place instead (an atomic rename over a running executable is fine on Linux — the old process keeps its already-open inode):
-
-```bash
-ssh-keygen -f ~/.ssh/known_hosts -R "<board-ip>"        # boards regenerate their host key on reflash
-sshpass -p analog scp <binary> root@<board-ip>:/usr/bin/<binary>.new
-sshpass -p analog ssh root@<board-ip> "cp -n /usr/bin/<binary> /usr/bin/<binary>.orig; \
-  chmod 755 /usr/bin/<binary>.new && mv /usr/bin/<binary>.new /usr/bin/<binary>"
-```
-
-The `S96plutostream` init script's `stop()` is a no-op (just echoes "Stopping"), so restart the process manually after replacing the binary:
-
-```bash
-sshpass -p analog ssh root@<board-ip> "pkill <binary>; nohup /usr/bin/<binary> >/tmp/<binary>.log 2>&1 </dev/null & disown"
-```
-
-### Updating boot artifacts (kernel/dtb/BOOT.bin) on a physical board's SD card
-
-For an SD-booting board (not QSPI), the SD card's boot partition is auto-mounted at `/boot` on the running system (the same partition `post-image.sh` populates as `images/sdimg/`: `BOOT.bin`, `uImage`, `uramdisk.image.xz`, `devicetree.dtb`, `uEnv.txt`). After a rebuild, these can be updated in place over SSH instead of pulling the physical card to reflash it — none of them are an executing binary, so a plain `scp` overwrite (no temp-name/`mv` dance) is fine:
-
-```bash
-sshpass -p analog scp output/<board>/images/sdimg/{BOOT.bin,uImage,uramdisk.image.xz,devicetree.dtb,uEnv.txt} root@<board-ip>:/boot/
-sshpass -p analog ssh root@<board-ip> "sync; reboot"
-```
-
-Confirm the board is actually SD-booting (not QSPI) before relying on this — see the board's boot-mode DIP switch reference if unsure.
-
-### Testing the Dashboard against a physical board
-
-`Dashboard/data.jsx` has a dev-host override right at the top:
-
-```js
-const MQTT_DEV_HOST = '<board-ip>';   // set to the board's IP for local development; null = window.location.hostname (on-device)
-```
-
-This is a working-tree-only value (not meant to be committed as a real IP) — check `git diff Dashboard/data.jsx` first, since it may already carry someone else's in-progress local value; ask before overwriting/reverting it. Setting it points the browser's MQTT WebSocket connection (`ws://<board-ip>:9001/mqtt`) at the physical board instead of `window.location.hostname`, so the Dashboard can be served from a laptop while driving a real board's MQTT broker.
-
-```bash
-cd Dashboard && python3 -m http.server 8099
-# open http://localhost:8099/Tezuka%20Dashboard.html#datv
-```
-
-Combined with a Chrome automation tool, this gives an end-to-end UI test path: drive a control (e.g. the DATV Controller's Stream mode dropdown or PTT button) in the browser, then confirm the effect on real hardware over SSH (e.g. `cat /sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown`) — see "Testing a binary on a physical board" above for SSH access. Stop the local server (`pkill -f "http.server 8099"`) and restore any board/UI state changed during the test when done.
-
-Since this is live hardware (not disposable CI infra), confirm with the user before overwriting a running service binary, and back up the original first as shown above.
-
-### Key custom packages
-
-| Package | Description |
-|---------|-------------|
-| `board-fpga` | Extracts FPGA bitstream from board-local `.xsa` |
-| `maia-httpd` | Rust web server (cross-compiled for armv7, branch `sweep`) |
-| `maia-wasm` / `maia-kmod` | Maia-SDR WebAssembly UI and kernel module |
-| `tezuka_tools` | On-target shell utilities |
-| `sdr_usb_gadget` | USB gadget configuration (SDR + audio + mass storage) |
-| `civetwebws` | CivetWeb with WebSocket support |
-
-### CI
-
-`.github/workflows/main.yml` builds a matrix from `boards.json`. On tag push (`vX.Y.Z`), it publishes a GitHub release with per-board zips (a grouped board, e.g. `fishball_mini_7010`, ships merged into its counterpart's zip, e.g. `fishball`, when both were built — see "Board groups" above) and git-cliff release notes. Manual dispatch builds artifacts only (no release). ccache is keyed per board; Buildroot downloads are shared across the matrix.
+Register map / control bits trxd relies on:
+- `0x790200BC` / `0x790240BC` bit 0: RX decimator / TX interpolator enable.
+- `0x43C10000` refmeter (see `refmeter.v` header).
+- PlutoSky R2 EXT_IO0 (Y18, bank 33 = 3.3 V) = GPS 1PPS -> refmeter and EMIO
+  52 (gpio 106, `pps-gpio` -> `/dev/pps0`).
 
 ## Important constraints
 
-- Never read, grep, or glob inside the `buildroot/` directory — it is a downloaded third-party tree.
-- `boards.json` must stay in sync with `configs/` — adding a new board requires both a `*_defconfig` in `configs/` and an entry in `boards.json`.
-- The Buildroot version is pinned in `buildroot.version`; bump `BR_VERSION`, `BR_SHA256`, and `BR_SHA256_GITHUB` together (the latter pins `getbuildroot.sh`'s GitHub-mirror fallback, used when buildroot.org itself is unreachable — a stale `BR_SHA256_GITHUB` means the fallback only breaks during an actual outage, so don't forget it on a version bump).
-
-## Verification (always do this before marking a task done)
-## Verification (always do this before marking a task done)
-
-- Kernel/rootfs: confirm `make` completes without errors AND the generated
-  image has the expected size (Buildroot post-image failures are often silent)
-- DTB: validate with `fdtdump` / `dtc -I dtb -O dts` after any device tree change
-- `bootgen` (Xilinx tool) is required for image assembly. If the host-built `bootgen` is broken, `bootgen-xlnx` system package is the fallback (`sudo apt install bootgen-xlnx`).
+- Never read, grep, or glob inside `buildroot/` (third-party tree).
+- U-Boot boot scripts (`board/tezuka/common/uboot-env.txt`: ab_count,
+  slot_select, qspi_slot_select, qspiboot) can be exercised in U-Boot sandbox
+  (build `sandbox_defconfig` from output/<board>/build/uboot-custom, import the
+  file with `host load hostfs` + `env import -t`). Do that after any change:
+  a broken script strands a remote board at the U-Boot prompt.
+- Do not modify the board scripts `S22refclk` (R2 ADF4001 source) or
+  `S22gpsdo`/`gpsdo_boot.sh` (Libre vctcxo_lock acquisition) from trxd; trxd
+  only reports on Libre's hardware loop.
+- Verify before calling a task done: `cargo test` for trxd; for images, a
+  complete `make` and a sane image size; for DTS changes, `dtc -I dtb -O dts`.
 
 ## Git
-- Do not mention Claude as author or co-author in commit messages (no
-  "Co-Authored-By: Claude" trailer, no "Generated with Claude Code" line).
+- Do not mention Claude as author or co-author in commit messages.
 - Stage only files you changed. Commit/push only when asked.
-- ASCII, no embedded double-quotes
-
-
-
+- ASCII, no embedded double-quotes.

@@ -21,15 +21,19 @@
 			type = "flat_dt";
 			arch = "arm";
 			compression = "none";
+			/* No hash: U-Boot's adi_loadvals edits this blob in place
+			 * inside the loaded FIT (fdt set/rm), so bootm would reject it. */
 		};
 
 		fpga@1 {
 			description = "FPGA";
-			data = /incbin/("system_top.bit");
+			/* gzip: U-Boot decompresses FPGA images to their load address
+			 * (boot/image-fit.c), ~2.3 MB -> ~0.5 MB in the flash slot. */
+			data = /incbin/("system_top.bit.gz");
 			type = "fpga";
 			compatible = "u-boot,fpga-legacy";
 			arch = "arm";
-			compression = "none";
+			compression = "gzip";
 			load = <0xF000000>;
 			hash@1 {
 				algo = "md5";
@@ -38,11 +42,14 @@
 
 		linux_kernel@1 {
 			description = "Linux";
-			data = /incbin/("zImage");
+			/* lzma: 1.6 MB smaller than zImage, and U-Boot decompresses it
+			 * itself, which sidesteps the zImage self-decompression
+			 * corruption past 0xE88000 (tezuka issue #450). */
+			data = /incbin/("Image.lzma");
 			type = "kernel";
 			arch = "arm";
 			os = "linux";
-			compression = "none";
+			compression = "lzma";
 			load = <0x8000>;
 			entry = <0x8000>;
 			hash@1 {

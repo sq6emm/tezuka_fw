@@ -1,6 +1,0 @@
-config BR2_PACKAGE_RUST_WASM
-	bool "rust-wasm"
-    depends on BR2_PACKAGE_HOST_RUSTC_TARGET_ARCH_SUPPORTS
-	select BR2_PACKAGE_HOST_RUSTC
-	help
-	   Rust standard library for the wasm.

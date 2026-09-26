@@ -1,0 +1,1825 @@
+//! `role = "trx"`: the remote transceiver.
+//!
+//! One engine thread, driven by receive blocks (10 ms each):
+//!
+//! ```text
+//! RX 384k ─┬─ DDC(vfo) ─ 48k IQ ─┬─ demod ─ AGC ─ audio ─┬─ TCI RX audio
+//!          │                     │                      └─ 12k ─┬─ Q65/PI4 slots ─ decoders ─ MQTT
+//!          │                     │                              └─ live CW (DeepCW at the pitch)
+//!          └─ DDC(0) ─ TCI IQ (48/96/192/384k)
+//!
+//! TCI TX audio / CW keyer / tune ─ modulator 48k ─ DUC ─ NCO(vfo) ─ TX 384k
+//! ```
+//!
+//! Transmit is paced by receive: every RX block produces exactly one TX block
+//! (silence when not keyed), so the DAC queue never drifts.
+
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+use crossbeam_channel::{Receiver, Sender};
+use num_complex::Complex32;
+use sdroxide_dsp::{
+    Agc, AutoNotch, Cessb, Ddc, Decimator, Demodulator, Duc, Modulator, Nco, NoiseBlanker, RealFir, RealFirDecim, SpectralNr,
+    SsbMod,
+    lowpass_taps, make_demod, make_modulator,
+};
+use sdroxide_rigctld::{RigState, RigctldController, ServerRequest as RigRequest};
+use sdroxide_tci::server::{ServerRequest as TciRequest, TciServerController, TciStateSnapshot};
+use sdroxide_types::{
+    AgcMode, Band, Command, DeviceCaps, Mode, RigctldConfig, TciServerConfig, TxTelemetry, Vfo,
+};
+use serde::Serialize;
+use tracing::{debug, info, warn};
+
+use crate::config::{Config, DecoderKind, GainMode};
+use crate::cwlive::CwLiveThread;
+use crate::settings::{Settings, Transverter};
+use crate::decode::{Decode, DecodeWorker, Job, Q65Letter};
+use crate::keyer::CwKeyer;
+use crate::mqtt::Mqtt;
+use crate::pace::TxPace;
+use crate::radio::RadioControl;
+use crate::scope::{self, Scope};
+use crate::web::WebHandle;
+use crate::slots::SlotRecorder;
+use crate::stream::{RxBlock, time_synced};
+
+/// Channel (audio) rate.
+const CH_RATE: f64 = 48_000.0;
+/// Demodulator rate for the narrow modes (SSB, CW, data): a quarter of the
+/// channel, where their 3 kHz fits with room to spare. The demodulator's
+/// passband FIR is the engine's biggest cost at 48 kHz (measured ~45 % of a
+/// Cortex-A9 core); here it is a quarter of that.
+const NARROW_RATE: f64 = 12_000.0;
+
+/// Whether a mode demodulates at [`NARROW_RATE`].
+fn narrow_mode(m: Mode) -> bool {
+    !matches!(m, Mode::Am | Mode::Sam | Mode::Nfm | Mode::Wfm | Mode::Dsb)
+}
+/// CW sidetone pitch: CW sits this far above the dial, as in sdroxide.
+const CW_PITCH_HZ: f64 = 700.0;
+/// Tune carrier offset in the sideband modes.
+const TUNE_TONE_HZ: f64 = 1_000.0;
+/// Keep the VFO at least this far from the LO (DC spike) and from the band edge.
+const EDGE_MARGIN_HZ: f64 = 5_000.0;
+/// MUTE AT TX: the receiver stays muted this long after unkeying (T/R switching,
+/// the tail of our own signal).
+const RX_RECOVER: Duration = Duration::from_millis(150);
+/// Unkey after this long without TX audio from the keying TCI client.
+const TCI_STARVE: Duration = Duration::from_millis(1_500);
+/// CW keyer: stay keyed this long after the last element (semi break-in).
+const CW_HANG: Duration = Duration::from_millis(400);
+/// Web microphone: audio buffered before the first sample goes out (12 kHz).
+const MIC_PREROLL: usize = 1_200;
+/// Web microphone silent this long while keyed: the browser is gone.
+const MIC_STARVE: Duration = Duration::from_secs(2);
+/// Scope spans served from the 48 kS/s channel (finer bins) up to this. The
+/// view stays put while the VFO moves inside it, so the channel must cover a
+/// whole span either side of the VFO: 2 x 10 kHz fits in its +/-21.6 kHz.
+const NARROW_SPAN_MAX: f64 = 20_000.0;
+/// Up to this the ARM FFT of the decimated stream serves the scope; wider
+/// spans come from Maia's spectrometer in the FPGA (full ADC rate).
+const STREAM_SPAN_MAX: f64 = 300_000.0;
+/// Web scope spans up to this keep the LO (the AD936x DC spike) outside the
+/// view: the LO goes beside the view, at most `rate * 0.4` from the VFO, which
+/// leaves tuning room either way up to +/-50 kHz. Wider views blank it instead.
+const DC_AVOID_SPAN_MAX: f64 = 100_000.0;
+/// Room between the edge of the view and the LO.
+const DC_GUARD_HZ: f64 = 5_000.0;
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct PublicState {
+    role: &'static str,
+    freq_hz: f64,
+    tx_freq_hz: f64,
+    mode: &'static str,
+    filter: (f32, f32),
+    ptt: bool,
+    tune: bool,
+    center_hz: f64,
+    rx_gain_db: f64,
+    s_dbfs: i32,
+    tx_attenuation_db: f64,
+    drive_pct: u32,
+    tci_clients: usize,
+    rigctl_clients: usize,
+    time_synced: bool,
+}
+
+/// Where the transmit audio is coming from right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxSource {
+    /// A TCI client holds the key and streams audio.
+    Tci,
+    /// PTT from rigctl / MQTT: TCI audio if any client streams it, else silence.
+    Ptt,
+    /// Keyer text from `cmd/cw`: unkeys by itself when the text is sent.
+    Cw,
+    /// PTT held in CW mode: the keyer sends whatever is queued, and the
+    /// transmitter stays up until PTT is released.
+    CwPtt,
+    Tune,
+    /// The web UI's PTT in CW mode: a straight key, carrier at the pitch
+    /// while it is held, with shaped edges.
+    Key,
+    /// A browser's microphone (web UI), identified by its connection.
+    Web(u64),
+}
+
+pub struct Trx {
+    cfg: Config,
+    radio: Box<dyn RadioControl>,
+    rate: f64,
+    block: usize,
+
+    // Radio state
+    vfo_a: f64,
+    vfo_b: f64,
+    active: Vfo,
+    split: bool,
+    mode: Mode,
+    filter: (f32, f32),
+    volume: f32,
+    muted: bool,
+    drive: f32,
+    center: f64,
+    rx_gain_mode: GainMode,
+    rx_gain_db: f64,
+    tx_att_db: f64,
+    /// RIT / XIT: (on, offset Hz) added to the receive / transmit frequency.
+    rit: (bool, f64),
+    xit: (bool, f64),
+    /// Mode and filter of VFO A and B (the active one's are `mode`/`filter`).
+    vfo_mode: [(Mode, (f32, f32)); 2],
+    /// Transverters and S-meter calibration, kept on the board.
+    settings: Settings,
+    settings_dir: std::path::PathBuf,
+    /// The transverter the LO is currently tuned through (None: direct).
+    xvtr: Option<Transverter>,
+
+    // Receive DSP
+    ddc: Ddc,
+    demod: Box<dyn Demodulator>,
+    agc: Agc,
+    agc_mode: AgcMode,
+    nb: Option<NoiseBlanker>,
+    notch: Option<AutoNotch>,
+    nr: Option<SpectralNr>,
+    /// Squelch threshold (channel dBFS; None = open) and whether it is open.
+    squelch_db: Option<f32>,
+    squelch_open: bool,
+    /// Gain-compensated channel level, smoothed (S-meter / calibration).
+    reading_db: f64,
+    /// Front-end gain actually in force (the AD936x AGC moves it), read by a
+    /// background thread (an SPI round trip takes ~70 ms) as f64 bits.
+    hw_gain_db: f64,
+    hw_gain: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// FPGA and AD936x temperatures (web header).
+    temps: std::sync::Arc<std::sync::Mutex<crate::temps::Temps>>,
+    chan: Vec<Complex32>,
+    /// The mode demodulates at 12 kHz (see [`NARROW_RATE`]).
+    narrow: bool,
+    dec4: Decimator,
+    chan12: Vec<Complex32>,
+    /// 12 -> 48 kHz for TCI clients' receive audio in the narrow modes.
+    tci_up: RealFir,
+    audio: Vec<f32>,
+    iq_tap: Option<(u32, Ddc)>,
+    iq_buf: Vec<Complex32>,
+    dec12: RealFirDecim,
+    audio12: Vec<f32>,
+    slots: Vec<(DecoderKind, SlotRecorder)>,
+    decoder: DecodeWorker,
+    /// Live CW copy of the station at the CW pitch (web CW box, MQTT cw/text).
+    cwlive: CwLiveThread,
+    /// The CW decoder's own slow AGC, on the audio before the listening AGC:
+    /// a fast AGC pumps up the noise in every key-up (F1A beacons leave the
+    /// passband silent then) and the pops read as dits.
+    cw_agc: Agc,
+    cw_audio: Vec<f32>,
+    s_dbfs: f32,
+
+    // Transmit DSP
+    tx_on: Option<TxSource>,
+    tx_since: Option<Instant>,
+    /// MUTE AT TX: the receiver is muted until then after TX.
+    rx_quiet_until: Option<Instant>,
+    modulator: Option<Box<dyn Modulator>>,
+    duc: Duc,
+    tx_nco: Nco,
+    keyer: CwKeyer,
+    cw_idle_since: Option<Instant>,
+    tune_phase: f64,
+    tx_fifo: VecDeque<f32>,
+    tx_bb: Vec<Complex32>,
+    tx_up: Vec<Complex32>,
+    tx_out: VecDeque<Complex32>,
+    pace: TxPace,
+    tci_last_audio: Instant,
+    tx_sink: Sender<Vec<Complex32>>,
+    /// Speech compressor (controlled-envelope SSB) and its drive, dB.
+    comp: Option<Cessb>,
+    comp_db: f32,
+    mic_gain: f32,
+    /// CW semi break-in: stay keyed this long after the last element.
+    cw_hang: Duration,
+    /// Straight key: held down, and the envelope (0..1) of its carrier.
+    key_down: bool,
+    key_env: f32,
+
+    // Web UI
+    web: Option<WebHandle>,
+    scope_wide: Scope,
+    scope_narrow: Scope,
+    maia: Option<Receiver<Vec<f32>>>,
+    web_span: f64,
+    /// Centre of the web scope: fixed while the VFO moves inside the view,
+    /// recentred on the VFO when it leaves (0 = recentre on the next row).
+    web_center: f64,
+    /// Scope keeps the VFO in the middle (CTR) instead of a fixed view.
+    scope_center: bool,
+    web_audio: Vec<f32>,
+    web_state: Option<String>,
+    web_state_at: Instant,
+    web_meter_at: Instant,
+    mic_up: RealFir,
+    mic_started: bool,
+    mic_last: Instant,
+    mic_buf: Vec<f32>,
+
+    // Control surfaces
+    tci: Option<TciServerController>,
+    rig: Option<RigctldController>,
+    mqtt: Mqtt,
+    last_rig: Option<RigState>,
+    last_tci: Option<TciStateSnapshot>,
+    last_public: Option<PublicState>,
+    last_public_at: Instant,
+    /// Engine time per stage since the last load report (see [`STAGES`]).
+    prof: [Duration; STAGES.len()],
+}
+
+/// Stages of one engine block, for the per-minute profile.
+const STAGES: [&str; 9] = ["tci_iq", "ddc", "rx_dsp", "audio12", "scope", "slots", "tci_audio", "transmit", "rest"];
+
+fn mode_name(m: Mode) -> &'static str {
+    sdroxide_rigctld::to_hamlib_mode(m)
+}
+
+impl Trx {
+    pub fn new(
+        cfg: Config,
+        radio: Box<dyn RadioControl>,
+        tx_sink: Sender<Vec<Complex32>>,
+        mqtt: Mqtt,
+        web: Option<WebHandle>,
+    ) -> Self {
+        let rate = radio.stream_rate();
+        let block = cfg.radio.buffer_samples;
+        let mode = sdroxide_rigctld::from_hamlib_mode(&cfg.trx.mode).unwrap_or(Mode::Usb);
+        let filter = mode.default_filter();
+        let vfo = cfg.trx.freq_hz;
+        let settings_dir = std::path::PathBuf::from(&cfg.web.state_dir);
+        let settings = Settings::load(&settings_dir);
+
+        let tci = {
+            let tc = TciServerConfig {
+                enabled: true,
+                bind: cfg.trx.tci_bind.clone(),
+                port: cfg.trx.tci_port,
+                device_name: "tezuka-trxd".into(),
+                allow_tx: cfg.trx.allow_tx,
+                max_clients: 4,
+            };
+            let snap = TciStateSnapshot::default();
+            match TciServerController::start(&tc, &Self::caps(&cfg, rate), snap) {
+                Ok(t) => {
+                    info!(addr = t.addr(), "TCI server");
+                    Some(t)
+                }
+                Err(e) => {
+                    warn!("TCI server: {e}");
+                    None
+                }
+            }
+        };
+        let rig = {
+            let rc = RigctldConfig {
+                enabled: true,
+                bind: cfg.trx.rigctl_bind.clone(),
+                port: cfg.trx.rigctl_port,
+                allow_tx: cfg.trx.allow_tx,
+                max_clients: 4,
+                rig_name: "tezuka-trxd".into(),
+            };
+            match RigctldController::start(&rc, RigState::default()) {
+                Ok(r) => {
+                    info!(addr = r.addr(), "rigctld server");
+                    Some(r)
+                }
+                Err(e) => {
+                    warn!("rigctld server: {e}");
+                    None
+                }
+            }
+        };
+
+        let slots = cfg.trx.decoders.iter().filter_map(|d| slot_recorder(*d).map(|r| (*d, r))).collect();
+
+        let mut agc = Agc::new(CH_RATE);
+        agc.set_mode(AgcMode::Med);
+
+        let mut t = Trx {
+            radio,
+            rate,
+            block,
+            vfo_a: vfo,
+            vfo_b: vfo,
+            active: Vfo::A,
+            split: false,
+            mode,
+            filter,
+            volume: 0.5,
+            muted: false,
+            drive: 1.0,
+            center: 0.0,
+            rx_gain_mode: cfg.radio.rx_gain_mode,
+            rx_gain_db: cfg.radio.rx_gain_db,
+            tx_att_db: cfg.radio.tx_attenuation_db,
+            rit: (false, 0.0),
+            xit: (false, 0.0),
+            vfo_mode: [(mode, filter); 2],
+            settings,
+            settings_dir,
+            xvtr: None,
+            nb: None,
+            notch: None,
+            nr: None,
+            squelch_db: None,
+            squelch_open: true,
+            reading_db: -120.0,
+            hw_gain_db: cfg.radio.rx_gain_db,
+            hw_gain: None,
+            temps: Default::default(),
+            comp: None,
+            comp_db: 10.0,
+            mic_gain: 1.0,
+            cw_hang: CW_HANG,
+            key_down: false,
+            key_env: 0.0,
+            scope_center: false,
+            ddc: Ddc::new(rate, CH_RATE),
+            demod: make_demod(mode, CH_RATE).expect("sideband demod"),
+            agc,
+            agc_mode: AgcMode::Med,
+            chan: Vec::new(),
+            narrow: false,
+            dec4: Decimator::new(4),
+            chan12: Vec::new(),
+            tci_up: RealFir::new(lowpass_taps(95, 3_600.0 / CH_RATE)),
+            audio: Vec::new(),
+            iq_tap: None,
+            iq_buf: Vec::new(),
+            dec12: RealFirDecim::new(63, 5_000.0, CH_RATE, 4),
+            audio12: Vec::new(),
+            slots,
+            decoder: DecodeWorker::new(),
+            cw_agc: {
+                let mut a = Agc::new(NARROW_RATE);
+                a.set_mode(AgcMode::Slow);
+                a
+            },
+            cw_audio: Vec::new(),
+            cwlive: CwLiveThread::start(12_000.0, CW_PITCH_HZ as f32, cfg.trx.cw_engine == "neural"),
+            s_dbfs: -120.0,
+            tx_on: None,
+            tx_since: None,
+            rx_quiet_until: None,
+            modulator: None,
+            duc: Duc::new(CH_RATE, rate),
+            tx_nco: Nco::new(0.0, rate),
+            keyer: CwKeyer::new(CH_RATE, CW_PITCH_HZ, cfg.trx.cw_wpm as f32),
+            cw_idle_since: None,
+            tune_phase: 0.0,
+            tx_fifo: VecDeque::new(),
+            tx_bb: Vec::new(),
+            tx_up: Vec::new(),
+            tx_out: VecDeque::new(),
+            pace: TxPace::default(),
+            tci_last_audio: Instant::now(),
+            tx_sink,
+            web,
+            scope_wide: Scope::new(4096, rate, 15.0, 45.0),
+            scope_narrow: Scope::new(2048, CH_RATE, 15.0, 23.0),
+            maia: None,
+            web_span: 96_000.0,
+            web_center: 0.0,
+            web_audio: Vec::new(),
+            web_state: None,
+            web_state_at: Instant::now(),
+            web_meter_at: Instant::now(),
+            // x4 interpolation filter for 12 -> 48 kHz microphone audio.
+            mic_up: RealFir::new(lowpass_taps(95, 3_600.0 / CH_RATE)),
+            mic_started: false,
+            mic_last: Instant::now(),
+            mic_buf: Vec::new(),
+            tci,
+            rig,
+            mqtt,
+            last_rig: None,
+            last_tci: None,
+            last_public: None,
+            last_public_at: Instant::now(),
+            prof: [Duration::ZERO; STAGES.len()],
+            cfg,
+        };
+        t.retune(true);
+        t.rebuild_demod();
+        if let Some(mut read) = t.radio.rx_gain_reader() {
+            let g = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(t.rx_gain_db.to_bits()));
+            let out = g.clone();
+            let _ = std::thread::Builder::new().name("rx-gain".into()).spawn(move || loop {
+                if let Some(db) = read() {
+                    out.store(db.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            });
+            t.hw_gain = Some(g);
+        }
+        if t.web.is_some() && t.cfg.radio.backend == crate::config::Backend::Iio {
+            t.temps = crate::temps::start();
+            t.maia = crate::maia::start(t.cfg.radio.adc_rate as f64, 15.0);
+        }
+        t
+    }
+
+    fn caps(cfg: &Config, rate: f64) -> DeviceCaps {
+        let range = (cfg.radio.freq_min_hz, cfg.radio.freq_max_hz);
+        DeviceCaps {
+            driver: "tezuka".into(),
+            label: "AD936x".into(),
+            rx_channels: 1,
+            tx_channels: 1,
+            full_duplex: true,
+            tx_audio: true,
+            freq_ranges_rx: vec![range],
+            freq_ranges_tx: if cfg.trx.allow_tx { vec![range] } else { Vec::new() },
+            sample_rates: [48_000.0, 96_000.0, 192_000.0, 384_000.0].into_iter().filter(|r| *r <= rate).collect(),
+            ..DeviceCaps::default()
+        }
+    }
+
+    fn rx_vfo(&self) -> f64 {
+        match self.active {
+            Vfo::A => self.vfo_a,
+            Vfo::B => self.vfo_b,
+        }
+    }
+
+    fn tx_vfo(&self) -> f64 {
+        match (self.active, self.split) {
+            (Vfo::A, false) | (Vfo::B, true) => self.vfo_a,
+            _ => self.vfo_b,
+        }
+    }
+
+    /// Where the receiver listens: the active VFO plus RIT.
+    fn rx_eff(&self) -> f64 {
+        self.rx_vfo() + if self.rit.0 { self.rit.1 } else { 0.0 }
+    }
+
+    /// Where the transmitter sends: the TX VFO plus XIT.
+    fn tx_eff(&self) -> f64 {
+        self.tx_vfo() + if self.xit.0 { self.xit.1 } else { 0.0 }
+    }
+
+    /// Clamp a frequency to what can be reached: the AD936x itself or a
+    /// transverter's band.
+    fn reachable(&self, hz: f64) -> f64 {
+        if self.settings.transverter(hz).is_some() {
+            hz
+        } else {
+            hz.clamp(self.cfg.radio.freq_min_hz, self.cfg.radio.freq_max_hz)
+        }
+    }
+
+    /// Lowest and highest frequency the operator can tune (the transverter
+    /// bands included).
+    fn freq_range(&self) -> (f64, f64) {
+        self.settings.transverters.iter().fold((self.cfg.radio.freq_min_hz, self.cfg.radio.freq_max_hz), |(a, b), t| {
+            (a.min(t.rf_min), b.max(t.rf_max))
+        })
+    }
+
+    /// Keep the LO so both VFOs sit inside the usable stream, clear of DC.
+    /// Retunes the hardware only when a VFO has walked out of the window, so
+    /// a TCI client's IQ panorama stays put while the operator tunes.
+    ///
+    /// Every frequency here is the one on the air; through a transverter the
+    /// AD936x is set to its IF, and an LO above the band mirrors the spectrum
+    /// (undone by conjugating the samples both ways).
+    fn retune(&mut self, force: bool) {
+        let half = self.rate * 0.4;
+        let rx = self.rx_eff();
+        let tx = self.tx_eff();
+        let keepout = self.dc_keepout();
+        let clear = |c: f64| keepout.is_none_or(|(a, b)| c < a || c > b);
+        let fits = |f: f64, c: f64| {
+            let off = f - c;
+            off.abs() < half - EDGE_MARGIN_HZ && off.abs() > EDGE_MARGIN_HZ
+        };
+        let fits_all = |c: f64| fits(rx, c) && (self.tx_on.is_none() || fits(tx, c));
+        if !force && fits_all(self.center) && clear(self.center) {
+            self.apply_offsets();
+            return;
+        }
+        let anchor = if self.tx_on.is_some() && !fits(tx, self.center) { tx } else { rx };
+        let xvtr = self.settings.transverter(anchor).cloned();
+        // The LO sits `lo_offset` below the signal on the air, which through an
+        // inverting transverter is above it on the AD936x.
+        let mut lo = anchor - self.cfg.radio.lo_offset_hz * if xvtr.as_ref().is_some_and(|t| t.inverted) { -1.0 } else { 1.0 };
+        // With the web scope open, the DC spike goes beside the view: halfway
+        // between the view and the farthest the VFO (and TX) may be from the
+        // LO, for the most tuning before the next move.
+        if let Some((a, b)) = keepout.filter(|_| !clear(lo)) {
+            let reach = half - EDGE_MARGIN_HZ;
+            let (lo_min, lo_max) = if self.tx_on.is_some() {
+                (rx.max(tx) - reach, rx.min(tx) + reach)
+            } else {
+                (rx - reach, rx + reach)
+            };
+            let below = (lo_min + a) / 2.0;
+            let above = (b + lo_max) / 2.0;
+            if lo_min < a && fits_all(below) {
+                lo = below;
+            } else if lo_max > b && fits_all(above) {
+                lo = above;
+            } else if !force && fits_all(self.center) {
+                // No room beside the view (split far apart): stay put.
+                self.apply_offsets();
+                return;
+            }
+        }
+        if !force && (lo - self.center).abs() < 1.0 {
+            self.apply_offsets();
+            return;
+        }
+        let (min, max) = (self.cfg.radio.freq_min_hz, self.cfg.radio.freq_max_hz);
+        let (lo, hw) = match &xvtr {
+            Some(t) => {
+                let hw = t.to_if(lo).clamp(min, max);
+                (if t.inverted { t.lo_hz - hw } else { hw + t.lo_hz }, hw)
+            }
+            None => {
+                let lo = lo.clamp(min, max);
+                (lo, lo)
+            }
+        };
+        if let Err(e) = self.radio.set_lo(hw) {
+            warn!("tune {hw}: {e}");
+            return;
+        }
+        if xvtr != self.xvtr {
+            info!(xvtr = xvtr.as_ref().map(|t| t.name.as_str()), "transverter");
+            self.xvtr = xvtr;
+        }
+        debug!(lo, hw, "LO retuned");
+        self.center = lo;
+        // A row averaged across the move would smear the spectrum.
+        self.scope_wide.reset();
+        self.apply_offsets();
+    }
+
+    fn apply_offsets(&mut self) {
+        self.ddc.set_offset_hz(self.rx_eff() - self.center);
+        let tx_off = self.tx_eff() - self.center;
+        self.tx_nco.set_freq(tx_off, self.rate);
+    }
+
+    fn rebuild_demod(&mut self) {
+        let narrow = narrow_mode(self.mode);
+        let rate = if narrow { NARROW_RATE } else { CH_RATE };
+        self.demod = make_demod(self.mode, rate).unwrap_or_else(|| make_demod(Mode::Usb, rate).unwrap());
+        self.demod.set_filter(self.filter.0, self.filter.1);
+        if narrow != self.narrow {
+            self.narrow = narrow;
+            self.agc = Agc::new(rate);
+            self.agc.set_mode(self.agc_mode);
+            self.notch = self.notch.take().map(|_| AutoNotch::new());
+            self.nr = self.nr.take().map(|_| SpectralNr::new());
+        }
+        // CW from a TCI client arrives as a keyed sidetone: single-sideband it
+        // around the pitch so it lands at dial + pitch, where CW is received.
+        self.modulator = make_modulator(self.mode, CH_RATE, self.filter).or_else(|| {
+            (self.mode == Mode::Cw).then(|| Box::new(SsbMod::new(CH_RATE, 300.0, 1_100.0)) as Box<dyn Modulator>)
+        });
+        if self.comp.is_some() {
+            self.comp = Some(self.make_comp());
+        }
+    }
+
+    /// The speech compressor for the current filter, at the set drive.
+    fn make_comp(&self) -> Cessb {
+        let (a, b) = (self.filter.0.abs(), self.filter.1.abs());
+        let mut c = Cessb::new(CH_RATE, a.min(b).max(100.0), a.max(b).max(300.0));
+        c.set_compression_db(self.comp_db);
+        c
+    }
+
+    fn set_vfo(&mut self, vfo: Vfo, hz: f64) {
+        let hz = self.reachable(hz);
+        let before = self.rx_vfo();
+        match vfo {
+            Vfo::A => self.vfo_a = hz,
+            Vfo::B => self.vfo_b = hz,
+        }
+        // More than the AFC can follow: another station.
+        if (self.rx_vfo() - before).abs() > 30.0 {
+            self.cwlive.restart();
+        }
+        self.retune(false);
+    }
+
+    fn set_mode(&mut self, mode: Mode) {
+        if mode == self.mode {
+            return;
+        }
+        self.mode = mode;
+        self.filter = mode.default_filter();
+        self.rebuild_demod();
+        self.cwlive.restart();
+        self.vfo_mode[self.active as usize] = (self.mode, self.filter);
+    }
+
+    fn set_filter(&mut self, lo: f32, hi: f32) {
+        self.filter = (lo, hi);
+        self.demod.set_filter(lo, hi);
+        if let Some(m) = &mut self.modulator {
+            m.set_filter(lo, hi);
+        }
+        if let Some(c) = &mut self.comp {
+            c.set_filter(lo.abs().min(hi.abs()), lo.abs().max(hi.abs()));
+        }
+        self.vfo_mode[self.active as usize] = (self.mode, self.filter);
+    }
+
+    /// Make `v` the receive VFO, with the mode and filter it was left in.
+    fn select_vfo(&mut self, v: Vfo) {
+        if v == self.active {
+            return;
+        }
+        self.vfo_mode[self.active as usize] = (self.mode, self.filter);
+        self.active = v;
+        let (m, f) = self.vfo_mode[v as usize];
+        if m != self.mode {
+            self.mode = m;
+            self.filter = f;
+            self.rebuild_demod();
+        } else {
+            self.set_filter(f.0, f.1);
+        }
+        self.cwlive.restart();
+        self.retune(false);
+    }
+
+    /// Switch one of the slot decoders (Q65 / PI4) on or off. The live
+    /// CW box is always on.
+    fn set_decoder(&mut self, kind: DecoderKind, on: bool) {
+        let have = self.slots.iter().any(|(k, _)| *k == kind);
+        if on && !have {
+            if let Some(r) = slot_recorder(kind) {
+                self.slots.push((kind, r));
+                info!(?kind, "decoder on");
+            }
+        } else if !on && have {
+            self.slots.retain(|(k, _)| *k != kind);
+            info!(?kind, "decoder off");
+        }
+    }
+
+    /// The station callsign: the one set in the web UI, else trxd.toml's.
+    fn callsign(&self) -> String {
+        self.settings.callsign.clone().unwrap_or_else(|| self.cfg.callsign.trim().to_ascii_uppercase())
+    }
+
+    /// The S-meter calibration table in force: the transverter's name, or the band.
+    fn cal_band(&self) -> String {
+        let f = self.rx_eff();
+        match self.settings.transverter(f) {
+            Some(t) => t.name.clone(),
+            None => Band::containing(f).label().to_string(),
+        }
+    }
+
+    /// Frequencies the LO must keep out of so the DC spike stays off the web
+    /// scope: the view plus a guard, for spans up to [`DC_AVOID_SPAN_MAX`]
+    /// while a browser is watching. `None`: anywhere will do.
+    fn dc_keepout(&self) -> Option<(f64, f64)> {
+        let watching = self.web.as_ref().is_some_and(|w| w.clients() > 0);
+        if !watching || self.web_span > DC_AVOID_SPAN_MAX {
+            return None;
+        }
+        let c = if self.web_center == 0.0 { self.rx_vfo() } else { self.web_center };
+        let h = self.web_span / 2.0 + DC_GUARD_HZ;
+        Some((c - h, c + h))
+    }
+
+    /// Where the web scope is centred for this row: it stays put while the
+    /// VFO is inside the view, and recentres on the VFO when it leaves (or
+    /// when the rows could not cover the view any more).
+    fn web_view_center(&mut self) -> f64 {
+        let vfo = self.rx_vfo();
+        let half = self.web_span / 2.0;
+        let margin = self.web_span * 0.05;
+        let c = self.web_center;
+        let covered = if self.web_span <= NARROW_SPAN_MAX {
+            (c - vfo).abs() + half <= CH_RATE * 0.45
+        } else if self.web_span <= STREAM_SPAN_MAX || self.maia.is_none() {
+            (c - self.center).abs() + half <= self.rate / 2.0
+        } else {
+            true
+        };
+        if self.scope_center || c == 0.0 || (vfo - c).abs() > half - margin || !covered {
+            self.web_center = vfo;
+        }
+        self.web_center
+    }
+
+    // ---- Transmit control ----
+
+    fn key(&mut self, source: TxSource) {
+        if !self.cfg.trx.allow_tx {
+            warn!("transmit refused: trx.allow_tx = false");
+            return;
+        }
+        if let Some(t) = self.settings.transverter(self.tx_eff()) {
+            if !t.tx {
+                warn!(xvtr = %t.name, "transmit refused: transverter is receive-only");
+                return;
+            }
+        }
+        if self.tx_on.is_some() {
+            self.tx_on = Some(source);
+            return;
+        }
+        self.tx_on = Some(source);
+        self.tx_since = Some(Instant::now());
+        // Nothing more of the other station while we send: settle its tail.
+        self.cwlive.flush();
+        if let (TxSource::Web(client), Some(w)) = (source, &self.web) {
+            w.set_mic_owner(Some(client));
+            self.mic_started = false;
+            self.mic_last = Instant::now();
+        }
+        self.tx_fifo.clear();
+        self.tx_out.clear();
+        self.pace.rekey();
+        self.tci_last_audio = Instant::now();
+        self.retune(false);
+        if let Err(e) = self.radio.set_tx_rf(true) {
+            warn!("TX on: {e}");
+        }
+        std::thread::sleep(Duration::from_millis(self.cfg.radio.ptt_delay_ms as u64));
+        info!(freq = self.tx_vfo(), mode = mode_name(self.mode), ?source, "TX");
+    }
+
+    /// MUTE AT TX and transmitting (or just stopped): the receiver is muted.
+    fn rx_quiet(&self) -> bool {
+        self.settings.mute_at_tx
+            && (self.tx_on.is_some() || self.rx_quiet_until.is_some_and(|t| Instant::now() < t))
+    }
+
+    fn unkey(&mut self) {
+        if self.tx_on.take().is_none() {
+            return;
+        }
+        self.tx_since = None;
+        self.rx_quiet_until = Some(Instant::now() + RX_RECOVER);
+        self.keyer.abort();
+        if let Some(w) = &self.web {
+            w.set_mic_owner(None);
+        }
+        if let Some(t) = &mut self.tci {
+            t.drain_tx_audio();
+            t.deny_tx();
+        }
+        // Let the queued RF (a few blocks) drain before the relay drops.
+        std::thread::sleep(Duration::from_millis(self.cfg.radio.ptt_delay_ms as u64 + 30));
+        if let Err(e) = self.radio.set_tx_rf(false) {
+            warn!("TX off: {e}");
+        }
+        info!("RX");
+    }
+
+    // ---- Command handling (TCI / rigctld / MQTT all end up here) ----
+
+    fn apply(&mut self, cmd: Command) {
+        match cmd {
+            Command::SetVfo { vfo, hz } => self.set_vfo(vfo, hz),
+            Command::SelectVfo(v) => self.select_vfo(v),
+            Command::SwapVfos => {
+                std::mem::swap(&mut self.vfo_a, &mut self.vfo_b);
+                let (a, b) = (self.vfo_mode[0], self.vfo_mode[1]);
+                self.vfo_mode = [b, a];
+                let (m, f) = self.vfo_mode[self.active as usize];
+                self.mode = m;
+                self.filter = f;
+                self.rebuild_demod();
+                self.cwlive.restart();
+                self.retune(false);
+            }
+            Command::CopyAtoB => {
+                self.vfo_b = self.vfo_a;
+                self.vfo_mode[1] = self.vfo_mode[0];
+            }
+            Command::SetSplit(s) => {
+                self.split = s;
+                self.retune(false);
+            }
+            Command::SetMode { mode, .. } => self.set_mode(mode),
+            Command::SetFilter { lo, hi, .. } => self.set_filter(lo, hi),
+            Command::SetPtt(on) => {
+                if on {
+                    let src = if self.mode == Mode::Cw { TxSource::CwPtt } else { TxSource::Ptt };
+                    self.key(src);
+                } else {
+                    self.unkey();
+                }
+            }
+            Command::SetTune(on) => {
+                if on {
+                    self.key(TxSource::Tune)
+                } else {
+                    self.unkey()
+                }
+            }
+            Command::SetTxDrive(d) => self.drive = d.clamp(0.0, 1.0),
+            Command::SetVolume { v, .. } => self.volume = v.clamp(0.0, 1.0),
+            Command::SetMute { muted, .. } => self.muted = muted,
+            Command::SetAgc { agc, .. } => {
+                self.agc_mode = agc;
+                self.agc.set_mode(agc);
+            }
+            other => debug!(?other, "command not supported here"),
+        }
+    }
+
+    fn apply_mqtt(&mut self, name: &str, payload: &str) {
+        let num = payload.parse::<f64>();
+        match (name, num) {
+            ("freq", Ok(hz)) => self.set_vfo(self.active, hz),
+            ("mode", _) => match sdroxide_rigctld::from_hamlib_mode(payload) {
+                Some(m) => self.set_mode(m),
+                None => warn!("MQTT mode '{payload}' unknown"),
+            },
+            ("ptt", _) => self.apply(Command::SetPtt(matches!(payload, "1" | "true" | "on"))),
+            ("tune", _) => self.apply(Command::SetTune(matches!(payload, "1" | "true" | "on"))),
+            ("cw", _) => self.send_cw(payload),
+            ("cw_wpm", Ok(w)) => self.keyer.set_wpm(w as f32),
+            ("drive", Ok(p)) => self.drive = (p / 100.0).clamp(0.0, 1.0) as f32,
+            ("txatt", Ok(db)) => {
+                self.tx_att_db = db;
+                if let Err(e) = self.radio.set_tx_attenuation(db) {
+                    warn!("{e}");
+                }
+            }
+            ("rxgain", _) => {
+                let (mode, db) = match payload {
+                    "auto" | "slow" => (GainMode::SlowAttack, self.rx_gain_db),
+                    "fast" => (GainMode::FastAttack, self.rx_gain_db),
+                    p => match p.parse::<f64>() {
+                        Ok(db) => (GainMode::Manual, db),
+                        Err(_) => return warn!("MQTT rxgain '{p}'"),
+                    },
+                };
+                self.rx_gain_mode = mode;
+                self.rx_gain_db = db;
+                if let Err(e) = self.radio.set_rx_gain(mode, db) {
+                    warn!("{e}");
+                }
+            }
+            ("filter", _) => {
+                let v: Vec<f32> = payload.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                if v.len() == 2 {
+                    self.apply(Command::SetFilter { rx: sdroxide_types::RxId::Main, lo: v[0], hi: v[1] });
+                }
+            }
+            _ => warn!("MQTT command '{name}' = '{payload}' not understood"),
+        }
+    }
+
+    fn send_cw(&mut self, text: &str) {
+        if self.mode != Mode::Cw {
+            self.set_mode(Mode::Cw);
+        }
+        self.keyer.send(text);
+        self.cw_idle_since = None;
+        // Under a held PTT the text just joins the queue.
+        if self.tx_on != Some(TxSource::CwPtt) {
+            self.key(TxSource::Cw);
+        }
+    }
+
+    fn poll_controls(&mut self) {
+        let mut cmds = Vec::new();
+        let mut keys = Vec::new();
+        if let Some(t) = &self.tci {
+            for r in t.poll() {
+                match r {
+                    TciRequest::Cmd(c) => cmds.push(c),
+                    TciRequest::Key(on) => keys.push(on),
+                    TciRequest::Clients(n) => info!(clients = n, "TCI"),
+                }
+            }
+        }
+        if let Some(r) = &self.rig {
+            for q in r.poll() {
+                match q {
+                    RigRequest::Cmd(c) => cmds.push(c),
+                    RigRequest::Clients(n) => info!(clients = n, "rigctld"),
+                }
+            }
+        }
+        for c in cmds {
+            self.apply(c);
+        }
+        for on in keys {
+            if on {
+                self.key(TxSource::Tci);
+            } else {
+                self.unkey();
+            }
+        }
+        for (name, payload) in self.mqtt.poll_cmds() {
+            self.apply_mqtt(&name, &payload);
+        }
+    }
+
+    // ---- State out ----
+
+    fn publish_state(&mut self) {
+        let can_tx = self.cfg.trx.allow_tx;
+        let range = (self.cfg.radio.freq_min_hz, self.cfg.radio.freq_max_hz);
+        let strength = self.settings.dbm(&self.cal_band(), self.reading_db).round() as i32;
+        let rig = RigState {
+            vfo_a_hz: self.vfo_a,
+            vfo_b_hz: self.vfo_b,
+            active_vfo: self.active,
+            split: self.split,
+            mode: self.mode,
+            filter_lo: self.filter.0,
+            filter_hi: self.filter.1,
+            ptt: self.tx_on.is_some(),
+            tune: self.tx_on == Some(TxSource::Tune),
+            drive: self.drive,
+            volume: self.volume,
+            band: Band::containing(self.rx_vfo()),
+            muted: self.muted,
+            strength_dbm: strength,
+            can_tx,
+            rx_ranges: vec![range],
+            tx_ranges: if can_tx { vec![range] } else { Vec::new() },
+            ..RigState::default()
+        };
+        if self.last_rig.as_ref() != Some(&rig) {
+            if let Some(r) = &self.rig {
+                r.publish_state(rig.clone());
+            }
+            self.last_rig = Some(rig);
+        }
+
+        let iq_rate = self.iq_tap.as_ref().map_or(0, |(r, _)| *r);
+        let tci = TciStateSnapshot {
+            vfo_a_hz: self.vfo_a,
+            vfo_b_hz: self.vfo_b,
+            center_hz: self.center,
+            if_span_hz: self.rate * 0.4,
+            mode: self.mode,
+            split: self.split,
+            ptt: self.tx_on.is_some(),
+            tune: self.tx_on == Some(TxSource::Tune),
+            drive_pct: (self.drive * 100.0).round() as u32,
+            tune_drive_pct: (self.drive * 100.0).round() as u32,
+            muted: self.muted,
+            volume_db: TciStateSnapshot::volume_db_from(self.volume),
+            iq_rate: if iq_rate == 0 { 48_000 } else { iq_rate },
+            vfo_lo_hz: range.0,
+            vfo_hi_hz: range.1,
+            can_tx,
+        };
+        if self.last_tci.as_ref() != Some(&tci) {
+            if let Some(t) = &self.tci {
+                t.broadcast_state(tci.clone());
+            }
+            self.last_tci = Some(tci);
+        }
+
+        if self.last_public_at.elapsed() >= Duration::from_secs(1) {
+            let p = PublicState {
+                role: "trx",
+                freq_hz: self.rx_vfo(),
+                tx_freq_hz: self.tx_vfo(),
+                mode: mode_name(self.mode),
+                filter: self.filter,
+                ptt: self.tx_on.is_some(),
+                tune: self.tx_on == Some(TxSource::Tune),
+                center_hz: self.center,
+                rx_gain_db: self.rx_gain_db,
+                s_dbfs: self.s_dbfs.round() as i32,
+                tx_attenuation_db: self.tx_att_db,
+                drive_pct: (self.drive * 100.0).round() as u32,
+                tci_clients: self.tci.as_ref().map_or(0, |t| t.clients()),
+                rigctl_clients: self.rig.as_ref().map_or(0, |r| r.clients()),
+                time_synced: time_synced(),
+            };
+            // Publish on change, and at least every 30 s as a heartbeat.
+            if self.last_public.as_ref() != Some(&p) || self.last_public_at.elapsed() >= Duration::from_secs(30) {
+                self.mqtt.publish_json("state", &p, true);
+                self.last_public = Some(p);
+                self.last_public_at = Instant::now();
+            }
+        }
+    }
+
+    // ---- The per-block work ----
+
+    fn receive(&mut self, b: &RxBlock) {
+        // Through an inverting transverter the IF spectrum is mirrored.
+        let inverted = self.xvtr.as_ref().is_some_and(|t| t.inverted);
+        let mirrored: Vec<Complex32>;
+        let iq: &[Complex32] = if inverted {
+            mirrored = b.iq.iter().map(|z| z.conj()).collect();
+            &mirrored
+        } else {
+            &b.iq
+        };
+        let mut mark = Instant::now();
+        // TCI wideband IQ, at whichever rate the clients asked for.
+        let want = self.tci.as_ref().and_then(|t| t.wants_iq()).filter(|r| (*r as f64) <= self.rate);
+        match (want, &self.iq_tap) {
+            (Some(r), Some((cur, _))) if *cur == r => {}
+            (Some(r), _) => self.iq_tap = Some((r, Ddc::new(self.rate, r as f64))),
+            (None, Some(_)) => self.iq_tap = None,
+            (None, None) => {}
+        }
+        if let Some((r, ddc)) = &mut self.iq_tap {
+            self.iq_buf.clear();
+            ddc.process(iq, &mut self.iq_buf);
+            if let Some(t) = &self.tci {
+                t.on_rx_iq(sdroxide_dsp::as_interleaved(&self.iq_buf), *r);
+            }
+        }
+
+        self.lap(0, &mut mark);
+        // The channel.
+        self.chan.clear();
+        self.ddc.process(iq, &mut self.chan);
+        self.lap(1, &mut mark);
+        if let Some(nb) = &mut self.nb {
+            nb.process(&mut self.chan);
+        }
+        self.audio.clear();
+        if self.narrow {
+            self.chan12.clear();
+            self.dec4.process(&self.chan, &mut self.chan12);
+            self.demod.process(&self.chan12, &mut self.audio);
+        } else {
+            self.demod.process(&self.chan, &mut self.audio);
+        }
+        self.s_dbfs = self.demod.power_dbfs();
+        // Gain-compensated level for the S-meter, smoothed over ~0.3 s.
+        // The AD936x AGC moves the gain on its own (read off the sample path).
+        self.hw_gain_db = match &self.hw_gain {
+            Some(g) => f64::from_bits(g.load(std::sync::atomic::Ordering::Relaxed)),
+            None => self.rx_gain_db,
+        };
+        // MUTE AT TX: our own signal is not received; the S-meter and the
+        // AGC hold what they had, so the other station comes back at once.
+        let quiet = self.rx_quiet();
+        if quiet {
+            self.audio.fill(0.0);
+        } else {
+            let reading = self.s_dbfs as f64 - self.hw_gain_db;
+            self.reading_db += (reading - self.reading_db) * 0.03;
+        }
+        if let Some(n) = &mut self.notch {
+            n.process(&mut self.audio);
+        }
+        if let Some(n) = &mut self.nr {
+            n.process(&mut self.audio);
+        }
+        if self.mode == Mode::Cw && self.tx_on.is_none() {
+            self.cw_audio.clear();
+            self.cw_audio.extend_from_slice(&self.audio);
+            self.cw_agc.process(&mut self.cw_audio);
+            self.cwlive.audio(&self.cw_audio);
+        }
+        if !quiet {
+            self.agc.process(&mut self.audio);
+        }
+        // Squelch on the channel power, 2 dB of hysteresis.
+        self.squelch_open = match self.squelch_db {
+            None => true,
+            Some(t) if self.squelch_open => self.s_dbfs >= t - 2.0,
+            Some(t) => self.s_dbfs >= t,
+        };
+
+        self.lap(2, &mut mark);
+        // Decoders (and the web UI) get the AGC'd audio, before volume and mute.
+        let web_clients = self.web.as_ref().map_or(0, |w| w.clients());
+        self.audio12.clear();
+        if self.narrow {
+            self.audio12.extend_from_slice(&self.audio);
+        } else {
+            self.dec12.process(&self.audio, &mut self.audio12);
+        }
+        self.lap(3, &mut mark);
+        // (The live CW copy is fed above, before the listening AGC, in CW mode
+        // only as on the IC-705: its speed fit costs a third of a Cortex-A9
+        // core and has nothing to read in the other modes.)
+        if web_clients > 0 {
+            if self.squelch_open {
+                self.web_audio.extend_from_slice(&self.audio12);
+            } else {
+                self.web_audio.resize(self.web_audio.len() + self.audio12.len(), 0.0);
+            }
+            if self.web_audio.len() >= 480 {
+                if let Some(w) = &self.web {
+                    w.send_audio(&self.web_audio);
+                }
+                self.web_audio.clear();
+            }
+            // The channel is centred where the receiver listens (RIT included).
+            let vfo = self.rx_eff();
+            let view = self.web_view_center();
+            let span = self.web_span;
+            // The view moved (or a browser came): take the LO out of it.
+            if let Some((a, b)) = self.dc_keepout() {
+                if self.center >= a && self.center <= b {
+                    self.retune(false);
+                }
+            }
+            let lo = self.center;
+            let row = if span <= NARROW_SPAN_MAX {
+                self.scope_narrow
+                    .process(&self.chan)
+                    .map(|r| scope::render(&r, vfo, CH_RATE, view, span))
+            } else if let (true, Some(m)) = (span > STREAM_SPAN_MAX, &self.maia) {
+                let adc = self.cfg.radio.adc_rate as f64;
+                m.try_iter().last().map(|mut r| {
+                    if inverted {
+                        r.reverse();
+                    }
+                    let mut cols = scope::render(&r, lo, adc, view, span);
+                    scope::blank_dc(&mut cols, lo, view, span, 2.5 * adc / crate::maia::BINS as f64);
+                    cols
+                })
+            } else {
+                let rate = self.rate;
+                self.scope_wide.process(iq).map(|r| {
+                    let mut cols = scope::render(&r, lo, rate, view, span);
+                    scope::blank_dc(&mut cols, lo, view, span, 1_000.0);
+                    cols
+                })
+            };
+            if let (Some(cols), Some(w)) = (row, &self.web) {
+                w.send_spectrum(view, span, &cols);
+            }
+        }
+        self.lap(4, &mut mark);
+        if !self.slots.is_empty() {
+            let dial = self.rx_eff();
+            for (kind, rec) in &mut self.slots {
+                for slot in rec.push(b.t0, &self.audio12) {
+                    let job = match kind {
+                        DecoderKind::Q65 => Job::Q65 {
+                            audio: slot.audio,
+                            letter: Q65Letter::parse(&self.cfg.trx.q65_submode).unwrap_or(Q65Letter::D),
+                            slot_utc: slot.utc,
+                            dial_hz: dial,
+                            range: (200.0, 3_000.0),
+                        },
+                        DecoderKind::Pi4 => Job::Pi4 {
+                            audio: slot.audio,
+                            boundary: slot.boundary,
+                            slot_utc: slot.utc,
+                            dial_hz: dial,
+                        },
+                        DecoderKind::Cw => continue,
+                    };
+                    // Nobody transmits into their own receive slot.
+                    if self.tx_on.is_none() {
+                        self.decoder.submit(job);
+                    }
+                }
+            }
+        }
+
+        self.lap(5, &mut mark);
+        if let Some(t) = &self.tci {
+            if t.wants_audio() {
+                let g = if self.muted || !self.squelch_open { 0.0 } else { self.volume * 2.0 };
+                let out: Vec<f32> = if self.narrow {
+                    // x4 to TCI's 48 kHz: zero-stuff and low-pass (4x makes up the energy).
+                    let stuffed: Vec<f32> = self.audio.iter().flat_map(|&a| [a * g * 4.0, 0.0, 0.0, 0.0]).collect();
+                    let mut up = Vec::with_capacity(stuffed.len());
+                    self.tci_up.process(&stuffed, &mut up);
+                    up
+                } else {
+                    self.audio.iter().map(|s| s * g).collect()
+                };
+                t.on_rx_audio(&out);
+            }
+        }
+        self.lap(6, &mut mark);
+    }
+
+    fn lap(&mut self, stage: usize, mark: &mut Instant) {
+        let now = Instant::now();
+        self.prof[stage] += now - *mark;
+        *mark = now;
+    }
+
+    fn transmit(&mut self) {
+        let n48 = (self.block as f64 * CH_RATE / self.rate).round() as usize;
+        self.tx_bb.clear();
+
+        // Safety rails first.
+        if let Some(since) = self.tx_since {
+            if since.elapsed() > Duration::from_secs(self.cfg.trx.max_tx_seconds as u64) {
+                warn!("TX time-out ({} s), unkeying", self.cfg.trx.max_tx_seconds);
+                self.unkey();
+            }
+        }
+
+        match self.tx_on {
+            None => {
+                // Anything a TCI client sends while we are not keyed is stale.
+                if let Some(t) = &mut self.tci {
+                    t.drain_tx_audio();
+                }
+            }
+            Some(src @ (TxSource::Cw | TxSource::CwPtt)) => {
+                self.keyer.set_offset_hz(CW_PITCH_HZ);
+                self.keyer.render(n48, &mut self.tx_bb);
+                if src == TxSource::CwPtt || self.keyer.busy() {
+                    self.cw_idle_since = None;
+                } else {
+                    let idle = *self.cw_idle_since.get_or_insert_with(Instant::now);
+                    if idle.elapsed() > self.cw_hang {
+                        self.cw_idle_since = None;
+                        self.unkey();
+                    }
+                }
+            }
+            Some(TxSource::Key) => {
+                // 5 ms raised-cosine edges: no key clicks. Released and faded
+                // out, the transmitter drops.
+                let step = std::f64::consts::TAU * CW_PITCH_HZ / CH_RATE;
+                let ramp = 1.0 / (0.005 * CH_RATE as f32);
+                for _ in 0..n48 {
+                    let target = if self.key_down { 1.0 } else { 0.0 };
+                    self.key_env = if self.key_env < target { (self.key_env + ramp).min(1.0) } else { (self.key_env - ramp).max(0.0) };
+                    let a = 0.5 - 0.5 * (std::f32::consts::PI * self.key_env).cos();
+                    self.tune_phase = (self.tune_phase + step) % std::f64::consts::TAU;
+                    self.tx_bb.push(Complex32::new(self.tune_phase.cos() as f32, self.tune_phase.sin() as f32) * a);
+                }
+                if !self.key_down && self.key_env == 0.0 {
+                    self.unkey();
+                }
+            }
+            Some(TxSource::Tune) => {
+                let hz = if self.mode == Mode::Cw { CW_PITCH_HZ } else { TUNE_TONE_HZ };
+                let step = std::f64::consts::TAU * hz / CH_RATE;
+                for _ in 0..n48 {
+                    self.tune_phase = (self.tune_phase + step) % std::f64::consts::TAU;
+                    self.tx_bb.push(Complex32::new(self.tune_phase.cos() as f32, self.tune_phase.sin() as f32));
+                }
+            }
+            Some(TxSource::Web(_)) => {
+                let n12 = n48 / 4;
+                let mut audio12 = Vec::with_capacity(n12);
+                if let Some(w) = &self.web {
+                    if !self.mic_started && w.mic_queued() >= MIC_PREROLL {
+                        self.mic_started = true;
+                    }
+                    if self.mic_started && w.take_mic(n12, &mut audio12) > 0 {
+                        self.mic_last = Instant::now();
+                    }
+                }
+                audio12.resize(n12, 0.0);
+                // x4: zero-stuff, low-pass, and make up the 4x energy loss.
+                self.mic_buf.clear();
+                let g = 4.0 * self.mic_gain;
+                for a in &audio12 {
+                    self.mic_buf.extend_from_slice(&[a * g, 0.0, 0.0, 0.0]);
+                }
+                let mut audio = Vec::with_capacity(n48);
+                self.mic_up.process(&self.mic_buf, &mut audio);
+                audio.resize(n48, 0.0);
+                match &mut self.modulator {
+                    Some(m) => m.process(&audio, &mut self.tx_bb),
+                    None => self.tx_bb.extend(audio.iter().map(|&a| Complex32::new(a, 0.0))),
+                }
+                if self.mic_last.elapsed() > MIC_STARVE {
+                    warn!("web microphone stopped; unkeying");
+                    self.unkey();
+                }
+            }
+            Some(src @ (TxSource::Tci | TxSource::Ptt)) => {
+                let mut got = 0;
+                if let Some(t) = &mut self.tci {
+                    let mut buf = [0.0f32; 1024];
+                    loop {
+                        let k = t.read_tx_audio(&mut buf);
+                        self.tx_fifo.extend(&buf[..k]);
+                        got += k;
+                        if k < buf.len() {
+                            break;
+                        }
+                    }
+                    let playing = self.tx_fifo.len() >= n48;
+                    if let Some(frames) = self.pace.request(n48, self.tx_fifo.len(), got, playing) {
+                        t.request_chrono(frames);
+                    }
+                }
+                if got > 0 {
+                    self.tci_last_audio = Instant::now();
+                }
+                // Queue bound: nobody transmits faster than real time.
+                while self.tx_fifo.len() > 24_000 {
+                    self.tx_fifo.pop_front();
+                }
+                let audio: Vec<f32> = (0..n48).map(|_| self.tx_fifo.pop_front().unwrap_or(0.0)).collect();
+                match &mut self.modulator {
+                    Some(m) => m.process(&audio, &mut self.tx_bb),
+                    None => self.tx_bb.extend(audio.iter().map(|&a| Complex32::new(a, 0.0))),
+                }
+                if src == TxSource::Tci && self.tci_last_audio.elapsed() > TCI_STARVE {
+                    warn!("TCI client stopped sending TX audio; unkeying");
+                    self.unkey();
+                }
+            }
+        }
+
+        // Speech processing for voice (not CW, not the tune carrier).
+        if let (Some(c), Some(TxSource::Web(_) | TxSource::Tci | TxSource::Ptt)) = (&mut self.comp, self.tx_on) {
+            if !self.tx_bb.is_empty() {
+                c.process(&mut self.tx_bb);
+            }
+        }
+
+        // Up to the stream rate and out to the VFO.
+        let mut block = vec![Complex32::default(); self.block];
+        if !self.tx_bb.is_empty() {
+            let g = self.drive;
+            for z in &mut self.tx_bb {
+                *z *= g;
+            }
+            self.tx_up.clear();
+            self.duc.process(&self.tx_bb, &mut self.tx_up);
+            let mut mixed = Vec::with_capacity(self.tx_up.len());
+            self.tx_nco.mix(&self.tx_up, &mut mixed);
+            self.tx_out.extend(mixed);
+        }
+        for z in block.iter_mut() {
+            match self.tx_out.pop_front() {
+                Some(s) => *z = s,
+                None => break,
+            }
+        }
+        if self.tx_on.is_none() {
+            self.tx_out.clear();
+        }
+        // An inverting transverter mirrors what it sends as well.
+        if self.xvtr.as_ref().is_some_and(|t| t.inverted) {
+            for z in &mut block {
+                *z = z.conj();
+            }
+        }
+        if self.tx_sink.try_send(block).is_err() {
+            debug!("TX queue full");
+        }
+    }
+
+    // ---- Web UI ----
+
+    fn web_cw_json(&self) -> serde_json::Value {
+        let (text, pending) = self.cwlive.snapshot();
+        serde_json::json!({"type": "cw", "text": text, "pending": pending})
+    }
+
+    /// Live CW text out when it changed: the whole (capped) text to the web
+    /// UI, what settled since last time to MQTT `cw/text`.
+    fn publish_cwlive(&mut self) {
+        let Some((text, pending, fresh)) = self.cwlive.changed() else { return };
+        if !fresh.trim().is_empty() {
+            self.mqtt.publish_json("cw/text", &serde_json::json!({"text": fresh, "freq_hz": self.rx_vfo() + CW_PITCH_HZ}), false);
+        }
+        if let Some(w) = &self.web {
+            if w.clients() > 0 {
+                w.send_json(&serde_json::json!({"type": "cw", "text": text, "pending": pending}));
+            }
+        }
+    }
+
+    fn web_decode(&self, d: &Decode) {
+        if let Some(w) = &self.web {
+            let mut v = serde_json::to_value(d).unwrap_or_default();
+            v["type"] = "decode".into();
+            w.send_json(&v);
+        }
+    }
+
+    fn web_state_json(&self) -> serde_json::Value {
+        let temps = *self.temps.lock().unwrap();
+        let agc = match self.agc_mode {
+            AgcMode::Off => "off",
+            AgcMode::Slow => "slow",
+            AgcMode::Med => "med",
+            AgcMode::Fast => "fast",
+        };
+        let mut v = serde_json::json!({
+            "type": "state",
+            "call": self.callsign(),
+            "vfo_a": self.vfo_a,
+            "vfo_b": self.vfo_b,
+            "active": if self.active == Vfo::A { "A" } else { "B" },
+            "split": self.split,
+            "mode": mode_name(self.mode),
+            "filter": [self.filter.0, self.filter.1],
+            "ptt": self.tx_on.is_some(),
+            "tune": self.tx_on == Some(TxSource::Tune),
+            "tx_source": self.tx_on.map(|s| match s {
+                TxSource::Tci => "tci",
+                TxSource::Ptt => "ptt",
+                TxSource::Cw | TxSource::CwPtt => "cw",
+                TxSource::Tune => "tune",
+                TxSource::Key => "key",
+                TxSource::Web(_) => "web",
+            }),
+            "drive": (self.drive * 100.0).round(),
+            "tx_att_db": self.tx_att_db,
+            "rx_gain_db": self.rx_gain_db,
+            "rx_gain_mode": match self.rx_gain_mode {
+                GainMode::Manual => "manual",
+                GainMode::SlowAttack => "slow",
+                GainMode::FastAttack => "fast",
+                GainMode::Hybrid => "hybrid",
+            },
+            "agc": agc,
+            "cw_wpm": self.keyer.wpm(),
+            "center": self.center,
+            "rate": self.rate,
+            "span": self.web_span,
+            "span_max": if self.maia.is_some() { self.cfg.radio.adc_rate as f64 } else { self.rate },
+            "allow_tx": self.cfg.trx.allow_tx,
+            "cw_engine": if self.cwlive.neural() { "neural" } else { "timing" },
+            "decoders": self.slots.iter().map(|(k, _)| match k {
+                DecoderKind::Q65 => "q65",
+                DecoderKind::Pi4 => "pi4",
+                DecoderKind::Cw => "cw",
+            }).collect::<Vec<_>>(),
+            "freq_min": self.freq_range().0,
+            "freq_max": self.freq_range().1,
+            "time_synced": time_synced(),
+            "temp_fpga": temps.fpga.map(|c| c.round()),
+            "temp_ad936x": temps.ad936x.map(|c| c.round()),
+            "tci_clients": self.tci.as_ref().map_or(0, |t| t.clients()),
+            "rigctl_clients": self.rig.as_ref().map_or(0, |r| r.clients()),
+        });
+        let more = serde_json::json!({
+            "rit": [self.rit.0, self.rit.1],
+            "xit": [self.xit.0, self.xit.1],
+            "nb": self.nb.is_some(),
+            "nr": self.nr.is_some(),
+            "notch": self.notch.is_some(),
+            "squelch": self.squelch_db,
+            "comp": self.comp.as_ref().map(|_| self.comp_db),
+            "mic_gain": self.mic_gain,
+            "cw_hang_ms": self.cw_hang.as_millis() as u64,
+            "scope_center": self.scope_center,
+            "mute_at_tx": self.settings.mute_at_tx,
+            "xvtr": self.xvtr.as_ref().map(|t| t.name.clone()),
+            "xvtrs": self.settings.transverters,
+            "cal_band": self.cal_band(),
+            "cal_points": self.settings.smeter.get(&self.cal_band()).map_or(0, |v| v.len()),
+        });
+        if let (Some(v), serde_json::Value::Object(m)) = (v.as_object_mut(), more) {
+            v.extend(m);
+        }
+        v
+    }
+
+    fn poll_web(&mut self) {
+        let Some(w) = &self.web else { return };
+        let joined = w.poll_joined();
+        let cmds = w.poll_cmds();
+        if !joined.is_empty() {
+            let st = self.web_state_json();
+            let cw = self.web_cw_json();
+            if let Some(w) = &self.web {
+                for c in joined {
+                    w.send_json_to(c, &st);
+                    w.send_json_to(c, &cw);
+                }
+            }
+        }
+        for c in cmds {
+            self.apply_web(c.client, &c.msg);
+        }
+        let Some(w) = &self.web else { return };
+        if w.clients() == 0 {
+            return;
+        }
+        if self.web_meter_at.elapsed() >= Duration::from_millis(100) {
+            self.web_meter_at = Instant::now();
+            let tx = self.tx_on.is_some();
+            let cw = self.cwlive.readout().map(|r| {
+                serde_json::json!({"tone_hz": r.tone_hz.round(), "wpm": r.wpm.round(), "snr_db": r.snr_db.round(), "locked": r.locked})
+            });
+            let dbm = self.settings.dbm(&self.cal_band(), self.reading_db);
+            w.send_json(&serde_json::json!({"type": "meter", "s_dbfs": self.s_dbfs, "tx": tx, "rx_gain_db": self.hw_gain_db, "cw": cw,
+                "dbm": (dbm * 10.0).round() / 10.0, "s": crate::settings::s_units(self.rx_eff(), dbm),
+                "reading": (self.reading_db * 10.0).round() / 10.0, "sq": self.squelch_open}));
+        }
+        if self.web_state_at.elapsed() >= Duration::from_millis(100) {
+            let st = self.web_state_json();
+            let s = st.to_string();
+            if self.web_state.as_deref() != Some(&s) {
+                w.send_json(&st);
+                self.web_state = Some(s);
+            }
+            self.web_state_at = Instant::now();
+        }
+    }
+
+    fn apply_web(&mut self, client: u64, m: &serde_json::Value) {
+        let cmd = m["cmd"].as_str().unwrap_or("");
+        let num = |k: &str| m[k].as_f64();
+        let on = m["on"].as_bool().unwrap_or(false);
+        match cmd {
+            "freq" => {
+                if let Some(hz) = num("hz") {
+                    self.set_vfo(self.active, hz.round());
+                }
+            }
+            "mode" => {
+                if let Some(md) = m["mode"].as_str().and_then(sdroxide_rigctld::from_hamlib_mode) {
+                    self.set_mode(md);
+                }
+            }
+            "filter" => {
+                if let (Some(lo), Some(hi)) = (num("lo"), num("hi")) {
+                    self.apply(Command::SetFilter { rx: sdroxide_types::RxId::Main, lo: lo as f32, hi: hi as f32 });
+                }
+            }
+            "ptt" => {
+                if self.mode == Mode::Cw {
+                    // In CW the web PTT is a straight key; release lets the
+                    // carrier fade out first (see TxSource::Key).
+                    self.key_down = on;
+                    if on && self.tx_on.is_none() {
+                        self.key_env = 0.0;
+                        self.key(TxSource::Key);
+                    } else if !on && self.tx_on != Some(TxSource::Key) {
+                        self.unkey();
+                    }
+                } else if on {
+                    self.key(TxSource::Web(client));
+                } else {
+                    self.unkey();
+                }
+            }
+            "tune" => self.apply(Command::SetTune(on)),
+            "vfo" => {
+                let v = if m["sel"].as_str() == Some("B") { Vfo::B } else { Vfo::A };
+                self.apply(Command::SelectVfo(v));
+            }
+            "swap" => self.apply(Command::SwapVfos),
+            "a_to_b" => self.apply(Command::CopyAtoB),
+            "split" => self.apply(Command::SetSplit(on)),
+            "agc" => {
+                let a = match m["mode"].as_str() {
+                    Some("off") => AgcMode::Off,
+                    Some("slow") => AgcMode::Slow,
+                    Some("fast") => AgcMode::Fast,
+                    _ => AgcMode::Med,
+                };
+                self.agc_mode = a;
+                self.agc.set_mode(a);
+            }
+            "span" => {
+                if let Some(sp) = num("hz") {
+                    let max = if self.maia.is_some() { self.cfg.radio.adc_rate as f64 } else { self.rate };
+                    self.web_span = sp.clamp(2_000.0, max);
+                    self.web_center = 0.0;
+                    self.scope_wide.reset();
+                    self.scope_narrow.reset();
+                }
+            }
+            "drive" | "txatt" | "cw_wpm" => {
+                if let Some(v) = num("value") {
+                    self.apply_mqtt(cmd, &v.to_string());
+                }
+            }
+            "rxgain" => {
+                let payload = match m["mode"].as_str() {
+                    Some("manual") => num("db").unwrap_or(self.rx_gain_db).to_string(),
+                    Some("fast") => "fast".into(),
+                    _ => "slow".into(),
+                };
+                self.apply_mqtt("rxgain", &payload);
+            }
+            "cw" => {
+                if let Some(t) = m["text"].as_str() {
+                    self.send_cw(t);
+                }
+            }
+            "cw_stop" => {
+                self.keyer.abort();
+            }
+            "cw_clear" => self.cwlive.clear(),
+            "rit" | "xit" => {
+                let hz = num("hz").unwrap_or(0.0).clamp(-9_999.0, 9_999.0).round();
+                let v = (on, hz);
+                if cmd == "rit" { self.rit = v } else { self.xit = v }
+                self.cwlive.restart();
+                self.retune(false);
+            }
+            "nb" => self.nb = on.then(NoiseBlanker::new),
+            "nr" => self.nr = on.then(SpectralNr::new),
+            "notch" => self.notch = on.then(AutoNotch::new),
+            "squelch" => {
+                self.squelch_db = num("db").map(|d| d.clamp(-160.0, 0.0) as f32);
+                self.squelch_open = true;
+            }
+            "comp" => {
+                if let Some(d) = num("db") {
+                    self.comp_db = d.clamp(0.0, 20.0) as f32;
+                }
+                self.comp = on.then(|| self.make_comp());
+            }
+            "mic_gain" => {
+                if let Some(v) = num("value") {
+                    self.mic_gain = v.clamp(0.0, 4.0) as f32;
+                }
+            }
+            "cw_hang" => {
+                if let Some(ms) = num("ms") {
+                    self.cw_hang = Duration::from_millis(ms.clamp(50.0, 3_000.0) as u64);
+                }
+            }
+            "mute_at_tx" => {
+                self.settings.mute_at_tx = on;
+                self.settings.save(&self.settings_dir);
+                info!(on, "mute the receiver at TX");
+            }
+            "scope_center" => {
+                self.scope_center = on;
+                self.web_center = 0.0;
+            }
+            "callsign" => {
+                // An empty call goes back to trxd.toml's.
+                let raw = m["call"].as_str().unwrap_or("");
+                match Settings::clean_call(raw) {
+                    Some(c) => self.settings.callsign = Some(c),
+                    None if raw.trim().is_empty() => self.settings.callsign = None,
+                    None => {
+                        warn!(call = raw, "callsign refused");
+                        return;
+                    }
+                }
+                self.settings.save(&self.settings_dir);
+                info!(call = %self.callsign(), "callsign set");
+            }
+            "xvtr_set" => {
+                if let Ok(list) = serde_json::from_value::<Vec<Transverter>>(m["list"].clone()) {
+                    let ok = list.iter().all(|t| t.rf_max > t.rf_min && !t.name.trim().is_empty());
+                    if ok {
+                        self.settings.transverters = list;
+                        self.settings.save(&self.settings_dir);
+                        info!(n = self.settings.transverters.len(), "transverters saved");
+                        let f = self.reachable(self.rx_vfo());
+                        self.set_vfo(self.active, f);
+                        self.retune(true);
+                    } else {
+                        warn!("transverter list refused: a name is empty or a range is backwards");
+                    }
+                }
+            }
+            "smeter_cal" => {
+                if let Some(dbm) = num("dbm") {
+                    let band = self.cal_band();
+                    self.settings.add_cal(&band, self.reading_db, dbm);
+                    self.settings.save(&self.settings_dir);
+                    info!(band, reading = self.reading_db, dbm, "S-meter calibration point");
+                }
+            }
+            "smeter_clear" => {
+                let band = self.cal_band();
+                self.settings.smeter.remove(&band);
+                self.settings.save(&self.settings_dir);
+            }
+            "cw_engine" => self.cwlive.set_neural(m["engine"].as_str() == Some("neural")),
+            "decoder" => {
+                let kind = match m["kind"].as_str() {
+                    Some("q65") => Some(DecoderKind::Q65),
+                    Some("pi4") => Some(DecoderKind::Pi4),
+                    _ => None,
+                };
+                if let Some(k) = kind {
+                    self.set_decoder(k, on);
+                }
+            }
+            "disconnected" => {
+                // A straight key whose browser went away comes up.
+                if self.tx_on == Some(TxSource::Key) {
+                    warn!("web client holding the key disconnected; key up");
+                    self.key_down = false;
+                }
+                if self.tx_on == Some(TxSource::Web(client)) {
+                    warn!("web client holding PTT disconnected; unkeying");
+                    self.unkey();
+                }
+            }
+            other => debug!(cmd = other, "web command not understood"),
+        }
+    }
+
+    /// Run until the RX stream ends.
+    pub fn run(mut self, rx: Receiver<RxBlock>) {
+        crate::stream::realtime_thread();
+        info!(freq = self.rx_vfo(), mode = mode_name(self.mode), rate = self.rate, "transceiver running");
+        let mut loads = LoadMeter::new();
+        for b in rx {
+            let t = Instant::now();
+            self.poll_controls();
+            self.receive(&b);
+            let mut mark = Instant::now();
+            self.transmit();
+            self.lap(7, &mut mark);
+            for d in self.decoder.poll() {
+                info!(mode = %d.mode, snr = d.snr_db, freq = d.freq_hz, "{}", d.message);
+                self.mqtt.publish_decode(&d);
+                self.web_decode(&d);
+            }
+            self.poll_web();
+            self.publish_cwlive();
+            self.publish_state();
+            if let Some(t) = &self.tci {
+                if self.tx_on.is_some() {
+                    t.push_telemetry(TxTelemetry::default());
+                }
+            }
+            self.lap(8, &mut mark);
+            if loads.add(t.elapsed(), b.iq.len() as f64 / self.rate) {
+                let span = 60.0;
+                let parts: Vec<String> = STAGES
+                    .iter()
+                    .zip(&self.prof)
+                    .map(|(n, d)| format!("{n}={:.1}", 100.0 * d.as_secs_f64() / span))
+                    .collect();
+                info!("engine profile (% of one core): {}", parts.join(" "));
+                self.prof = [Duration::ZERO; STAGES.len()];
+            }
+        }
+        self.unkey();
+    }
+}
+
+/// The slot recorder a decoder reads from; `None` for CW (the live CW box reads it).
+fn slot_recorder(kind: DecoderKind) -> Option<SlotRecorder> {
+    match kind {
+        DecoderKind::Q65 => Some(SlotRecorder::new(12_000.0, 60, 0.0, 59.0)),
+        DecoderKind::Pi4 => Some(SlotRecorder::new(12_000.0, 60, 2.5, 30.0)),
+        DecoderKind::Cw => None,
+    }
+}
+
+
+/// Engine CPU use, logged once a minute: the one number that says whether
+/// this board keeps up.
+struct LoadMeter {
+    busy: f64,
+    span: f64,
+    since: Instant,
+}
+
+impl LoadMeter {
+    fn new() -> Self {
+        LoadMeter { busy: 0.0, span: 0.0, since: Instant::now() }
+    }
+    /// True when a report went out (once a minute).
+    fn add(&mut self, busy: Duration, span_s: f64) -> bool {
+        self.busy += busy.as_secs_f64();
+        self.span += span_s;
+        if self.since.elapsed() >= Duration::from_secs(60) {
+            info!(load_pct = (100.0 * self.busy / self.span.max(1e-9)).round(), "engine load");
+            *self = LoadMeter::new();
+            return true;
+        }
+        false
+    }
+}

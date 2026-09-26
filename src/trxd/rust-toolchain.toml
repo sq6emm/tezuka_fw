@@ -1,0 +1,6 @@
+# rten (DeepCW) needs 1.94+, kstring 1.96+; Buildroot 2026.02 ships 1.88.
+# rustup reads this and installs the toolchain + target on first use.
+[toolchain]
+channel = "1.98.1"
+targets = ["armv7-unknown-linux-gnueabihf"]
+profile = "minimal"

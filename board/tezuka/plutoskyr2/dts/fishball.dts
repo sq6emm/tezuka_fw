@@ -35,6 +35,14 @@
 		};
 	};
 
+	/* GPS 1PPS on EXT_IO0 (JP5, 3.3 V), routed by the simple bitstream to
+	 * EMIO 52 = gpio0 line 106. Gives /dev/pps0 for chrony; the same edge
+	 * also latches the FPGA refmeter (0x43c10000). */
+	pps {
+		compatible = "pps-gpio";
+		gpios = <&gpio0 106 0>;
+	};
+
 	gpio_keys {
 		compatible = "gpio-keys";
 		#address-cells = <1>;

@@ -9,17 +9,7 @@ DTB_NAME="$3"
 
 # Buildroot's host-bootgen (xilinx_v2025.2) may be broken.
 # Test it, fall back to system bootgen if needed.
-BOOTGEN="$HOST_DIR/bin/bootgen"
-if ! "$BOOTGEN" -help >/dev/null 2>&1; then
-    if [ -x /usr/bin/bootgen ]; then
-        BOOTGEN=/usr/bin/bootgen
-        echo "WARNING: host-bootgen is broken, using /usr/bin/bootgen"
-    else
-        echo "ERROR: host-bootgen is broken and no system bootgen found."
-        echo "Install bootgen-xlnx: sudo apt-get install bootgen-xlnx"
-        exit 1
-    fi
-fi
+. "$(dirname "$0")/find-bootgen.sh"
 
 # ── SD card ───────────────────────────────────────────────────────────────────
 # BOOT.bin: FSBL + U-Boot only (no bitstream — U-Boot programs the FPGA at
@@ -80,3 +70,21 @@ cp "$BIN_DIR/$DTB_NAME" "$SDIMGDIR/devicetree.dtb"
 cp "$BIN_DIR/uboot-env.txt" "$SDIMGDIR/uEnv.txt"
 
 
+
+# ── A/B slot layout ───────────────────────────────────────────────────────────
+# Everything that changes with a firmware version goes into slot a/; the card
+# root keeps only BOOT.bin (FSBL + U-Boot), uEnv.txt and the overclock loaders.
+# U-Boot's slot_select boots /a or /b (uboot-env.txt), and /usr/sbin/fw-update
+# writes a new version into whichever slot is not running. SHA256SUMS lets
+# fw-update verify a slot before switching to it.
+SLOTDIR="$SDIMGDIR/a"
+rm -rf "$SLOTDIR" "$SDIMGDIR/b"
+mkdir -p "$SLOTDIR"
+for f in uImage uramdisk.image.xz devicetree.dtb system_top.bin "$SDIMGDIR"/*_top.bin; do
+    f=$(basename -- "$f")
+    [ -e "$SDIMGDIR/$f" ] && mv "$SDIMGDIR/$f" "$SLOTDIR/$f"
+done
+FW_VERSION=$(cd "$COMMON_DIR" && git describe --abbrev=4 --always --tags --dirty 2>/dev/null || echo unknown)
+echo "$FW_VERSION" > "$SLOTDIR/VERSION"
+(cd "$SLOTDIR" && sha256sum -- * > SHA256SUMS)
+(cd "$SDIMGDIR" && sha256sum BOOT.bin uEnv.txt > SHA256SUMS)

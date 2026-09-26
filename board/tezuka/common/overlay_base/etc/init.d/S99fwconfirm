@@ -1,0 +1,52 @@
+#!/bin/sh
+#
+# Confirm a freshly installed firmware slot (see /usr/sbin/fw-update) once
+# the board is demonstrably usable over the network: an IPv4 address on a
+# non-loopback interface, dropbear listening, and trxd running. Without that
+# within CONFIRM_TIMEOUT seconds, reboot: U-Boot counts it, and the third
+# unconfirmed boot rolls back to the previous slot.
+
+CONFIRM_TIMEOUT=240
+LOG=/mnt/jffs2/fw-update.log
+
+healthy() {
+	ip -4 addr show 2>/dev/null | grep -v ' lo$' | grep -q 'inet ' || return 1
+	pidof dropbear >/dev/null || return 1
+	pidof trxd >/dev/null || return 1
+}
+
+confirm_loop() {
+	i=0
+	while [ $i -lt $CONFIRM_TIMEOUT ]; do
+		if healthy; then
+			# Healthy once is not enough: trxd must survive its first seconds.
+			sleep 20
+			if healthy; then
+				/usr/sbin/fw-update --confirm >/dev/null
+				logger -t fwconfirm "firmware slot confirmed"
+				return
+			fi
+		fi
+		sleep 5
+		i=$((i + 5))
+	done
+	echo "$(date '+%F %T') S99fwconfirm: slot not healthy after ${CONFIRM_TIMEOUT}s, rebooting" >> "$LOG"
+	logger -t fwconfirm "slot not healthy, rebooting towards rollback"
+	sync
+	reboot
+}
+
+case "$1" in
+start)
+	if [ "$(fw_printenv -n upgrade_available 2>/dev/null)" = "1" ]; then
+		echo "Unconfirmed firmware slot: checking health in the background"
+		confirm_loop </dev/null >/dev/null 2>&1 &
+	fi
+	if [ "$(fw_printenv -n rolled_back 2>/dev/null)" = "1" ]; then
+		echo "WARNING: the last firmware update was rolled back (fw-update --status)"
+	fi
+	;;
+stop|restart|reload) ;;
+*) echo "Usage: $0 {start}"; exit 1 ;;
+esac
+exit 0

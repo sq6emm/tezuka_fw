@@ -1,0 +1,13 @@
+config BR2_PACKAGE_TRXD
+	bool "trxd"
+	select BR2_PACKAGE_MOSQUITTO
+	select BR2_PACKAGE_MOSQUITTO_BROKER
+	help
+	  Headless AD936x transceiver (TCI + rigctld, Q65/PI4/CW
+	  decoders) and IARU-R1 MGM beacon transmitter/receiver with
+	  MQTT output. Source: src/trxd in this tree.
+
+	  Built with the host's rustup toolchain pinned by
+	  src/trxd/rust-toolchain.toml (Buildroot's Rust is too old for
+	  its dependencies), so rustup must be installed on the build
+	  machine.

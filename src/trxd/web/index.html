@@ -1,0 +1,1307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d10">
+<title>SQTRV</title>
+<style>
+:root {
+  --bezel: #0b0d10;
+  --panel: #14181d;
+  --panel2: #1b2027;
+  --edge: #2a313b;
+  --lcd: #05080c;
+  --lcd-edge: #1d2a36;
+  --text: #d8dee6;
+  --dim: #7f8b99;
+  --amber: #ffb547;
+  --cyan: #5fd4ff;
+  --green: #5ff08a;
+  --red: #ff4d4d;
+  --tx: #ff3b3b;
+  --key: #232a33;
+  --key-hi: #2e3743;
+  --key-on: #0f5e8c;
+  --r: 6px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bezel); color: var(--text);
+  font: 14px/1.3 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+button { font: inherit; color: inherit; }
+.hidden { display: none !important; }
+
+/* ---------- login ---------- */
+#login { position: fixed; inset: 0; display: grid; place-items: center; background: var(--bezel); }
+#login form { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px; padding: 28px 30px;
+  width: min(340px, 90vw); display: grid; gap: 14px; }
+#login h1 { margin: 0; font-size: 18px; letter-spacing: .08em; }
+#login input { background: var(--lcd); border: 1px solid var(--lcd-edge); color: var(--text); border-radius: 6px;
+  padding: 10px 12px; font-size: 16px; }
+#login button { background: var(--key-on); border: 0; border-radius: 6px; padding: 10px; font-weight: 600; cursor: pointer; }
+#login .err { color: var(--red); font-size: 13px; }
+
+/* ---------- layout ---------- */
+#app { display: grid; grid-template-rows: auto auto auto 1fr auto; height: 100%; gap: 6px; padding: 6px;
+  padding-bottom: max(6px, env(safe-area-inset-bottom)); }
+header { display: flex; align-items: center; gap: 12px; padding: 2px 6px; color: var(--dim); font-size: 12px; }
+header .brand { color: var(--text); font-weight: 700; letter-spacing: .14em; }
+header .by { margin-left: -8px; }
+#login h1 small { font-size: 12px; color: var(--dim); letter-spacing: .04em; font-weight: 600; }
+header .grow { flex: 1; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--dim); margin-right: 4px; vertical-align: middle; }
+.dot.ok { background: var(--green); } .dot.bad { background: var(--red); } .dot.warn { background: var(--amber); }
+header a { color: var(--dim); }
+#temps b { color: var(--text); font-weight: 600; }
+#temps .warm b { color: var(--amber); } #temps .hot b { color: var(--red); }
+
+/* ---------- LCD top: frequency + meter ---------- */
+#lcd { background: var(--lcd); border: 1px solid var(--lcd-edge); border-radius: 10px; padding: 8px 12px 10px;
+  display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 10px 18px;
+  box-shadow: inset 0 0 24px rgba(0, 120, 200, .08); }
+.vfo-line { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.tag { font-size: 11px; font-weight: 700; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--edge); color: var(--dim); }
+.tag.on { color: var(--bezel); background: var(--cyan); border-color: var(--cyan); }
+.tag.tx { color: #fff; background: var(--tx); border-color: var(--tx); }
+.tag.amber { color: var(--bezel); background: var(--amber); border-color: var(--amber); }
+#freq { font: 700 clamp(34px, 6.2vw, 64px)/1 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  letter-spacing: .02em; color: #eaf6ff; text-shadow: 0 0 12px rgba(95, 212, 255, .35); user-select: none; white-space: nowrap; }
+#freq .d { cursor: ns-resize; padding: 0 .02em; border-radius: 4px; }
+#freq .d:hover { background: rgba(95, 212, 255, .14); }
+#freq .sep { color: #7fa9c4; padding: 0 .02em; }
+#freq .small { font-size: .62em; color: #bcd6e8; }
+#freq.tx { color: #ffe0e0; text-shadow: 0 0 12px rgba(255, 60, 60, .45); }
+.sub-line { color: var(--dim); font: 600 15px ui-monospace, Menlo, Consolas, monospace; display: flex; gap: 14px; flex-wrap: wrap; }
+.sub-line b { color: var(--amber); font-weight: 600; }
+.meter { display: grid; gap: 4px; align-content: center; }
+.meter .scale { display: flex; justify-content: space-between; font: 600 11px ui-monospace, Menlo, monospace; color: var(--dim); }
+.meter .scale .hi { color: var(--red); }
+.bar { height: 14px; background: #0c1219; border: 1px solid var(--lcd-edge); border-radius: 3px; position: relative; overflow: hidden; }
+.bar > i { position: absolute; inset: 0 auto 0 0; width: 0; background: linear-gradient(90deg, #2bd46a, #d9ef44 60%, #ff5a3c); transition: width .08s linear; }
+.bar > em { position: absolute; top: 0; bottom: 0; width: 2px; background: #fff; opacity: .7; left: 0; }
+.meter .label { display: flex; justify-content: space-between; font-size: 12px; color: var(--dim); }
+.meter .label b { color: var(--text); font-weight: 600; font-family: ui-monospace, Menlo, monospace; }
+
+/* ---------- band bar ---------- */
+#bandbar { display: flex; gap: 5px; align-items: center; }
+#bands { display: flex; gap: 5px; flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+#bands .k { flex: 1 0 auto; padding: 5px 8px; }
+#bands .k.on { box-shadow: 0 0 10px rgba(29, 134, 194, .6); }
+#bands .k.warn.on { background: var(--amber); border-color: var(--amber); color: var(--bezel); box-shadow: 0 0 10px rgba(255, 181, 71, .5); }
+#fentry { flex: 0 0 150px; text-align: right; }
+#fentry.bad { border-color: var(--red); }
+
+/* ---------- scope ---------- */
+#scopewrap { position: relative; min-height: 180px; background: #020406; border: 1px solid var(--lcd-edge);
+  border-radius: 10px; overflow: hidden; display: grid; grid-template-rows: 34% 1fr; }
+#spec, #wf { width: 100%; height: 100%; display: block; touch-action: none; }
+#scopebar { position: absolute; top: 6px; right: 8px; display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+#scopebar .k { padding: 2px 8px; font-size: 12px; background: rgba(20, 26, 33, .85); }
+#scopeinfo { position: absolute; top: 6px; left: 8px; font: 600 12px ui-monospace, Menlo, monospace; color: var(--dim);
+  background: rgba(2, 4, 6, .6); padding: 1px 6px; border-radius: 4px; pointer-events: none; }
+#cursor { position: absolute; font: 600 12px ui-monospace, Menlo, monospace; color: #fff; background: rgba(0, 0, 0, .7);
+  padding: 1px 5px; border-radius: 4px; pointer-events: none; transform: translate(-50%, -130%); white-space: nowrap; }
+
+/* ---------- control deck ---------- */
+#deck { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.1fr); gap: 6px; }
+.card { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px; padding: 8px; display: grid; gap: 7px; align-content: start; }
+.card h3 { margin: 0; font-size: 11px; letter-spacing: .12em; color: var(--dim); font-weight: 700; }
+.row { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
+.k { background: var(--key); border: 1px solid var(--edge); border-radius: var(--r); padding: 6px 9px; min-width: 42px;
+  cursor: pointer; font-weight: 600; font-size: 13px; text-align: center; user-select: none; -webkit-user-select: none; }
+.k:hover { background: var(--key-hi); }
+.k.on { background: var(--key-on); border-color: #1d86c2; color: #fff; }
+.k.warn { border-color: var(--amber); color: var(--amber); }
+.k:disabled { opacity: .45; cursor: default; }
+#ptt { flex: 1; min-height: 52px; font-size: 18px; letter-spacing: .15em; background: #3a1414; border-color: #6b2323; }
+#ptt.on { background: var(--tx); border-color: #ff8080; color: #fff; box-shadow: 0 0 18px rgba(255, 59, 59, .55); }
+.slider { display: grid; grid-template-columns: 58px 1fr 52px; gap: 6px; align-items: center; font-size: 12px; color: var(--dim); }
+.slider b { color: var(--text); font: 600 12px ui-monospace, Menlo, monospace; text-align: right; }
+input[type=range] { width: 100%; accent-color: var(--cyan); }
+input[type=text] { background: var(--lcd); border: 1px solid var(--lcd-edge); color: var(--text); border-radius: var(--r);
+  padding: 6px 8px; font: 14px ui-monospace, Menlo, monospace; min-width: 0; flex: 1; text-transform: uppercase; }
+#decodes { height: 160px; overflow: auto; font: 12px ui-monospace, Menlo, Consolas, monospace;
+  background: var(--lcd); border: 1px solid var(--lcd-edge); border-radius: var(--r); }
+#decodes .empty { color: var(--dim); padding: 8px; white-space: normal; }
+#cwbox { height: 96px; overflow: auto; white-space: pre-wrap; word-break: break-word; padding: 6px 8px;
+  font: 15px/1.35 ui-monospace, Menlo, Consolas, monospace; color: #ffd37a;
+  background: var(--lcd); border: 1px solid var(--lcd-edge); border-radius: var(--r); }
+#cwbox .pend { color: #b08a4a; }
+#cw-read { font: 600 12px ui-monospace, Menlo, monospace; }
+#cw-read.lock { color: var(--green); }
+#decodes table { width: 100%; border-collapse: collapse; }
+#decodes td { padding: 2px 4px; border-bottom: 1px solid #1d232b; white-space: nowrap; }
+#decodes td.msg { white-space: normal; color: var(--text); width: 100%; }
+#decodes tr { cursor: pointer; color: var(--dim); }
+#decodes tr:hover { background: #1b2230; }
+#decodes .CW { color: #ffd37a; } #decodes .Q65 { color: #b6ff9a; } #decodes .PI4 { color: #f0a0ff; }
+header .k { padding: 2px 8px; font-size: 12px; min-width: 0; }
+#setmenu { position: fixed; top: 34px; right: 10px; z-index: 11; width: min(720px, 96vw); max-height: 88vh; overflow: auto; box-shadow: 0 10px 30px rgba(0,0,0,.6); }
+table.xv { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.xv th { color: var(--dim); text-align: left; font-weight: 600; padding: 2px; }
+table.xv input[type=text] { width: 100%; min-width: 60px; padding: 3px 5px; text-transform: none; }
+.offs { font: 600 13px ui-monospace, Menlo, monospace; min-width: 70px; text-align: center; cursor: ns-resize;
+  background: var(--lcd); border: 1px solid var(--lcd-edge); border-radius: var(--r); padding: 4px 6px; }
+#rc28menu { position: fixed; top: 34px; right: 10px; z-index: 10; width: min(360px, 94vw); box-shadow: 0 10px 30px rgba(0,0,0,.6); }
+select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd-edge); border-radius: var(--r); padding: 4px; }
+.note { color: var(--dim); font-size: 12px; }
+
+@media (max-width: 1100px) {
+  #deck { grid-template-columns: 1fr 1fr; }
+  #deck .card.wide { grid-column: 1 / -1; }
+}
+@media (max-width: 720px) {
+  #lcd { grid-template-columns: 1fr; }
+  #deck { grid-template-columns: 1fr; }
+  #app { grid-template-rows: auto auto auto minmax(260px, 1fr) auto; overflow: auto; height: auto; min-height: 100%; }
+}
+</style>
+</head>
+<body>
+
+<div id="login" class="hidden">
+  <form method="post" action="/login">
+    <h1>SQTRV <small>by SQ6EMM</small></h1>
+    <input type="password" name="password" placeholder="Password" autocomplete="current-password" autofocus required>
+    <button type="submit">Log in</button>
+    <div class="err hidden" id="loginerr">Wrong password.</div>
+    <div class="note">The password is <code>web.password</code> in trxd.toml (or, when that is empty, the
+      generated one in <code>/mnt/jffs2/trxd-web/password</code> on the board).</div>
+  </form>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <span class="brand">SQTRV</span><span class="by">by SQ6EMM</span>
+    <span id="callsign"></span>
+    <span class="grow"></span>
+    <span title="WebSocket"><span class="dot" id="d-ws"></span>LINK</span>
+    <span title="System clock synchronised (chrony/GPS)"><span class="dot" id="d-time"></span>TIME</span>
+    <span id="temps" title="Die temperatures: Zynq FPGA (XADC) and AD9361"></span>
+    <button class="k" id="setbtn" title="Callsign, S-meter calibration, transverters">SET</button>
+    <button class="k" id="rc28" title="Icom RC-28 (WebHID: Chrome/Edge over HTTPS)">RC-28</button>
+    <span id="clients"></span>
+    <span id="utc"></span>
+    <a href="/logout">log out</a>
+  </header>
+
+  <div id="rc28menu" class="card hidden">
+    <h3>ICOM RC-28</h3>
+    <div class="note" id="rc28status">Not connected.</div>
+    <div class="row"><button class="k" id="rc28pick">CHOOSE DEVICE…</button><button class="k" id="rc28off">DISCONNECT</button></div>
+    <div class="note">F-1 selects VFO A, F-2 selects VFO B; the lit one is the active VFO.
+      Knob: tuning step per detent, faster when spun quickly. TRANSMIT: hold for PTT,
+      tap to latch (tap again to release). Click MIC once per visit first: browsers only open the
+      microphone after a click, and a HID button does not count as one.</div>
+  </div>
+
+  <div id="setmenu" class="card hidden">
+    <h3>STATION</h3>
+    <div class="row">
+      <span class="note">My call</span>
+      <input type="text" id="set-call" placeholder="e.g. SQ6EMM" maxlength="12" style="max-width:160px" autocomplete="off">
+      <button class="k" id="call-save">SAVE</button>
+      <span class="note">used in the header and the CW macros; empty = trxd.toml's</span>
+    </div>
+    <h3>S-METER CALIBRATION <span class="note">IARU: S9 = -73 dBm below 30 MHz, -93 dBm above; 6 dB per S unit</span></h3>
+    <div class="note">Band <b id="cal-band">—</b> · points <b id="cal-n">0</b> · reading <b id="cal-read">—</b> · shows <b id="cal-dbm">—</b></div>
+    <div class="note">Feed a known level into the antenna input (CW carrier in the passband), then store it. Several levels
+      (S1 ... S9+60) make the whole scale right, not only S9.</div>
+    <div class="row">
+      <select id="cal-s"></select>
+      <input type="text" id="cal-level" placeholder="dBm, e.g. -93" style="max-width:130px;text-transform:none">
+      <button class="k" id="cal-store">STORE</button><button class="k" id="cal-clear">CLEAR BAND</button>
+    </div>
+    <h3>TRANSVERTERS <span class="note">RF range on the air and the IF that RF from lands on; tick LO above for a mirrored band</span></h3>
+    <table id="xv-table" class="xv"><thead><tr><th>Name</th><th>RF from MHz</th><th>RF to MHz</th><th>IF at RF from, MHz</th><th>LO above</th><th>TX</th><th></th></tr></thead><tbody id="xv-body"></tbody></table>
+    <div class="row"><button class="k" id="xv-add">ADD</button><button class="k" id="xv-save">SAVE</button><button class="k" id="set-close">CLOSE</button></div>
+  </div>
+
+  <section id="lcd">
+    <div>
+      <div class="vfo-line">
+        <span class="tag on" id="t-vfo">VFO A</span>
+        <span class="tag" id="t-mode">USB</span>
+        <span class="tag" id="t-fil">FIL2</span>
+        <span class="tag" id="t-agc">AGC-M</span>
+        <span class="tag" id="t-split">SPLIT</span>
+        <span class="tag" id="t-txrx">RX</span>
+        <span class="tag" id="t-src"></span>
+        <span class="tag hidden" id="t-xvtr"></span>
+        <span class="tag hidden" id="t-lock">LOCK</span>
+      </div>
+      <div id="freq" title="Scroll or drag a digit to tune it; click a digit to set the tuning step"></div>
+      <div class="sub-line">
+        <span>SUB <b id="freq-b">—</b></span>
+        <span>TX <b id="freq-tx">—</b></span>
+        <span>TS <b id="ts-show">100 Hz</b></span>
+        <span id="rit-line" class="hidden"><span id="rit-name">RIT</span> <b id="rit-show">+0</b></span>
+      </div>
+    </div>
+    <div class="meter">
+      <div class="label"><span id="m-name">S</span><b id="m-val">—</b></div>
+      <div class="bar"><i id="m-bar"></i><em id="m-peak"></em></div>
+      <div class="scale" id="m-scale"></div>
+      <div class="label"><span>RF gain <b id="rfg-show">—</b></span><span>Drive <b id="drv-show">—</b></span><span>ATT <b id="att-show">—</b></span></div>
+    </div>
+  </section>
+
+  <section id="bandbar">
+    <div id="bands"></div>
+    <input type="text" id="fentry" placeholder="MHz / kHz / Hz" title="Type a frequency and press Enter: 144.3 (MHz), 144300 (kHz), 144300000 (Hz), or 144300k" autocomplete="off" inputmode="decimal">
+    <button class="k" id="fgo">GO</button>
+  </section>
+
+  <section id="scopewrap">
+    <canvas id="spec"></canvas>
+    <canvas id="wf"></canvas>
+    <div id="scopeinfo"></div>
+    <div id="scopebar">
+      <button class="k" data-span="5000">±2.5k</button>
+      <button class="k" data-span="10000">±5k</button>
+      <button class="k" data-span="25000">±12.5k</button>
+      <button class="k" data-span="50000">±25k</button>
+      <button class="k" data-span="100000">±50k</button>
+      <button class="k" data-span="250000">±125k</button>
+      <button class="k" data-span="500000">±250k</button>
+      <button class="k" data-span="1000000">±500k</button>
+      <button class="k" data-span="2500000">±1.25M</button>
+      <button class="k" id="ref-auto" title="Keep the noise floor near the bottom of the scope">AUTO</button>
+      <button class="k" id="ref-dn" title="Reference level down">REF−</button>
+      <button class="k" id="ref-up" title="Reference level up">REF+</button>
+      <button class="k" id="pal" title="Waterfall palette">PAL</button>
+      <button class="k" id="scope-ctr" title="Scope: keep the VFO centred (CTR) or a fixed view that follows only when the VFO leaves it (FIX)">FIX</button>
+    </div>
+    <div id="cursor" class="hidden"></div>
+  </section>
+
+  <section id="deck">
+    <div class="card">
+      <h3>MODE · FILTER · DSP</h3>
+      <div class="row" id="modes">
+        <button class="k" data-mode="LSB">LSB</button><button class="k" data-mode="USB">USB</button>
+        <button class="k" data-mode="CW">CW</button><button class="k" data-mode="PKTUSB">DATA</button>
+        <button class="k" data-mode="AM">AM</button><button class="k" data-mode="FM">FM</button>
+      </div>
+      <div class="row" id="fils">
+        <button class="k" data-fil="0">FIL1</button><button class="k" data-fil="1">FIL2</button><button class="k" data-fil="2">FIL3</button>
+        <span class="note" id="fil-show"></span>
+      </div>
+      <div class="slider">WIDTH<input type="range" id="fwidth" min="50" max="6000" step="50" value="2700"><b id="fwidth-v">—</b></div>
+      <div class="slider">SHIFT<input type="range" id="fshift" min="-1200" max="1200" step="10" value="0"><b id="fshift-v">0</b></div>
+      <div class="row" id="agcs">
+        <button class="k" data-agc="fast">FAST</button><button class="k" data-agc="med">MID</button>
+        <button class="k" data-agc="slow">SLOW</button><button class="k" data-agc="off">OFF</button>
+      </div>
+      <div class="row">
+        <button class="k" id="nb" title="Noise blanker (impulse noise)">NB</button>
+        <button class="k" id="nr" title="Noise reduction">NR</button>
+        <button class="k" id="notch" title="Automatic notch (steady tones)">NOTCH</button>
+      </div>
+      <div class="slider">SQL<input type="range" id="sql" min="0" max="100" value="0"><b id="sql-v">OFF</b></div>
+    </div>
+
+    <div class="card">
+      <h3>VFO · STEP · LEVELS</h3>
+      <div class="row">
+        <button class="k" id="vfo-ab">A/B</button><button class="k" id="vfo-eq">A=B</button>
+        <button class="k" id="split">SPLIT</button><button class="k" id="lock" title="Lock the tuning">LOCK</button>
+      </div>
+      <div class="row">
+        <button class="k" id="rit">RIT</button><button class="k" id="xit">XIT</button>
+        <b id="ritv" class="offs" title="Scroll or drag to set the offset">+0 Hz</b>
+        <button class="k" id="ritclr">CLR</button>
+      </div>
+      <div class="row" id="steps">
+        <button class="k" data-step="10">10</button><button class="k" data-step="100">100</button>
+        <button class="k" data-step="1000">1k</button><button class="k" data-step="5000">5k</button>
+        <button class="k" data-step="12500">12.5k</button><button class="k" data-step="25000">25k</button>
+      </div>
+      <div class="slider">AF<input type="range" id="af" min="0" max="100" value="60"><b id="af-v">60</b></div>
+      <div class="slider">RF gain<input type="range" id="rfg" min="0" max="73" value="40"><b id="rfg-v">AUTO</b></div>
+      <div class="row"><button class="k" id="audio" title="Receive audio in this browser: on / off">AUDIO</button>
+        <button class="k" id="rfg-auto" title="Front-end (AD9361) gain: AUTO = the chip's own AGC, MAN = the RF gain slider">RF AUTO</button></div>
+    </div>
+
+    <div class="card wide">
+      <h3>TRANSMIT</h3>
+      <div class="row">
+        <button class="k" id="ptt" title="Hold, or Space; Shift-click latches. In CW it is a straight key: carrier at the pitch while held.">PTT</button>
+        <button class="k" id="tune">TUNE</button>
+        <button class="k" id="mic">MIC</button>
+        <button class="k" id="mute-tx" title="Lit: the receiver is muted while transmitting. Off: keep receiving during TX (satellites, crossband).">MUTE AT TX</button>
+      </div>
+      <div class="slider">Drive<input type="range" id="drv" min="0" max="100" value="100"><b id="drv-v">100</b></div>
+      <div class="slider">TX att<input type="range" id="att" min="0" max="89" value="20"><b id="att-v">20</b></div>
+      <div class="slider">MIC<input type="range" id="micg" min="0" max="200" value="100"><b id="micg-v">100%</b></div>
+      <div class="slider"><button class="k" id="comp" style="min-width:0;padding:2px 6px;font-size:11px">COMP</button><input type="range" id="compl" min="0" max="20" value="10"><b id="compl-v">10 dB</b></div>
+      <div class="row">
+        <input type="text" id="cwtext" placeholder="CW text, Enter sends" maxlength="200">
+        <button class="k" id="cwsend">SEND</button><button class="k" id="cwstop">STOP</button>
+      </div>
+      <div class="row" id="macros"></div>
+      <div class="slider">CW WPM<input type="range" id="wpm" min="5" max="45" value="20"><b id="wpm-v">20</b></div>
+      <div class="slider">BK-IN<input type="range" id="hang" min="50" max="2000" step="50" value="400"><b id="hang-v">400 ms</b></div>
+      <h3>CW <span class="note">live copy in CW mode: click the signal to put it on the pitch</span>
+        <span id="cw-read"></span> <button class="k" id="cw-clear" style="float:right;padding:0 8px;font-size:11px;min-width:0">CLEAR</button>
+</h3>
+      <div id="cwbox"><span id="cw-text"></span><span class="pend" id="cw-pend"></span></div>
+      <h3>DECODES <span class="note">switch on what you need: each costs CPU on the board</span></h3>
+      <div class="row" id="decoders">
+        <button class="k" data-dec="q65">Q65</button>
+        <button class="k" data-dec="pi4">PI4</button>
+        <button class="k" id="dec-clear">CLEAR</button>
+      </div>
+      <div id="decodes"><table><tbody id="dec-body"></tbody></table></div>
+    </div>
+  </section>
+</div>
+
+<script>
+"use strict";
+(() => {
+// ============================================================ helpers
+const $ = (id) => document.getElementById(id);
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const store = {
+  get(k, d) { try { const v = localStorage.getItem("trxd." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("trxd." + k, JSON.stringify(v)); } catch { /* private mode */ } },
+};
+function fmtFreq(hz, dotted = true) {
+  const s = Math.round(hz).toString().padStart(4, "0");
+  if (!dotted) return s;
+  const hzp = s.slice(-3), khz = s.slice(-6, -3), mhz = s.slice(0, -6) || "0";
+  return `${mhz}.${khz}.${hzp}`;
+}
+function fmtHz(hz) {
+  const a = Math.abs(hz);
+  if (a >= 1e6) return (hz / 1e6).toFixed(a >= 1e7 ? 2 : 3).replace(/\.?0+$/, "") + " MHz";
+  if (a >= 1e3) return (hz / 1e3).toFixed(a >= 1e4 ? 1 : 2).replace(/\.?0+$/, "") + " kHz";
+  return hz + " Hz";
+}
+
+// ============================================================ state
+const S = {
+  st: null,            // last state from the radio
+  step: store.get("step", 100),
+  refDb: -20,                       // top of the spectrum, dBFS
+  refAuto: store.get("refAuto", true),
+  refOffset: store.get("refOffset", 0), // manual trim on top of AUTO, or absolute REF when not
+  floorDb: null,
+  rangeDb: 80,
+  palette: store.get("pal", 0),
+  vol: store.get("vol", 60) / 100,
+  muted: false,
+  pttLatched: false,
+  row: null, rowCenter: 0, rowSpan: 1,
+  meterPeak: -160, meterPeakAt: 0,
+};
+// [name, first tune, mode, band from, band to] (IARU R1 edges).
+const BANDS = [
+  ["6m", 50_150_000, "USB", 50e6, 52e6], ["4m", 70_200_000, "USB", 70e6, 70.5e6],
+  ["2m", 144_300_000, "USB", 144e6, 146e6], ["70cm", 432_200_000, "USB", 430e6, 440e6],
+  ["23cm", 1_296_200_000, "USB", 1240e6, 1300e6], ["13cm", 2_320_200_000, "USB", 2300e6, 2450e6],
+  ["9cm", 3_400_100_000, "USB", 3400e6, 3475e6], ["6cm", 5_760_100_000, "USB", 5650e6, 5850e6],
+];
+// The band button for a frequency: a transverter's range first, then the bands.
+function bandOf(f, xvtrs) {
+  const xv = (xvtrs || []).find((t) => f >= t.rf_min && f <= t.rf_max);
+  if (xv) return xv.name;
+  const b = BANDS.find(([, , , lo, hi]) => f >= lo && f <= hi);
+  return b ? b[0] : null;
+}
+// Filter presets per mode: [lo, hi] Hz, FIL1 widest.
+const FILTERS = {
+  USB: [[100, 3000], [150, 2850], [300, 2400]],
+  LSB: [[-3000, -100], [-2850, -150], [-2400, -300]],
+  PKTUSB: [[100, 3100], [200, 2900], [500, 2500]],
+  CW: [[200, 1200], [450, 950], [600, 800]],
+  AM: [[-5000, 5000], [-3000, 3000], [-2000, 2000]],
+  FM: [[-8000, 8000], [-5000, 5000], [-3000, 3000]],
+};
+
+// ============================================================ login / connect
+async function boot() {
+  let ok = false;
+  try { ok = (await (await fetch("/session", { cache: "no-store" })).json()).ok; } catch { /* offline */ }
+  if (!ok) {
+    $("login").classList.remove("hidden");
+    if (location.search.includes("bad=1")) $("loginerr").classList.remove("hidden");
+    return;
+  }
+  $("app").classList.remove("hidden");
+  buildStatic();
+  connect();
+  requestAnimationFrame(frame);
+}
+
+let ws = null;
+function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+function connect() {
+  ws = new WebSocket(`wss://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { $("d-ws").className = "dot ok"; };
+  ws.onclose = () => {
+    $("d-ws").className = "dot bad";
+    setTimeout(async () => {
+      // Session gone (reboot): back to the login page.
+      try { if (!(await (await fetch("/session")).json()).ok) { location.reload(); return; } } catch { /* retry */ }
+      connect();
+    }, 1500);
+  };
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string") onJson(JSON.parse(ev.data));
+    else onBinary(ev.data);
+  };
+}
+
+function onBinary(buf) {
+  const u8 = new Uint8Array(buf);
+  if (u8[0] === 1) {
+    const dv = new DataView(buf);
+    S.rowCenter = dv.getFloat64(1, true);
+    S.rowSpan = dv.getFloat64(9, true);
+    const n = dv.getUint16(17, true);
+    S.row = u8.subarray(19, 19 + n);
+    autoLevel(S.row);
+    pushWaterfall(S.row);
+  } else if (u8[0] === 2) {
+    audioIn(u8.subarray(1));
+  }
+}
+
+function onJson(m) {
+  if (m.type === "state") { S.st = m; renderState(); }
+  else if (m.type === "meter") renderMeter(m);
+  else if (m.type === "decode") addDecode(m);
+  else if (m.type === "cw") renderCw(m);
+}
+function renderCw(m) {
+  const box = $("cwbox"), atEnd = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+  $("cw-text").textContent = m.text;
+  $("cw-pend").textContent = m.pending ? (m.text && !/[ \n]$/.test(m.text) ? " " : "") + m.pending : "";
+  if (atEnd) box.scrollTop = box.scrollHeight;
+}
+
+// ============================================================ frequency display
+function renderFreq() {
+  const st = S.st; if (!st) return;
+  const hz = st.active === "B" ? st.vfo_b : st.vfo_a;
+  const s = Math.round(hz).toString();
+  const el = $("freq");
+  el.classList.toggle("tx", !!st.ptt);
+  let html = "";
+  for (let i = 0; i < s.length; i++) {
+    const place = s.length - 1 - i;              // 10^place
+    if (place % 3 === 2 && i > 0) html += `<span class="sep">.</span>`;
+    const cls = place < 3 ? "d small" : "d";
+    html += `<span class="${cls}" data-p="${place}">${s[i]}</span>`;
+  }
+  if (el.dataset.v !== html) { el.innerHTML = html; el.dataset.v = html; }
+}
+function tuneTo(hz) {
+  const st = S.st; if (!st || S.locked) return;
+  hz = clamp(Math.round(hz), st.freq_min, st.freq_max);
+  const k = st.active === "B" ? "vfo_b" : "vfo_a";
+  st[k] = hz; renderFreq(); drawSpectrum();
+  send({ cmd: "freq", hz });
+}
+function curFreq() { const st = S.st; return st ? (st.active === "B" ? st.vfo_b : st.vfo_a) : 0; }
+function tuneBy(steps, step = S.step) {
+  const f = curFreq();
+  // Snap to the step grid first, as a real VFO knob does.
+  const snapped = steps > 0 ? Math.floor(f / step) * step : Math.ceil(f / step) * step;
+  tuneTo((snapped === f ? f : snapped) + steps * step);
+}
+function setupFreqTuning() {
+  const el = $("freq");
+  el.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const d = e.target.closest(".d");
+    const step = d ? 10 ** +d.dataset.p : S.step;
+    tuneBy(e.deltaY < 0 ? 1 : -1, step);
+  }, { passive: false });
+  el.addEventListener("click", (e) => {
+    const d = e.target.closest(".d"); if (!d) return;
+    setStep(Math.max(1, 10 ** +d.dataset.p));
+  });
+  let drag = null;
+  el.addEventListener("pointerdown", (e) => {
+    const d = e.target.closest(".d"); if (!d) return;
+    drag = { y: e.clientY, step: 10 ** +d.dataset.p, acc: 0 }; el.setPointerCapture(e.pointerId);
+  });
+  el.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    const dy = drag.y - e.clientY; drag.y = e.clientY; drag.acc += dy;
+    while (Math.abs(drag.acc) >= 12) { const s = Math.sign(drag.acc); tuneBy(s, drag.step); drag.acc -= 12 * s; }
+  });
+  el.addEventListener("pointerup", () => { drag = null; });
+}
+function setStep(step) {
+  S.step = step; store.set("step", step);
+  $("ts-show").textContent = fmtHz(step);
+  document.querySelectorAll("#steps .k").forEach((b) => b.classList.toggle("on", +b.dataset.step === step));
+}
+
+// ============================================================ filters, bands, settings
+function filPreset(mode, i) {
+  const all = store.get("fil." + mode, null);
+  return (all && all[i]) || (FILTERS[mode] || FILTERS.USB)[i];
+}
+const FIL_MAX = { CW: 2000, USB: 4000, LSB: 4000, PKTUSB: 4000, AM: 12000, FM: 20000 };
+function renderFilter(st) {
+  if (!S.filIdx) S.filIdx = store.get("filidx", {});
+  const i = S.filIdx[st.mode] ?? 1, def = (FILTERS[st.mode] || FILTERS.USB)[i];
+  const w = Math.round(st.filter[1] - st.filter[0]);
+  const sh = Math.round(((st.filter[0] + st.filter[1]) / 2 - (def[0] + def[1]) / 2) * (def[0] < 0 ? -1 : 1));
+  const fw = $("fwidth"), fs = $("fshift");
+  fw.max = FIL_MAX[st.mode] || 4000;
+  if (document.activeElement !== fw) fw.value = w;
+  if (document.activeElement !== fs) fs.value = clamp(sh, -1200, 1200);
+  $("fwidth-v").textContent = fmtHz(w); $("fshift-v").textContent = sh;
+  document.querySelectorAll("#fils .k").forEach((b) => b.classList.toggle("on", +b.dataset.fil === i));
+  $("fil-show").textContent = `${Math.round(st.filter[0])} .. ${Math.round(st.filter[1])} Hz`;
+}
+function buildBands(xvtrs) {
+  const key = JSON.stringify(xvtrs);
+  if (S.bandsKey === key) return; S.bandsKey = key;
+  $("bands").innerHTML = BANDS.map(([n, f, m]) => `<button class="k" data-f="${f}" data-m="${m}">${n}</button>`).join("") +
+    xvtrs.map((t) => `<button class="k warn" data-f="${Math.round((t.rf_min + Math.min(t.rf_max, t.rf_min + 200e3)) / 2 / 1e3) * 1e3}" data-m="USB" title="Transverter: ${t.rf_min / 1e6} MHz on IF ${(t.inverted ? t.lo_hz - t.rf_min : t.rf_min - t.lo_hz) / 1e6} MHz${t.inverted ? " (LO above)" : ""}">${escapeHtml(t.name)}</button>`).join("");
+}
+function setupSettings() {
+  $("setbtn").onclick = () => { const m = $("setmenu"); m.classList.toggle("hidden"); if (!m.classList.contains("hidden")) openSettings(); };
+  $("set-close").onclick = () => $("setmenu").classList.add("hidden");
+  $("cal-s").onchange = () => { const v = $("cal-s").value; if (v) $("cal-level").value = v; };
+  $("cal-store").onclick = () => {
+    const d = parseFloat($("cal-level").value.replace(",", "."));
+    if (!isFinite(d) || d > 20 || d < -170) { alert("Level in dBm, for example -93"); return; }
+    send({ cmd: "smeter_cal", dbm: d });
+  };
+  $("cal-clear").onclick = () => { if (confirm("Remove every calibration point of this band?")) send({ cmd: "smeter_clear" }); };
+  $("xv-add").onclick = () => addXvRow({ name: "", rf_min: 0, rf_max: 0, lo_hz: 0, inverted: false, tx: true });
+  $("xv-body").onclick = (e) => { if (e.target.dataset.del !== undefined) e.target.closest("tr").remove(); };
+  $("xv-save").onclick = () => {
+    const list = [...$("xv-body").querySelectorAll("tr")].map((tr) => {
+      const v = (k) => tr.querySelector(`[data-k=${k}]`);
+      const mhz = (k) => Math.round(parseFloat(v(k).value.replace(",", ".")) * 1e6);
+      const rf = mhz("rf_min"), ifq = mhz("if"), inv = v("inv").checked;
+      // The board keeps the LO: IF = RF - LO, or LO - RF with the LO above.
+      return { name: v("name").value.trim(), rf_min: rf, rf_max: mhz("rf_max"), lo_hz: inv ? rf + ifq : rf - ifq, inverted: inv, tx: v("tx").checked, _if: ifq };
+    });
+    const bad = list.find((t) => !t.name || !(t.rf_max > t.rf_min) || !(t._if > 0));
+    if (bad) { alert("Every transverter needs a name, RF from < RF to, and the IF (MHz) that RF from lands on."); return; }
+    list.forEach((t) => delete t._if);
+    send({ cmd: "xvtr_set", list });
+  };
+}
+function addXvRow(t) {
+  const tr = document.createElement("tr");
+  const mhz = (x) => x ? (Math.round(x) / 1e6).toString() : "";
+  const ifq = t.rf_min ? (t.inverted ? t.lo_hz - t.rf_min : t.rf_min - t.lo_hz) : 0;
+  tr.innerHTML = `<td><input type="text" data-k="name" value="${escapeHtml(t.name)}"></td>
+    <td><input type="text" data-k="rf_min" value="${mhz(t.rf_min)}"></td><td><input type="text" data-k="rf_max" value="${mhz(t.rf_max)}"></td>
+    <td><input type="text" data-k="if" value="${mhz(ifq)}"></td>
+    <td><input type="checkbox" data-k="inv" ${t.inverted ? "checked" : ""}></td><td><input type="checkbox" data-k="tx" ${t.tx ? "checked" : ""}></td>
+    <td><button class="k" data-del style="min-width:0;padding:2px 8px">✕</button></td>`;
+  $("xv-body").appendChild(tr);
+}
+function openSettings() {
+  const st = S.st; if (!st) return;
+  const s9 = curFreq() < 30e6 ? -73 : -93;
+  const opts = [["", "S unit…"]].concat([1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => [s9 + (n - 9) * 6, "S" + n]),
+    [10, 20, 30, 40, 50, 60].map((n) => [s9 + n, "S9+" + n]));
+  $("cal-s").innerHTML = opts.map(([v, l]) => `<option value="${v}">${l}${v !== "" ? " (" + v + " dBm)" : ""}</option>`).join("");
+  $("set-call").value = st.call || "";
+  $("xv-body").innerHTML = "";
+  (st.xvtrs || []).forEach(addXvRow);
+  renderCal(st);
+}
+function renderCal(st) {
+  $("cal-band").textContent = st.cal_band || "—";
+  $("cal-n").textContent = st.cal_points || 0;
+}
+
+// ============================================================ state rendering
+function renderState() {
+  const st = S.st;
+  $("callsign").textContent = st.call || "";
+  renderFreq();
+  $("t-vfo").textContent = "VFO " + st.active;
+  $("t-mode").textContent = st.mode === "PKTUSB" ? "DATA" : st.mode;
+  $("t-mode").className = "tag on";
+  if (!S.filIdx) S.filIdx = store.get("filidx", {});
+  $("t-fil").textContent = "FIL" + ((S.filIdx[st.mode] ?? 1) + 1) + " " + fmtHz(Math.round(st.filter[1] - st.filter[0]));
+  $("t-agc").textContent = "AGC-" + ({ fast: "F", med: "M", slow: "S", off: "OFF" }[st.agc] || "?");
+  $("t-split").className = "tag" + (st.split ? " amber" : "");
+  $("t-txrx").textContent = st.ptt ? "TX" : "RX";
+  $("t-txrx").className = "tag" + (st.ptt ? " tx" : "");
+  $("t-src").textContent = st.tx_source ? st.tx_source.toUpperCase() : "";
+  $("t-src").className = st.tx_source ? "tag tx" : "hidden";
+  $("freq-b").textContent = fmtFreq(st.active === "B" ? st.vfo_a : st.vfo_b);
+  const txf = (st.split ? (st.active === "B" ? st.vfo_a : st.vfo_b) : curFreq()) + (st.xit && st.xit[0] ? st.xit[1] : 0);
+  $("freq-tx").textContent = fmtFreq(txf);
+  document.querySelectorAll("#modes .k").forEach((b) => b.classList.toggle("on", b.dataset.mode === st.mode));
+  document.querySelectorAll("#agcs .k").forEach((b) => b.classList.toggle("on", b.dataset.agc === st.agc));
+  $("split").classList.toggle("on", st.split);
+  renderFilter(st);
+  buildBands(st.xvtrs || []);
+  const bnow = bandOf(curFreq(), st.xvtrs);
+  document.querySelectorAll("#bands .k").forEach((b) => b.classList.toggle("on", b.textContent === bnow));
+  for (const k of ["nb", "nr", "notch"]) $(k).classList.toggle("on", !!st[k]);
+  $("rit").classList.toggle("on", !!(st.rit && st.rit[0])); $("xit").classList.toggle("on", !!(st.xit && st.xit[0]));
+  const ro = st.rit ? (st.rit[0] || !st.xit[0] ? st.rit[1] : st.xit[1]) : 0;
+  $("ritv").textContent = (ro >= 0 ? "+" : "") + ro + " Hz";
+  const ritOn = st.rit && (st.rit[0] || st.xit[0]);
+  $("rit-line").classList.toggle("hidden", !ritOn);
+  if (ritOn) { $("rit-name").textContent = [st.rit[0] && "RIT", st.xit[0] && "XIT"].filter(Boolean).join("/"); $("rit-show").textContent = (ro >= 0 ? "+" : "") + ro; }
+  $("t-xvtr").classList.toggle("hidden", !st.xvtr); $("t-xvtr").textContent = st.xvtr ? "XVTR " + st.xvtr : "";
+  if (document.activeElement !== $("sql")) { $("sql").value = st.squelch === null ? 0 : st.squelch + 140; $("sql-v").textContent = st.squelch === null ? "OFF" : st.squelch + " dB"; }
+  $("comp").classList.toggle("on", st.comp !== null);
+  if (document.activeElement !== $("micg")) { $("micg").value = Math.round(st.mic_gain * 100); $("micg-v").textContent = $("micg").value + "%"; }
+  if (document.activeElement !== $("hang")) { $("hang").value = st.cw_hang_ms; $("hang-v").textContent = st.cw_hang_ms + " ms"; }
+  $("mute-tx").classList.toggle("on", st.mute_at_tx !== false);
+  $("scope-ctr").textContent = st.scope_center ? "CTR" : "FIX"; $("scope-ctr").classList.toggle("on", !!st.scope_center);
+  if (!$("setmenu").classList.contains("hidden")) renderCal(st);
+  const decs = st.decoders || [];
+  document.querySelectorAll("#decoders [data-dec]").forEach((b) => b.classList.toggle("on", decs.includes(b.dataset.dec)));
+  $("ptt").classList.toggle("on", !!st.ptt && st.tx_source !== "tune");
+  $("tune").classList.toggle("on", !!st.tune);
+  $("ptt").disabled = !st.allow_tx; $("tune").disabled = !st.allow_tx;
+  $("d-time").className = "dot " + (st.time_synced ? "ok" : "warn");
+  const tc = (n, c) => c == null ? "" : `<span class="${c >= 85 ? "hot" : c >= 70 ? "warm" : ""}">${n} <b>${c}°C</b></span>`;
+  $("temps").innerHTML = [tc("FPGA", st.temp_fpga), tc("AD9361", st.temp_ad936x)].filter(Boolean).join(" · ");
+  $("clients").textContent = `TCI ${st.tci_clients} · RIG ${st.rigctl_clients}`;
+  setSlider("drv", st.drive); setSlider("att", Math.round(st.tx_att_db)); setSlider("wpm", Math.round(st.cw_wpm));
+  $("rfg-v").textContent = st.rx_gain_mode === "manual" ? Math.round(st.rx_gain_db) + " dB" : "AUTO";
+  $("rfg-auto").classList.toggle("on", st.rx_gain_mode !== "manual");
+  $("rfg-auto").textContent = st.rx_gain_mode === "manual" ? "RF MAN" : "RF AUTO";
+  $("rfg-show").textContent = st.rx_gain_mode === "manual" ? Math.round(st.rx_gain_db) + " dB" : "AUTO";
+  $("drv-show").textContent = Math.round(st.drive) + " %";
+  $("att-show").textContent = Math.round(st.tx_att_db) + " dB";
+  document.querySelectorAll("#scopebar [data-span]").forEach((b) => {
+    b.classList.toggle("on", +b.dataset.span === st.span);
+    b.disabled = +b.dataset.span > st.span_max;
+  });
+  $("scopeinfo").textContent = `SPAN ±${fmtHz(st.span / 2)}  REF ${S.refAuto ? "AUTO" + (S.refOffset ? (S.refOffset > 0 ? "+" : "") + S.refOffset : "") : S.refDb + " dBFS"}`;
+  drawSpectrum();
+}
+function setSlider(id, v) {
+  const el = $(id);
+  if (document.activeElement !== el) el.value = v;
+  $(id + "-v").textContent = v;
+}
+
+// ============================================================ meter
+const S_SCALE = ["1", "3", "5", "7", "9", "+20", "+40", "+60"];
+function renderMeter(m) {
+  // S-meter from dBFS at the channel and the hardware gain: -73 dBm = S9
+  // needs a per-board calibration; this reads S9 at -73 dBm with a nominal
+  // 0 dBFS = -10 dBm at 0 dB gain front end. Good for relative readings.
+  const tx = m.tx;
+  let frac, val;
+  if (tx) {
+    $("m-name").textContent = "Po";
+    frac = S.st ? S.st.drive / 100 : 0;
+    val = Math.round(frac * 100) + " %";
+    $("m-scale").innerHTML = ["0", "25", "50", "75", "100%"].map((s) => `<span>${s}</span>`).join("");
+  } else {
+    $("m-name").textContent = "S";
+    // Calibrated level from the board (IARU: S9 = -73 dBm below 30 MHz, -93 above).
+    const dbm = m.dbm !== undefined ? m.dbm : m.s_dbfs - m.rx_gain_db - 10;
+    const s9 = curFreq() < 30e6 ? -73 : -93;
+    const s = 9 + (dbm - s9) / 6;
+    frac = s <= 9 ? clamp(s / 9, 0, 1) * 0.6 : 0.6 + clamp((dbm - s9) / 60, 0, 1) * 0.4;
+    val = `${m.s || ("S" + Math.max(0, s).toFixed(0))}  ${dbm.toFixed(0)} dBm`;
+    S.lastMeter = m;
+    if (!$("setmenu").classList.contains("hidden")) {
+      $("cal-read").textContent = m.reading !== undefined ? m.reading.toFixed(1) + " dB" : "—";
+      $("cal-dbm").textContent = dbm.toFixed(1) + " dBm (" + (m.s || "") + ")";
+    }
+    $("m-scale").innerHTML = S_SCALE.map((x, i) => `<span class="${i > 4 ? "hi" : ""}">${x}</span>`).join("");
+  }
+  $("m-val").textContent = val;
+  if (m.cw) {
+    const r = $("cw-read");
+    r.textContent = `${m.cw.tone_hz} Hz · ${m.cw.wpm} WPM · SNR ${m.cw.snr_db} dB`;
+    r.classList.toggle("lock", !!m.cw.locked);
+  }
+  $("m-bar").style.width = (frac * 100).toFixed(1) + "%";
+  const now = performance.now();
+  if (frac >= S.meterPeak || now - S.meterPeakAt > 1500) { S.meterPeak = frac; S.meterPeakAt = now; }
+  $("m-peak").style.left = (S.meterPeak * 100).toFixed(1) + "%";
+}
+
+// ============================================================ scope
+const spec = $("spec"), wf = $("wf");
+const sctx = spec.getContext("2d"), wctx = wf.getContext("2d", { willReadFrequently: false });
+let wfImage = null;
+const PALETTES = [
+  // classic: black-blue-cyan-yellow-red-white
+  [[0, 0, 0, 0], [0.2, 0, 0, 90], [0.4, 0, 110, 220], [0.6, 30, 230, 180], [0.75, 250, 240, 40], [0.9, 255, 60, 20], [1, 255, 255, 255]],
+  // amber LCD
+  [[0, 0, 0, 0], [0.35, 40, 20, 0], [0.7, 220, 140, 20], [1, 255, 240, 200]],
+  // grey
+  [[0, 0, 0, 0], [1, 255, 255, 255]],
+];
+let lut = null;
+function buildLut() {
+  const p = PALETTES[S.palette % PALETTES.length];
+  lut = new Uint8Array(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const x = i / 255;
+    let j = 0; while (j < p.length - 2 && x > p[j + 1][0]) j++;
+    const [x0, r0, g0, b0] = p[j], [x1, r1, g1, b1] = p[j + 1];
+    const t = clamp((x - x0) / (x1 - x0 || 1), 0, 1);
+    lut[i * 3] = r0 + (r1 - r0) * t; lut[i * 3 + 1] = g0 + (g1 - g0) * t; lut[i * 3 + 2] = b0 + (b1 - b0) * t;
+  }
+}
+function resizeScope() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  for (const c of [spec, wf]) {
+    const w = Math.round(c.clientWidth * dpr), h = Math.round(c.clientHeight * dpr);
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; if (c === wf) wfImage = null; }
+  }
+  drawSpectrum();
+}
+// AUTO: follow the noise floor (a low percentile of the row) so it sits
+// 10 dB above the bottom of the scope, like a radio's scope reference.
+function autoLevel(row) {
+  const v = []; for (let i = 0; i < row.length; i += 4) if (row[i]) v.push(row[i]);
+  if (!v.length) return;
+  v.sort((a, b) => a - b);
+  const floor = u8db(v[(v.length * 0.3) | 0]);
+  S.floorDb = S.floorDb === null ? floor : S.floorDb + 0.1 * (floor - S.floorDb);
+  if (S.refAuto) S.refDb = Math.round(S.floorDb - 10 + S.rangeDb + S.refOffset);
+  else S.refDb = S.refOffset;
+}
+// u8 -> dBFS (see web.rs): v = (dB + 160) * 1.5
+const u8db = (v) => v / 1.5 - 160;
+function level(v) { // 0..1 on the display scale
+  if (v === 0) return -1;
+  return clamp((u8db(v) - (S.refDb - S.rangeDb)) / S.rangeDb, 0, 1);
+}
+function pushWaterfall(row) {
+  const w = wf.width, h = wf.height;
+  if (!w || !h) return;
+  if (!wfImage || wfImage.width !== w) wfImage = wctx.createImageData(w, 1);
+  // Scroll down one pixel, paint the new line on top.
+  wctx.drawImage(wf, 0, 0, w, h - 1, 0, 1, w, h - 1);
+  const d = wfImage.data, n = row.length;
+  for (let x = 0; x < w; x++) {
+    const v = row[Math.min(n - 1, (x * n / w) | 0)];
+    const l = level(v);
+    const i = l < 0 ? 0 : (l * 255) | 0;
+    d[x * 4] = l < 0 ? 25 : lut[i * 3]; d[x * 4 + 1] = l < 0 ? 25 : lut[i * 3 + 1]; d[x * 4 + 2] = l < 0 ? 30 : lut[i * 3 + 2]; d[x * 4 + 3] = 255;
+  }
+  wctx.putImageData(wfImage, 0, 0);
+  S.dirtySpec = true;
+}
+function freqAtX(x, width) { return S.rowCenter + (x / width - 0.5) * S.rowSpan; }
+function xAtFreq(f, width) { return ((f - S.rowCenter) / S.rowSpan + 0.5) * width; }
+function drawSpectrum() {
+  const w = spec.width, h = spec.height; if (!w || !h) return;
+  const c = sctx;
+  c.fillStyle = "#020406"; c.fillRect(0, 0, w, h);
+  const st = S.st;
+  // grid: dB lines every 10 dB, frequency ticks
+  c.strokeStyle = "rgba(95,212,255,.10)"; c.lineWidth = 1; c.fillStyle = "rgba(127,139,153,.9)";
+  c.font = `${Math.round(10 * (window.devicePixelRatio || 1))}px ui-monospace, Menlo, monospace`;
+  for (let db = Math.ceil((S.refDb - S.rangeDb) / 10) * 10; db <= S.refDb; db += 10) {
+    const y = (S.refDb - db) / S.rangeDb * h;
+    c.beginPath(); c.moveTo(0, y); c.lineTo(w, y); c.stroke();
+  }
+  if (S.rowSpan > 1) {
+    const raw = S.rowSpan / 8, mag = 10 ** Math.floor(Math.log10(raw));
+    const tick = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((t) => t >= raw);
+    for (let f = Math.ceil((S.rowCenter - S.rowSpan / 2) / tick) * tick; f < S.rowCenter + S.rowSpan / 2; f += tick) {
+      const x = xAtFreq(f, w);
+      c.beginPath(); c.moveTo(x, 0); c.lineTo(x, h); c.stroke();
+      c.fillText(fmtFreq(f).replace(/\.\d{3}$/, ""), x + 3, h - 4);
+    }
+  }
+  // passband of the receiver
+  if (st && S.rowSpan > 1) {
+    const f0 = curFreq() + (st.rit && st.rit[0] ? st.rit[1] : 0);
+    const x0 = xAtFreq(f0 + st.filter[0], w), x1 = xAtFreq(f0 + st.filter[1], w);
+    c.fillStyle = st.ptt ? "rgba(255,60,60,.16)" : "rgba(95,212,255,.13)";
+    c.fillRect(Math.min(x0, x1), 0, Math.max(2, Math.abs(x1 - x0)), h);
+    const xv = xAtFreq(f0, w);
+    c.strokeStyle = st.ptt ? "#ff5050" : "#ffb547"; c.lineWidth = 1.5;
+    c.beginPath(); c.moveTo(xv, 0); c.lineTo(xv, h); c.stroke();
+  }
+  // trace
+  const row = S.row; if (!row) return;
+  const n = row.length;
+  c.beginPath();
+  for (let x = 0; x < w; x++) {
+    const v = row[Math.min(n - 1, (x * n / w) | 0)];
+    const l = level(v);
+    const y = h - (l < 0 ? 0 : l) * h;
+    if (x === 0) c.moveTo(x, y); else c.lineTo(x, y);
+  }
+  c.lineTo(w, h); c.lineTo(0, h); c.closePath();
+  const g = c.createLinearGradient(0, 0, 0, h);
+  g.addColorStop(0, "rgba(95,212,255,.45)"); g.addColorStop(1, "rgba(95,212,255,.02)");
+  c.fillStyle = g; c.fill();
+  c.strokeStyle = "#8fe6ff"; c.lineWidth = 1.2; c.stroke();
+}
+function frame() {
+  if (S.dirtySpec) { S.dirtySpec = false; drawSpectrum(); }
+  $("utc").textContent = new Date().toISOString().slice(11, 19) + "Z";
+  requestAnimationFrame(frame);
+}
+function setupScope() {
+  const wrap = $("scopewrap"), cur = $("cursor");
+  for (const c of [spec, wf]) {
+    c.addEventListener("click", (e) => {
+      if (S.dragged) return;
+      const r = c.getBoundingClientRect();
+      const f = freqAtX(e.clientX - r.left, r.width);
+      // CW: put the clicked signal on the sidetone; SSB: on the carrier.
+      const off = S.st && S.st.mode === "CW" ? -700 : 0;
+      tuneTo(Math.round((f + off) / 10) * 10);
+    });
+    c.addEventListener("wheel", (e) => { e.preventDefault(); tuneBy(e.deltaY < 0 ? 1 : -1); }, { passive: false });
+    c.addEventListener("pointermove", (e) => {
+      const r = wrap.getBoundingClientRect(), rc = c.getBoundingClientRect();
+      cur.classList.remove("hidden");
+      cur.style.left = (e.clientX - r.left) + "px"; cur.style.top = (e.clientY - r.top) + "px";
+      cur.textContent = fmtFreq(freqAtX(e.clientX - rc.left, rc.width));
+      if (S.drag) {
+        const dx = e.clientX - S.drag.x;
+        if (Math.abs(dx) > 3) S.dragged = true;
+        if (S.dragged) tuneTo(S.drag.f + dx / rc.width * S.rowSpan);
+      }
+    });
+    c.addEventListener("pointerleave", () => cur.classList.add("hidden"));
+    c.addEventListener("pointerdown", (e) => { S.drag = { x: e.clientX, f: curFreq() }; S.dragged = false; c.setPointerCapture(e.pointerId); });
+    c.addEventListener("pointerup", () => { S.drag = null; setTimeout(() => { S.dragged = false; }, 0); });
+  }
+  document.querySelectorAll("#scopebar [data-span]").forEach((b) => b.addEventListener("click", () => send({ cmd: "span", hz: +b.dataset.span })));
+  const refStep = (d) => {
+    S.refOffset = clamp(S.refOffset + d, S.refAuto ? -40 : -140, S.refAuto ? 40 : 10);
+    store.set("refOffset", S.refOffset); if (S.row) autoLevel(S.row); renderState();
+  };
+  $("ref-up").onclick = () => refStep(5);
+  $("ref-dn").onclick = () => refStep(-5);
+  $("ref-auto").classList.toggle("on", S.refAuto);
+  $("ref-auto").onclick = () => {
+    S.refAuto = !S.refAuto; store.set("refAuto", S.refAuto);
+    S.refOffset = S.refAuto ? 0 : S.refDb; store.set("refOffset", S.refOffset);
+    $("ref-auto").classList.toggle("on", S.refAuto); renderState();
+  };
+  $("pal").onclick = () => { S.palette = (S.palette + 1) % PALETTES.length; store.set("pal", S.palette); buildLut(); };
+  new ResizeObserver(resizeScope).observe(wrap);
+}
+
+// ============================================================ audio
+let actx = null, rxNode = null, micNode = null, micStream = null, gain = null;
+const WORKLET = `
+class RxPlayer extends AudioWorkletProcessor {
+  constructor() {
+    super(); this.q = new Float32Array(48000); this.r = 0; this.w = 0; this.n = 0; this.pos = 0; this.started = false;
+    this.port.onmessage = (e) => { const a = e.data; for (let i = 0; i < a.length; i++) {
+      if (this.n >= this.q.length) { this.r = (this.r + 1) % this.q.length; this.n--; }
+      this.q[this.w] = a[i]; this.w = (this.w + 1) % this.q.length; this.n++; } };
+  }
+  process(_i, outputs) {
+    const out = outputs[0][0]; const step = 12000 / sampleRate;
+    // Jitter buffer: start at 120 ms, drop to 150 ms if it grows past 400 ms.
+    if (!this.started) { if (this.n < 1440) { out.fill(0); return true; } this.started = true; }
+    if (this.n > 4800) { const drop = this.n - 1800; this.r = (this.r + drop) % this.q.length; this.n -= drop; }
+    for (let i = 0; i < out.length; i++) {
+      if (this.n < 2) { out[i] = 0; this.started = false; continue; }
+      const a = this.q[this.r], b = this.q[(this.r + 1) % this.q.length];
+      out[i] = a + (b - a) * this.pos;
+      this.pos += step;
+      while (this.pos >= 1) { this.pos -= 1; this.r = (this.r + 1) % this.q.length; this.n--; }
+    }
+    return true;
+  }
+}
+class MicCapture extends AudioWorkletProcessor {
+  constructor() { super(); this.acc = []; this.pos = 0; }
+  process(inputs) {
+    const inp = inputs[0][0]; if (!inp) return true;
+    const step = sampleRate / 12000;
+    for (let i = 0; i < inp.length; i++) {
+      this.pos += 1;
+      if (this.pos >= step) { this.pos -= step; this.acc.push(inp[i]); }
+    }
+    if (this.acc.length >= 240) { this.port.postMessage(Float32Array.from(this.acc)); this.acc = []; }
+    return true;
+  }
+}
+registerProcessor("rx-player", RxPlayer);
+registerProcessor("mic-capture", MicCapture);`;
+// mu-law (G.711), as in web.rs
+const MU = new Float32Array(256);
+for (let u = 0; u < 256; u++) {
+  const v = ~u & 0xff, sign = v & 0x80, exp = (v >> 4) & 7, mant = v & 15;
+  const mag = (((mant << 3) + 0x84) << exp) - 0x84;
+  MU[u] = (sign ? -mag : mag) / 32768;
+}
+function muEncode(x) {
+  let s = Math.round(clamp(x, -1, 1) * 32635), sign = 0;
+  if (s < 0) { s = -s; sign = 0x80; }
+  s += 0x84;
+  let exp = 7; for (let m = 0x4000; (s & m) === 0 && exp > 0; m >>= 1) exp--;
+  const mant = (s >> (exp + 3)) & 15;
+  return ~(sign | (exp << 4) | mant) & 0xff;
+}
+async function audioStart() {
+  if (actx) { await actx.resume(); $("audio").classList.add("on"); return; }
+  actx = new AudioContext({ latencyHint: "interactive" });
+  const url = URL.createObjectURL(new Blob([WORKLET], { type: "text/javascript" }));
+  await actx.audioWorklet.addModule(url);
+  rxNode = new AudioWorkletNode(actx, "rx-player", { outputChannelCount: [1] });
+  gain = actx.createGain(); gain.gain.value = S.muted ? 0 : S.vol;
+  rxNode.connect(gain).connect(actx.destination);
+  $("audio").classList.add("on");
+}
+// AUDIO switches this browser's receive audio on and off (MUTE only silences it).
+async function audioToggle() {
+  if (actx && actx.state === "running") { await actx.suspend(); $("audio").classList.remove("on"); return; }
+  await audioStart();
+}
+function audioIn(u8) {
+  if (!rxNode || actx.state !== "running") return;
+  const f = new Float32Array(u8.length);
+  for (let i = 0; i < u8.length; i++) f[i] = MU[u8[i]];
+  rxNode.port.postMessage(f, [f.buffer]);
+}
+async function micStart() {
+  await audioStart();
+  if (micNode) return true;
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true, channelCount: 1 } });
+  } catch (e) { alert("Microphone: " + e.message); return false; }
+  const src = actx.createMediaStreamSource(micStream);
+  micNode = new AudioWorkletNode(actx, "mic-capture");
+  micNode.port.onmessage = (e) => {
+    if (!S.st || !S.st.ptt || S.st.tx_source !== "web") return;
+    const a = e.data, b = new Uint8Array(a.length + 1); b[0] = 3;
+    for (let i = 0; i < a.length; i++) b[i + 1] = muEncode(a[i]);
+    if (ws && ws.readyState === 1) ws.send(b);
+  };
+  src.connect(micNode);
+  $("mic").classList.add("on");
+  return true;
+}
+
+// ============================================================ decodes
+const decodes = [];
+function addDecode(d) {
+  const key = d.mode.startsWith("Q65") ? "Q65" : d.mode.startsWith("PI4") ? "PI4" : d.mode;
+  d.key = key;
+  decodes.unshift(d); if (decodes.length > 300) decodes.pop();
+  renderDecodes();
+}
+function renderDecodes() {
+  const rows = decodes.slice(0, 120).map((d, i) => {
+    const t = new Date(d.utc * 1000).toISOString().slice(11, 19);
+    return `<tr data-i="${decodes.indexOf(d)}" class="${d.key}"><td>${t}</td><td class="${d.key}">${d.mode}</td>
+      <td>${Math.round(d.snr_db)}</td><td>${(d.freq_hz / 1e6).toFixed(4)}</td><td class="msg">${escapeHtml(d.message)}</td></tr>`;
+  });
+  $("dec-body").innerHTML = rows.length ? rows.join("")
+    : `<tr><td class="empty">Q65 / PI4 decodes appear here when switched on (CW is read in the box above).</td></tr>`;
+}
+// "144.3" MHz, "144300" kHz, "144300000" Hz, or an explicit k / M / Hz suffix.
+function parseFreq(t) {
+  const m = String(t).trim().replace(/,/g, ".").replace(/\s+/g, "").match(/^([0-9]*\.?[0-9]+)(hz|k|khz|m|mhz|g|ghz)?$/i);
+  if (!m) return null;
+  const v = parseFloat(m[1]), u = (m[2] || "").toLowerCase();
+  const mul = u === "hz" ? 1 : u[0] === "k" ? 1e3 : u[0] === "m" ? 1e6 : u[0] === "g" ? 1e9
+    : v < 1e4 ? 1e6 : v < 1e7 ? 1e3 : 1;
+  const hz = Math.round(v * mul);
+  return hz > 0 ? hz : null;
+}
+function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+// ============================================================ controls
+function buildStatic() {
+  buildLut();
+  $("m-scale").innerHTML = S_SCALE.map((x, i) => `<span class="${i > 4 ? "hi" : ""}">${x}</span>`).join("");
+  buildBands([]);
+  $("bands").onclick = (e) => {
+    const b = e.target.closest("[data-f]"); if (!b) return;
+    const last = store.get("band." + b.textContent, null);
+    tuneTo(last ? last.f : +b.dataset.f);
+    send({ cmd: "mode", mode: last ? last.mode : (b.dataset.m || "USB") });
+  };
+  // Remember where each band was left.
+  setInterval(() => {
+    const st = S.st; if (!st) return;
+    const f = curFreq();
+    const band = bandOf(f, st.xvtrs);
+    if (band) store.set("band." + band, { f, mode: st.mode });
+  }, 3000);
+  // A mode comes back with the FIL it was last used with (edited widths included).
+  $("modes").onclick = (e) => {
+    const b = e.target.closest("[data-mode]"); if (!b) return;
+    const m = b.dataset.mode; send({ cmd: "mode", mode: m });
+    if (!S.filIdx) S.filIdx = store.get("filidx", {});
+    const [lo, hi] = filPreset(m, S.filIdx[m] ?? 1); send({ cmd: "filter", lo, hi });
+  };
+  $("fils").onclick = (e) => {
+    const b = e.target.closest("[data-fil]"); if (!b || !S.st) return;
+    const i = +b.dataset.fil; S.filIdx[S.st.mode] = i; store.set("filidx", S.filIdx);
+    const [lo, hi] = filPreset(S.st.mode, i);
+    send({ cmd: "filter", lo, hi });
+  };
+  // WIDTH / SHIFT edit the selected FIL of this mode (kept per mode in the browser).
+  const filEdit = () => {
+    const st = S.st; if (!st) return;
+    const i = S.filIdx[st.mode] ?? 1, def = (FILTERS[st.mode] || FILTERS.USB)[i];
+    const w = +$("fwidth").value, c = (def[0] + def[1]) / 2 + (+$("fshift").value) * (def[0] < 0 ? -1 : 1);
+    const lo = Math.round(c - w / 2), hi = Math.round(c + w / 2);
+    const all = store.get("fil." + st.mode, null) || (FILTERS[st.mode] || FILTERS.USB).map((x) => x.slice());
+    all[i] = [lo, hi]; store.set("fil." + st.mode, all);
+    $("fwidth-v").textContent = fmtHz(w); $("fshift-v").textContent = $("fshift").value;
+    send({ cmd: "filter", lo, hi });
+  };
+  $("fwidth").oninput = filEdit; $("fshift").oninput = filEdit;
+  const toggle = (id, cmd, key) => { $(id).onclick = () => send({ cmd, on: !(S.st && S.st[key]) }); };
+  toggle("nb", "nb", "nb"); toggle("nr", "nr", "nr"); toggle("notch", "notch", "notch");
+  $("sql").oninput = () => {
+    const v = +$("sql").value;
+    $("sql-v").textContent = v ? (v - 140) + " dB" : "OFF";
+    send(v ? { cmd: "squelch", db: v - 140 } : { cmd: "squelch" });
+  };
+  $("lock").onclick = () => { S.locked = !S.locked; $("lock").classList.toggle("on", S.locked); $("t-lock").classList.toggle("hidden", !S.locked); };
+  // RIT / XIT share one offset, as on the IC-705.
+  const offs = (hz) => {
+    const st = S.st; if (!st) return;
+    hz = clamp(Math.round(hz), -9990, 9990);
+    send({ cmd: "rit", on: st.rit[0], hz }); send({ cmd: "xit", on: st.xit[0], hz });
+  };
+  $("rit").onclick = () => S.st && send({ cmd: "rit", on: !S.st.rit[0], hz: S.st.rit[1] || S.st.xit[1] });
+  $("xit").onclick = () => S.st && send({ cmd: "xit", on: !S.st.xit[0], hz: S.st.xit[1] || S.st.rit[1] });
+  $("ritclr").onclick = () => offs(0);
+  $("ritv").addEventListener("wheel", (e) => { e.preventDefault(); if (S.st) offs(S.st.rit[1] + (e.deltaY < 0 ? 10 : -10) * (e.shiftKey ? 10 : 1)); }, { passive: false });
+  let rdrag = null;
+  $("ritv").addEventListener("pointerdown", (e) => { rdrag = { y: e.clientY, hz: S.st ? S.st.rit[1] : 0 }; $("ritv").setPointerCapture(e.pointerId); });
+  $("ritv").addEventListener("pointermove", (e) => { if (rdrag) offs(rdrag.hz + Math.round((rdrag.y - e.clientY) / 4) * 10); });
+  $("ritv").addEventListener("pointerup", () => { rdrag = null; });
+  // Direct frequency entry in the band bar (double-click the display to get there).
+  const fEnter = () => {
+    const el = $("fentry"), hz = parseFreq(el.value);
+    const st = S.st;
+    if (hz === null || (st && (hz < st.freq_min || hz > st.freq_max))) { el.classList.add("bad"); return; }
+    el.classList.remove("bad"); el.value = ""; el.blur();
+    tuneTo(hz);
+  };
+  $("fentry").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") fEnter();
+    else if (e.key === "Escape") { $("fentry").value = ""; $("fentry").classList.remove("bad"); $("fentry").blur(); }
+  });
+  $("fentry").addEventListener("input", () => $("fentry").classList.remove("bad"));
+  $("fgo").onclick = fEnter;
+  $("freq").addEventListener("dblclick", () => { const el = $("fentry"); el.value = (curFreq() / 1e6).toFixed(6); el.focus(); el.select(); });
+  $("call-save").onclick = () => {
+    const c = $("set-call").value.trim().toUpperCase();
+    if (c && !/^(?=.*[0-9])(?=.*[A-Z])[A-Z0-9/]{3,12}$/.test(c)) { alert("A callsign: 3 to 12 of A-Z, 0-9 and /, e.g. SQ6EMM or SQ6EMM/P."); return; }
+    send({ cmd: "callsign", call: c });
+  };
+  $("micg").oninput = () => { $("micg-v").textContent = $("micg").value + "%"; send({ cmd: "mic_gain", value: +$("micg").value / 100 }); };
+  $("compl").oninput = () => { $("compl-v").textContent = $("compl").value + " dB"; if (S.st && S.st.comp !== null) send({ cmd: "comp", on: true, db: +$("compl").value }); };
+  $("comp").onclick = () => send({ cmd: "comp", on: !(S.st && S.st.comp !== null), db: +$("compl").value });
+  $("hang").oninput = () => { $("hang-v").textContent = $("hang").value + " ms"; send({ cmd: "cw_hang", ms: +$("hang").value }); };
+  $("mute-tx").onclick = () => send({ cmd: "mute_at_tx", on: !(S.st && S.st.mute_at_tx) });
+  $("scope-ctr").onclick = () => send({ cmd: "scope_center", on: !(S.st && S.st.scope_center) });
+  setupSettings();
+  $("agcs").onclick = (e) => { const b = e.target.closest("[data-agc]"); if (b) send({ cmd: "agc", mode: b.dataset.agc }); };
+  $("steps").onclick = (e) => { const b = e.target.closest("[data-step]"); if (b) setStep(+b.dataset.step); };
+  $("vfo-ab").onclick = () => send({ cmd: "vfo", sel: S.st && S.st.active === "A" ? "B" : "A" });
+  $("vfo-eq").onclick = () => send({ cmd: "a_to_b" });
+  $("split").onclick = () => send({ cmd: "split", on: !(S.st && S.st.split) });
+
+  const slider = (id, fn) => { const el = $(id); el.oninput = () => { $(id + "-v").textContent = el.value; fn(+el.value); }; };
+  slider("af", (v) => { S.vol = v / 100; store.set("vol", v); if (gain) gain.gain.value = S.muted ? 0 : S.vol; });
+  $("af").value = Math.round(S.vol * 100); $("af-v").textContent = $("af").value;
+  slider("rfg", (v) => send({ cmd: "rxgain", mode: "manual", db: v }));
+  slider("drv", (v) => send({ cmd: "drive", value: v }));
+  slider("att", (v) => send({ cmd: "txatt", value: v }));
+  slider("wpm", (v) => send({ cmd: "cw_wpm", value: v }));
+  // RF AUTO: the AD936x AGC, or the RF gain slider.
+  $("rfg-auto").onclick = () => send(S.st && S.st.rx_gain_mode !== "manual" ? { cmd: "rxgain", mode: "manual", db: +$("rfg").value } : { cmd: "rxgain", mode: "slow" });
+  $("audio").onclick = () => audioToggle();
+
+  // PTT: hold (mouse/touch/space) or Shift-click to latch.
+  const pttDown = async (latch) => {
+    if (!S.st || !S.st.allow_tx) return;
+    if (S.pttLatched) { pttUp(true); return; }
+    if (S.st.mode !== "CW" && !(await micStart())) return;
+    S.pttLatched = latch;
+    send({ cmd: "ptt", on: true });
+  };
+  const pttUp = (force) => { if (S.pttLatched && !force) return; S.pttLatched = false; send({ cmd: "ptt", on: false }); };
+  $("ptt").addEventListener("pointerdown", (e) => { e.preventDefault(); pttDown(e.shiftKey); });
+  $("ptt").addEventListener("pointerup", () => pttUp(false));
+  $("ptt").addEventListener("pointerleave", () => { if (!S.pttLatched && S.st && S.st.ptt) pttUp(false); });
+  $("tune").onclick = () => send({ cmd: "tune", on: !(S.st && S.st.tune) });
+  $("mic").onclick = () => micStart();
+  window.addEventListener("keydown", (e) => {
+    if (e.target.tagName === "INPUT") return;
+    if (e.code === "Space" && !e.repeat) { e.preventDefault(); pttDown(false); }
+    else if (e.code === "ArrowRight" || e.code === "ArrowUp") { e.preventDefault(); tuneBy(1); }
+    else if (e.code === "ArrowLeft" || e.code === "ArrowDown") { e.preventDefault(); tuneBy(-1); }
+  });
+  window.addEventListener("keyup", (e) => { if (e.code === "Space" && e.target.tagName !== "INPUT") { e.preventDefault(); pttUp(false); } });
+  window.addEventListener("blur", () => { if (S.st && S.st.ptt && !S.pttLatched) pttUp(false); });
+
+  const sendCw = () => { const t = $("cwtext").value.trim(); if (t) { send({ cmd: "cw", text: t.toUpperCase() }); $("cwtext").value = ""; } };
+  $("cwsend").onclick = sendCw;
+  $("cwtext").addEventListener("keydown", (e) => { if (e.key === "Enter") sendCw(); });
+  $("cwstop").onclick = () => send({ cmd: "cw_stop" });
+  $("cw-clear").onclick = () => send({ cmd: "cw_clear" });
+  const call = () => (S.st && S.st.call) || "";
+  const MACROS = [["CQ", () => `CQ CQ DE ${call()} ${call()} K`], ["QRZ", () => "QRZ?"], ["TU", () => `TU 73 DE ${call()} SK`],
+    ["599", () => "5NN 5NN"], ["AGN", () => "AGN?"]];
+  $("macros").innerHTML = MACROS.map(([n], i) => `<button class="k" data-i="${i}">${n}</button>`).join("");
+  $("macros").onclick = (e) => { const b = e.target.closest("[data-i]"); if (b) send({ cmd: "cw", text: MACROS[+b.dataset.i][1]() }); };
+
+  $("decoders").onclick = (e) => {
+    if (e.target.id === "dec-clear") { decodes.length = 0; renderDecodes(); return; }
+    const b = e.target.closest("[data-dec]"); if (!b || !S.st) return;
+    send({ cmd: "decoder", kind: b.dataset.dec, on: !(S.st.decoders || []).includes(b.dataset.dec) });
+  };
+  $("dec-body").onclick = (e) => {
+    const tr = e.target.closest("tr"); if (!tr) return;
+    const d = decodes[+tr.dataset.i]; if (!d) return;
+    if (d.key === "CW") { send({ cmd: "mode", mode: "CW" }); tuneTo(Math.round(d.freq_hz - 700)); }
+    else { tuneTo(Math.round(d.freq_hz - d.audio_hz)); }
+  };
+  renderDecodes();
+  setupFreqTuning();
+  setupScope();
+  setStep(S.step);
+  RC28.init();
+}
+
+// ============================================================ Icom RC-28 (WebHID)
+// Protocol (read off a real unit; see sdroxide crates/sdroxide-rc28/src/proto.rs):
+// 32-byte reports, no report id. In:  01 cc 00 dd 00 kk  -> cc knob counts,
+// dd 1 = clockwise / 2 = anticlockwise, kk buttons active low (bit0 TRANSMIT,
+// bit1 F-1, bit2 F-2). Out: 01 ll -> LEDs active low (bit3 LINK).
+const RC28 = (() => {
+  const VID = 0x0c26, PID = 0x001e, FILTERS = [{ vendorId: VID, productId: PID }];
+  const supported = window.isSecureContext && "hid" in navigator;
+  const COUNTS_PER_DETENT = 10;               // ~670 counts a turn -> ~67 detents
+  // F-1 / F-2 are a radio-button pair: VFO A / VFO B, the active one lit.
+  const selectVfo = (v) => { if (S.st && S.st.active !== v) send({ cmd: "vfo", sel: v }); };
+  const active = () => (S.st ? S.st.active : "");
+  let dev = null, keys = 0, carry = 0, lastTurn = 0, leds = -1, txDownAt = 0, txLatched = false;
+
+  function status(t) { $("rc28status").textContent = t; }
+  function chip() {
+    const b = $("rc28");
+    b.classList.toggle("on", !!dev);
+    b.disabled = !supported;
+    if (!supported) b.title = "RC-28 needs WebHID: Chrome, Edge or Opera, over HTTPS";
+  }
+  async function open(d) {
+    try {
+      if (!d.opened) await d.open();
+      d.addEventListener("inputreport", onReport);
+      dev = d; keys = 0; carry = 0; leds = -1;
+      status("Connected: " + (d.productName || "Icom RC-28"));
+      write([0x02]);                          // ask for the firmware version
+      updateLeds();
+    } catch (e) { status("Cannot open the RC-28: " + (e.message || e)); }
+    chip();
+  }
+  async function close() {
+    const d = dev; dev = null;
+    if (d) { try { write([0x01, 0x0f]); d.removeEventListener("inputreport", onReport); await d.close(); } catch { /* gone */ } }
+    releaseTx(); status("Not connected."); chip();
+  }
+  let writing = Promise.resolve();
+  function write(bytes) {
+    const d = dev; if (!d) return;
+    const r = new Uint8Array(32); r.set(bytes);
+    writing = writing.then(() => d.sendReport(0, r)).catch(() => {});
+  }
+  function updateLeds() {
+    if (!dev) return;
+    let lit = 0;
+    // No link to the radio: every LED off (the last state is stale).
+    if (ws && ws.readyState === 1) {
+      lit |= 0x08;                                                    // LINK
+      if (S.st && S.st.ptt) lit |= 0x01;                              // TRANSMIT
+      if (active() === "A") lit |= 0x02;                              // F-1
+      if (active() === "B") lit |= 0x04;                              // F-2
+    }
+    if (lit !== leds) { leds = lit; write([0x01, ~lit & 0x0f]); }
+  }
+  function releaseTx() {
+    if (txLatched || (S.st && S.st.ptt && S.st.tx_source === "web")) send({ cmd: "ptt", on: false });
+    txLatched = false;
+  }
+  function onReport(e) {
+    const b = new Uint8Array(e.data.buffer, e.data.byteOffset, e.data.byteLength);
+    if (b[0] === 0x02) {
+      const t = new TextDecoder().decode(b.subarray(1)).replace(/\0.*$/s, "").trim();
+      status(`Connected: ${(dev && dev.productName) || "Icom RC-28"}, firmware ${t}`);
+      return;
+    }
+    if (b[0] !== 0x01 || b.length < 6) return;
+    // Knob: counts into detents (a wiggle back spends the carry first), then
+    // acceleration by speed so a fast spin crosses a band.
+    const n = b[1], dir = b[3];
+    const counts = dir === 1 ? n : dir === 2 ? -n : 0;
+    if (counts) {
+      carry += counts;
+      const det = Math.trunc(carry / COUNTS_PER_DETENT);
+      carry -= det * COUNTS_PER_DETENT;
+      if (det) {
+        const now = performance.now(), dt = now - lastTurn; lastTurn = now;
+        const speed = Math.abs(det) / Math.max(dt, 5) * 1000;            // detents/s
+        const accel = speed > 120 ? 10 : speed > 50 ? 4 : speed > 25 ? 2 : 1;
+        tuneBy(det * accel);
+      }
+    }
+    // Buttons: level-triggered, active low; act on edges.
+    const now = ~b[5] & 0x07, changed = now ^ keys; keys = now;
+    if (changed & 0x01) {
+      if (now & 0x01) {                                                  // TRANSMIT down
+        txDownAt = performance.now();
+        if (txLatched) { releaseTx(); txDownAt = 0; }
+        else $("ptt").dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      } else if (txDownAt) {                                             // TRANSMIT up
+        if (performance.now() - txDownAt < 350) txLatched = true;       // tap: stay on air
+        else $("ptt").dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+        txDownAt = 0;
+      }
+    }
+    if (changed & 0x02 && now & 0x02) selectVfo("A");
+    if (changed & 0x04 && now & 0x04) selectVfo("B");
+    updateLeds();
+  }
+  function init() {
+    chip();
+    $("rc28").onclick = () => $("rc28menu").classList.toggle("hidden");
+    $("rc28pick").onclick = async () => {
+      if (!supported) return;
+      try { const [d] = await navigator.hid.requestDevice({ filters: FILTERS }); if (d) { await close(); await open(d); store.set("rc28.on", true); } }
+      catch (e) { status(e.message || String(e)); }
+    };
+    $("rc28off").onclick = () => { store.set("rc28.on", false); close(); };
+    if (!supported) { status("This browser has no WebHID (use Chrome, Edge or Opera over HTTPS)."); return; }
+    navigator.hid.addEventListener("connect", (e) => { if (!dev && store.get("rc28.on", false) && e.device.vendorId === VID && e.device.productId === PID) open(e.device); });
+    navigator.hid.addEventListener("disconnect", (e) => { if (e.device === dev) { dev = null; releaseTx(); status("Disconnected."); chip(); } });
+    // A device granted on an earlier visit comes back without a prompt.
+    if (store.get("rc28.on", false)) navigator.hid.getDevices().then((ds) => { const d = ds.find((x) => x.vendorId === VID && x.productId === PID); if (d) open(d); });
+    setInterval(updateLeds, 250);
+    // Page closed or reloaded: leave the RC-28 dark, not showing a dead link.
+    window.addEventListener("pagehide", () => { if (dev) { const r = new Uint8Array(32); r.set([0x01, 0x0f]); dev.sendReport(0, r).catch(() => {}); } });
+  }
+  return { init, onReport, get connected() { return !!dev; } };
+})();
+window.__rc28 = RC28; // for tests
+
+boot();
+})();
+</script>
+</body>
+</html>

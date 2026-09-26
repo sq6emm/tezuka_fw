@@ -259,6 +259,18 @@ do
 
 	md5sum -c /opt/config.md5 || process_ini $conf
 
+	# trxd.toml edited on the drive: validate, keep, restart the daemon.
+	if [ -s /mnt/msd/trxd.toml ] && ! md5sum -c /opt/trxd.md5 >/dev/null 2>&1; then
+		if /usr/bin/trxd --config /mnt/msd/trxd.toml --check > /dev/null 2> /tmp/trxd-check.txt; then
+			cp /mnt/msd/trxd.toml /mnt/jffs2/trxd.toml
+			echo "trxd.toml accepted $(date)" > /mnt/msd/trxd-status.txt
+			/etc/init.d/S80trxd restart >/dev/null 2>&1
+		else
+			{ echo "trxd.toml REJECTED, previous config kept:"; cat /tmp/trxd-check.txt; } > /mnt/msd/trxd-status.txt
+		fi
+		md5sum /mnt/msd/trxd.toml > /opt/trxd.md5
+	fi
+
 	if [ "$TARGET" == "m2k" ]; then
 		if [[ -s /mnt/msd/${CALIBFILENAME} ]]; then
 			md5sum -c /opt/${CALIBFILENAME}.md5

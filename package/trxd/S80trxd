@@ -1,0 +1,48 @@
+#!/bin/sh
+#
+# trxd: transceiver / beacon daemon.
+# Config: /mnt/jffs2/trxd.toml if present (edit trxd.toml on the USB drive
+# and eject: update.sh validates it and stores it there), else the firmware
+# default /etc/trxd.toml.
+
+DAEMON=/usr/bin/trxd
+PIDFILE=/var/run/trxd.pid
+LOG=/var/log/trxd.log
+
+pick_config() {
+	# /mnt/jffs2/trxd.toml is written by update.sh when a trxd.toml edited on
+	# the USB drive passes --check.
+	if [ -f /mnt/jffs2/trxd.toml ]; then
+		echo /mnt/jffs2/trxd.toml
+	else
+		echo /etc/trxd.toml
+	fi
+}
+
+start() {
+	CONF=$(pick_config)
+	printf 'Starting trxd (%s): ' "$CONF"
+	if ! $DAEMON --config "$CONF" --check >/dev/null 2>"$LOG"; then
+		echo "config error, see $LOG"
+		return 1
+	fi
+	# Keep restarting on a crash, but not in a tight loop.
+	start-stop-daemon -S -b -m -p "$PIDFILE" -x /bin/sh -- -c \
+		"while :; do RUST_LOG=\${RUST_LOG:-info} $DAEMON --config '$CONF' >>$LOG 2>&1; sleep 5; done"
+	echo "OK"
+}
+
+stop() {
+	printf 'Stopping trxd: '
+	start-stop-daemon -K -q -p "$PIDFILE"
+	killall trxd 2>/dev/null
+	rm -f "$PIDFILE"
+	echo "OK"
+}
+
+case "$1" in
+	start) start ;;
+	stop) stop ;;
+	restart|reload) stop; sleep 1; start ;;
+	*) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac

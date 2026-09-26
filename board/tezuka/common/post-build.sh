@@ -12,8 +12,6 @@ fi
 
 cp "${BOARD_DIR}/LICENSE.template" "${BINARIES_DIR}/msd/LICENSE.html"
 cp -r "${BOARD_DIR}/msd/"* "${BINARIES_DIR}/msd/"
-python3 "${BOARD_DIR}/../../../Dashboard/bundle.py" "${BINARIES_DIR}/msd/dash/index.html"
-rm -rf "${BINARIES_DIR}/msd/dash/assets"
 LINUX_VERS=$(grep '^BR2_LINUX_KERNEL_VERSION' "${BR2_CONFIG}" | cut -d\" -f 2)
 UBOOT_VERS=$(grep '^BR2_TARGET_UBOOT_VERSION' "${BR2_CONFIG}" | cut -d\" -f 2)
 FW_VERSION=$(cd "${BOARD_DIR}" && git describe --abbrev=4 --always --tags)
@@ -33,10 +31,10 @@ try:
     print(r[0] if r else '')
 except: pass
 " 2>/dev/null)
-FPGA_VERS=$(cat "${BOARD_DIR}/../${_board}/bitstream/maia-iio/bit.txt" 2>/dev/null || echo "")
+FPGA_VERS=$(cd "${BOARD_DIR}/../${_board}/bitstream" 2>/dev/null && git log -1 --format=%h -- simple.xsa 2>/dev/null || echo "")
 
 {
-	echo "device-fw tezuka-${FW_VERSION}"
+	echo "device-fw tezuka-simple-${FW_VERSION}"
 	echo "uboot ${UBOOT_VERS}"
 	echo "buildroot ${BR_VERSION}"
 	[ -n "${FPGA_VERS}" ] && echo "fpga ${FPGA_VERS}" || true
@@ -76,21 +74,41 @@ mkdir -p "${TARGET_DIR}/etc/dropbear"
 mkdir -p "${TARGET_DIR}/var/spool/cron/crontabs"
 
 ${INSTALL} -D -m 0644 "${BOARD_DIR}/msd/img/"* "${TARGET_DIR}/root/img/"
-# Static landing page — patched with #MODEL#/#SERIAL#/#IP#/etc by S40network
-# and S45msd at boot, then copied onto the USB mass-storage image as
-# info.html. Kept as a *static* page deliberately: unlike the live "/" page
-# below (reached over the network, where a real hostname exists), info.html
-# is opened offline from a mounted USB drive with no path back to this
-# device's MQTT broker — the live Dashboard's auto-connect would just throw
-# on an empty-host WebSocket URL and render nothing.
+# Static landing page, patched with #MODEL#/#SERIAL#/#IP# by S40network and
+# S45msd at boot and copied onto the USB mass-storage image as info.html.
 ${INSTALL} -D -m 0644 "${BOARD_DIR}/msd/index.html" "${TARGET_DIR}/root/info.html"
-# Dashboard is now the served root page ("/"), replacing the old static
-# landing page that used to link out to it from dash/index.html.
-python3 "${BOARD_DIR}/../../../Dashboard/bundle.py" "${TARGET_DIR}/root/index.html"
 
-ln -sf ../../wpa_supplicant/ifupdown.sh "${TARGET_DIR}/etc/network/if-up.d/wpasupplicant"
-ln -sf ../../wpa_supplicant/ifupdown.sh "${TARGET_DIR}/etc/network/if-down.d/wpasupplicant"
-ln -sf ../../wpa_supplicant/ifupdown.sh "${TARGET_DIR}/etc/network/if-pre-up.d/wpasupplicant"
-ln -sf ../../wpa_supplicant/ifupdown.sh "${TARGET_DIR}/etc/network/if-post-down.d/wpasupplicant"
+# trxd documentation, and a copy of the config template on the USB drive so
+# it can be edited from a PC before first boot.
+${INSTALL} -D -m 0644 "${BOARD_DIR}/../../../docs/REFERENCE.md" "${TARGET_DIR}/usr/share/doc/trxd/REFERENCE.md"
+${INSTALL} -D -m 0644 "${BOARD_DIR}/../../../docs/PLAN.md" "${TARGET_DIR}/usr/share/doc/trxd/PLAN.md"
+
+# Size trim for the 12 MB QSPI slots (docs/FLASH.md): things packages install
+# that nothing on this firmware uses (no GPS: time comes from NTP).
+rm -rf "${TARGET_DIR}/etc/wpa_supplicant"
+for f in gpsmon gpsdecode gpsctl cgps gpsrinex lcdgps gpxlogger ntpshmmon gpssnmp \
+         gps2udp gpspipe ppscheck gpscsv gpssubframe gpsplot ubxtool zerk gpsprof gpscat \
+         gpsfake gegps xgps xgpsspeed; do
+	rm -f "${TARGET_DIR}/usr/bin/$f"
+done
+rm -f "${TARGET_DIR}"/usr/lib/libgfortran.so* "${TARGET_DIR}"/usr/lib/libgomp.so* \
+      "${TARGET_DIR}"/usr/lib/libatomic.so* "${TARGET_DIR}"/usr/lib/libgpiodcxx.so* \
+      "${TARGET_DIR}"/usr/lib/libstdc++.so* \
+      "${TARGET_DIR}"/usr/lib/libmosquittopp.so*
+rm -f "${TARGET_DIR}/sbin/tc" "${TARGET_DIR}/sbin/ss" "${TARGET_DIR}/sbin/bridge" \
+      "${TARGET_DIR}/sbin/dcb" "${TARGET_DIR}/sbin/devlink" "${TARGET_DIR}/sbin/rdma" \
+      "${TARGET_DIR}/sbin/tipc" "${TARGET_DIR}/sbin/vdpa"
+rm -rf "${TARGET_DIR}/usr/share/gpsd" "${TARGET_DIR}/usr/share/man" "${TARGET_DIR}/usr/share/doc/gpsd"
+# Anything still linked against a library removed above breaks the build here
+# rather than on the board.
+READELF="${HOST_DIR}/bin/arm-linux-readelf"
+if [ -x "$READELF" ]; then
+	bad=$(find "${TARGET_DIR}" -type f \( -perm -u+x -o -name '*.so*' \) -exec sh -c \
+		'"$0" -d "$1" 2>/dev/null | grep -q -E "NEEDED.*(libstdc\+\+|libgfortran|libgomp|libatomic|libgpiodcxx|libmosquittopp)" && echo "$1"' "$READELF" {} \;)
+	if [ -n "$bad" ]; then
+		echo "ERROR: still linked against a removed library:" $bad >&2
+		exit 1
+	fi
+fi
 
 ln -sf device_reboot "${TARGET_DIR}/usr/sbin/pluto_reboot"

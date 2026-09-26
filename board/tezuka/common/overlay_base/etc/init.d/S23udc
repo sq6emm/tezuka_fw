@@ -153,8 +153,8 @@ if [ "$AUDIO_MODE" = "on" ]
 	ln -s $GADGET/functions/$USB_NET_FUNCTION $GADGET/configs/c.1
 	ln -s $GADGET/functions/mass_storage.0 $GADGET/configs/c.1
 	ln -s $GADGET/functions/acm.usb0 $GADGET/configs/c.1
-	if grep -q dma_test_skip /proc/cmdline; then
-		echo "Skipping ffs.iio_ffs gadget function (dma_test_skip on cmdline, no iiod to bind it)"
+	if grep -q dma_test_skip /proc/cmdline || [ ! -x /usr/sbin/iiod ]; then
+		echo "Skipping ffs.iio_ffs gadget function (no iiod to bind it)"
 	else
 		ln -s $GADGET/functions/ffs.iio_ffs $GADGET/configs/c.1/ffs.iio_ffs
 	fi
@@ -168,8 +168,8 @@ if [ "$AUDIO_MODE" = "on" ]
 	
 	mkdir -p /dev/iio_ffs
 	mount iio_ffs -t functionfs /dev/iio_ffs 2> /dev/null
-	if grep -q dma_test_skip /proc/cmdline; then
-		echo "Skipping iiod start (dma_test_skip on cmdline)"
+	if grep -q dma_test_skip /proc/cmdline || [ ! -x /usr/sbin/iiod ]; then
+		echo "Skipping iiod start (not installed, or dma_test_skip on cmdline)"
 	elif [ "$NB_CORE" = "2" ]
 	then
 		# shellcheck disable=SC2086

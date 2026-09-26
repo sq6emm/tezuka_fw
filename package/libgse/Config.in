@@ -1,7 +1,0 @@
-config BR2_PACKAGE_LIBGSE
-	bool "libgse"
-	select BR2_PACKAGE_LIBPCAP
-	help
-	  LibGSE.
-
-	  https://github.com/CNES/libgse

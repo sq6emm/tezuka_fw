@@ -61,6 +61,14 @@ case "$1" in
 		cp $CONF /mnt/msd
 		md5sum /mnt/msd/config.txt > /opt/config.md5
 
+		# trxd's config, editable from a PC; picked up on eject by update.sh.
+		if [ -f /mnt/jffs2/trxd.toml ]; then
+			cp /mnt/jffs2/trxd.toml /mnt/msd/trxd.toml
+		elif [ -f /etc/trxd.toml ]; then
+			cp /etc/trxd.toml /mnt/msd/trxd.toml
+		fi
+		[ -f /mnt/msd/trxd.toml ] && md5sum /mnt/msd/trxd.toml > /opt/trxd.md5
+
 		cp -a /root/info.html /root/img /mnt/msd/
 		umount /mnt/msd
 		echo $img > $file

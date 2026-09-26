@@ -44,34 +44,18 @@
 		view-port = <0x0170>;
 		drv-vbus;
 	};
-	
+
+	/* Maia spectrometer ring: 8 x 4096 x u64, written by the FPGA's DMA
+	 * (web UI wide scope, trxd reads it through /dev/mem). */
 	reserved-memory {
-                #address-cells = <1>;
-                #size-cells = <1>;
-                ranges;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
 
-                maia_sdr_spectrometer: maia_sdr_spectrometer@16000000 {
-                        no-map;
-                        reg = <0x16000000 0x40000>;
-                        label = "maia_sdr_spectrometer";
-                };
-
-                maia_sdr_recording: maia_sdr_recording@6000000 {
-                        no-map;
-                        reg = <0x6000000 0x10000000>;
-                        label = "maia_sdr_recording";
-                };
-        };
-
-	maia-sdr-recording {
-		compatible = "maia-sdr,recording";
-		memory-region = <&maia_sdr_recording>;
-	};
-
-	maia-sdr-spectrometer {
-		compatible = "maia-sdr,rxbuffer";
-		memory-region = <&maia_sdr_spectrometer>;
-		buffer-size = <0x8000>;
+		maia_sdr_spectrometer: maia_sdr_spectrometer@16000000 {
+			no-map;
+			reg = <0x16000000 0x40000>;
+		};
 	};
 };
 
@@ -146,9 +130,17 @@
 			label = "qspi-nvmfs";
 			reg = <0x120000 0xE0000>; /* 1M */
 		};
-		partition@qspi-linux {
-			label = "qspi-linux";
-			reg = <0x200000 0x1E00000>; /* 30M */
+		partition@qspi-linux-a {
+			label = "linux-a";
+			reg = <0x200000 0xC40000>; /* 12.25M: firmware slot A (FIT) */
+		};
+		partition@qspi-linux-b {
+			label = "linux-b";
+			reg = <0xE40000 0xC40000>; /* 12.25M: firmware slot B (FIT) */
+		};
+		partition@qspi-model {
+			label = "model";
+			reg = <0x1A80000 0x580000>; /* 5.5M: DeepCW model, shared by both slots */
 		};
 	};
 };
@@ -214,7 +206,7 @@
 				};
 			};
 		};
-
+		
 		maia_sdr: maia-sdr@7c460000 {
 			compatible = "uio_pdrv_genirq";
 			linux,uio-name = "maia-sdr";
@@ -223,7 +215,7 @@
 			interrupt-parent = <&intc>;
 			interrupts = <0 55 IRQ_TYPE_LEVEL_HIGH>;
 		};
-		
+
 		cf_ad9364_adc_core_0: cf-ad9361-lpc@79020000 {
 			compatible = "adi,axi-ad9361-6.00.a";
 			reg = <0x79020000 0x6000>;

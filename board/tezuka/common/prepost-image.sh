@@ -7,17 +7,7 @@ BOARD_DIR="$2"
 
 # Buildroot's host-bootgen (xilinx_v2025.2) may be broken.
 # Test it, fall back to system bootgen if needed.
-BOOTGEN="$HOST_DIR/bin/bootgen"
-if ! "$BOOTGEN" -help >/dev/null 2>&1; then
-    if [ -x /usr/bin/bootgen ]; then
-        BOOTGEN=/usr/bin/bootgen
-        echo "WARNING: host-bootgen is broken, using /usr/bin/bootgen"
-    else
-        echo "ERROR: host-bootgen is broken and no system bootgen found."
-        echo "Install bootgen-xlnx: sudo apt-get install bootgen-xlnx"
-        exit 1
-    fi
-fi
+. "$(dirname "$0")/find-bootgen.sh"
 # ── Shared: kernel, bitstream, U-Boot env ────────────────────────────────────
 # These artifacts are consumed by both the flash (.frm/.dfu) and SD paths.
 
@@ -36,7 +26,9 @@ dd if="$BIN_DIR/zImage" bs=1 skip="$skip" | gunzip > "$BIN_DIR/Image" 2>/dev/nul
 KERNEL_CORRUPT_OFFSET=$((0xE88000))   # 15237120 bytes / ~14.53 MiB
 KERNEL_WARN_MARGIN=$((512 * 1024))    # heads-up 512 KiB before the cliff
 IMAGE_SIZE=$(wc -c < "$BIN_DIR/Image")
-if [ "$IMAGE_SIZE" -ge "$KERNEL_CORRUPT_OFFSET" ]; then
+if grep -q 'Image.lzma' "$BOARD_DIR/plutomaia.its" 2>/dev/null; then
+    : # the flash FIT ships Image.lzma, decompressed by U-Boot: not affected
+elif [ "$IMAGE_SIZE" -ge "$KERNEL_CORRUPT_OFFSET" ]; then
     echo "ERROR: kernel Image is $IMAGE_SIZE bytes, at or past the known" >&2
     echo "       zImage self-decompression corruption offset 0xE88000" >&2
     echo "       (~14.53 MiB, see issue #450). Any board booting this" >&2
@@ -63,8 +55,12 @@ cp "$BIN_DIR/u-boot" "$BIN_DIR/u-boot.elf"
 FW_VERSION=$(cd "$COMMON_DIR" && git describe --abbrev=4 --always --tags)
 FIT_SIZE="${4:-$(grep "^fit_size=" "$BOARD_DIR/uboot-env.txt" 2>/dev/null | cut -d= -f2)}"
 : "${FIT_SIZE:=0x1E00000}"
+# U-Boot console UART: uboot-env.txt names the Pluto's UART1; a board whose
+# console is elsewhere (LibreSDR: UART0) names its own in $BOARD_DIR/uboot-serial.
+UBOOT_SERIAL=$(cat "$BOARD_DIR/uboot-serial" 2>/dev/null || echo serial@e0001000)
 sed -e "s/#BUILD#/${FW_VERSION}/g" \
     -e "s/^fit_size=.*/fit_size=${FIT_SIZE}/" \
+    -e "s/serial@e0001000/${UBOOT_SERIAL}/g" \
     "$COMMON_DIR/uboot-env.txt" > "$BIN_DIR/uboot-env.txt"
 "$HOST_DIR/bin/mkenvimage" -s 0x20000 -o "$BIN_DIR/uboot-env.bin" "$BIN_DIR/uboot-env.txt"
 

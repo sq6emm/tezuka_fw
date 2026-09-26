@@ -136,7 +136,7 @@ fit_config=config@0
 fit_load_address=0x2080000
 fit_size=0x1E00000
 fpgaload=fatload usb 0 0xF000000 ${bitstream_image};fpga load 0 0xF000000 ${filesize}
-fpgaload_mmc=fatload mmc 0 0xF000000 ${bitstream_image};fpga load 0 0xF000000 ${filesize}
+fpgaload_mmc=fatload mmc 0 0xF000000 ${slotdir}${bitstream_image};fpga load 0 0xF000000 ${filesize}
 importbootenv=env import -t ${loadbootenv_addr} $filesize
 initrd_high=0x20000000
 ipaddr=192.168.2.1
@@ -170,10 +170,7 @@ preboot_main=\
       fi; \
     fi; \
   elif test "${modeboot}" = "qspiboot" ; then \
-    if env run qspiboot_bootenv; then \
-        env import -t ${loadbootenv_addr} 0x20000; \
-        run dfu_button; \
-    fi; \
+    run dfu_button; \
   elif test "${modeboot}" = "usbboot" ; then \
     if env run loadbootenv_usb; then \
         env run importbootenv; \
@@ -206,14 +203,27 @@ pl_init=\
 
 qspiboot_bootenv=sf probe && sf read ${extraenv_load_address} 0x100000 0x20000;
 qspiboot_extraenv=sf read ${extraenv_load_address} 0xFF000 0x1000;
+# QSPI A/B slots (docs/FLASH.md): linux-a at 0x200000, linux-b at 0xE40000,
+# 0xC40000 each; the DeepCW model lives in its own partition at 0x1A80000.
+# iminfo checks every image's hash in the slot before anything boots from it.
+qspi_slot_select=\
+  run ab_count; \
+  if test "${slot}" = "b"; then setenv slot_offset 0xE40000; else setenv slot_offset 0x200000; fi; \
+  echo "Booting QSPI slot ${slot} at ${slot_offset} (upgrade_available=${upgrade_available} bootcount=${bootcount})";
+
 qspiboot=\
   adi_hwref; \
-  echo Copying Linux from QSPI flash to RAM... && run read_sf && if run adi_loadvals; then \
+  run qspi_slot_select; \
+  echo Copying Linux from QSPI flash to RAM... \
+  && sf probe 0:0 50000000 0 && sf read ${fit_load_address} ${slot_offset} 0xC40000 && iminfo ${fit_load_address} \
+  && if run adi_loadvals; then \
     echo Loaded AD936x refclk frequency and model into devicetree; \
   fi; \
   run pl_init; \
-  setenv bootargs console=ttyPS0,115200 maxcpus=${maxcpus} rootfstype=ramfs root=/dev/ram0 rw earlyprintk clk_ignore_unused cpuidle.off=1 uio_pdrv_genirq.of_id=uio_pdrv_genirq UBOOT_MODEBOOT=$modeboot UBOOT_VERSION='\"'${uboot-version}'\"' \
-  && bootm ${fit_load_address}#${fit_config} || echo BOOT failed entering DFU mode && run dfu_sf
+  setenv bootargs console=ttyPS0,115200 maxcpus=${maxcpus} rootfstype=ramfs root=/dev/ram0 rw earlyprintk clk_ignore_unused cpuidle.off=1 panic=10 uio_pdrv_genirq.of_id=uio_pdrv_genirq UBOOT_MODEBOOT=$modeboot UBOOT_SLOT=${slot} UBOOT_VERSION='\"'${uboot-version}'\"' \
+  && bootm ${fit_load_address}#${fit_config}; \
+  if test "${upgrade_available}" = "1"; then echo "Slot ${slot} failed to boot: resetting to count it"; reset; fi; \
+  echo BOOT failed entering DFU mode && run dfu_sf
 
 ramboot_verbose=\
   adi_hwref; \
@@ -237,18 +247,46 @@ sdboot=\
     run sdboot_ram; \
   fi
 
+# A/B firmware slots on the SD card's FAT partition (/a, /b), for updates
+# over the network with no console or USB (see /usr/sbin/fw-update).
+#   slot                a | b         which slot boots (saved in QSPI env)
+#   upgrade_available   1 after fw-update, until S99fwconfirm clears it
+#   bootcount           boots of an unconfirmed slot; the 4th rolls back
+# Counted with plain test/setenv: this U-Boot has no setexpr. None of these
+# three may be defined in this file: uEnv.txt is re-imported on every boot.
+# A card with no slot directories boots from / as before.
+ab_count=\
+  if test -z "${slot}"; then setenv slot a; fi; \
+  if test "${upgrade_available}" = "1"; then \
+    if test "${bootcount}" = "3"; then \
+      echo "Slot ${slot} not confirmed after 3 boots: rolling back"; \
+      if test "${slot}" = "a"; then setenv slot b; else setenv slot a; fi; \
+      setenv upgrade_available 0; setenv bootcount 0; setenv rolled_back 1; \
+    elif test "${bootcount}" = "2"; then setenv bootcount 3; \
+    elif test "${bootcount}" = "1"; then setenv bootcount 2; \
+    else setenv bootcount 1; fi; \
+    env save; \
+  fi;
+
+slot_select=\
+  run ab_count; \
+  if test -e mmc 0 /${slot}/${kernel_image}; then setenv slotdir /${slot}/; else setenv slotdir /; fi; \
+  echo "Booting firmware slot ${slotdir} (upgrade_available=${upgrade_available} bootcount=${bootcount})";
+
 sdboot_ram=\
   if mmcinfo; then \
     run uenvboot; \
+    run slot_select; \
     echo Copying Linux from SD to RAM... \
-    && load mmc 0 ${fit_load_address} ${kernel_image} \
-    && load mmc 0 ${devicetree_load_address} ${devicetree_image} \
-    && load mmc 0 ${ramdisk_load_address} ${ramdisk_image} \
+    && load mmc 0 ${fit_load_address} ${slotdir}${kernel_image} \
+    && load mmc 0 ${devicetree_load_address} ${slotdir}${devicetree_image} \
+    && load mmc 0 ${ramdisk_load_address} ${slotdir}${ramdisk_image} \
     && run fpgaload_mmc \
     && run adi_loadvals; \
     run pl_init; \
-    setenv bootargs console=ttyPS0,115200 rootfstype=ramfs root=/dev/ram0 rw rootwait earlycon clk_ignore_unused cpuidle.off=1 uio_pdrv_genirq.of_id=uio_pdrv_genirq UBOOT_MODEBOOT=$modeboot UBOOT_VERSION='"\'${uboot-version}'\"' \
+    setenv bootargs console=ttyPS0,115200 rootfstype=ramfs root=/dev/ram0 rw rootwait earlycon panic=10 clk_ignore_unused cpuidle.off=1 uio_pdrv_genirq.of_id=uio_pdrv_genirq UBOOT_MODEBOOT=$modeboot UBOOT_SLOT=${slot} UBOOT_VERSION='"\'${uboot-version}'\"' \
     && bootm ${fit_load_address} ${ramdisk_load_address} ${devicetree_load_address}; \
+    echo "Slot ${slot} failed to load: rebooting to count it"; reset; \
   fi
 
 bootargs=console=ttyPS0,115200 root=/dev/mmcblk0p2 rw earlycon rootfstype=ext4 rootwait clk_ignore_unused cpuidle.off=1 uio_pdrv_genirq.of_id=uio_pdrv_genirq UBOOT_MODEBOOT=$modeboot UBOOT_VERSION='\"'${uboot-version}'\"'

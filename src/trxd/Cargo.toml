@@ -1,0 +1,74 @@
+[package]
+name = "trxd"
+version = "0.1.0"
+edition = "2024"
+# Links mfsk-core (GPL-3.0-or-later) and sdroxide's DeepCW port with its model
+# (AGPL-3.0-only); the binary carries AGPL. Anyone offered trxd's TCI/rigctld
+# service over a network must be offered its source.
+license = "AGPL-3.0-only"
+description = "Headless AD936x transceiver / MGM beacon daemon for tezuka_fw_simple"
+
+[dependencies]
+# sdroxide building blocks: DSP chain, TCI + rigctld servers, DeepCW.
+# Pinned to one upstream commit so a firmware build is reproducible.
+sdroxide-types = { git = "https://github.com/sq6emm/sdroxide", rev = "77c8ee3dd7246ccced43d46455a05bdbf8c2a2c2" }
+sdroxide-dsp = { git = "https://github.com/sq6emm/sdroxide", rev = "77c8ee3dd7246ccced43d46455a05bdbf8c2a2c2" }
+sdroxide-tci = { git = "https://github.com/sq6emm/sdroxide", rev = "77c8ee3dd7246ccced43d46455a05bdbf8c2a2c2" }
+sdroxide-rigctld = { git = "https://github.com/sq6emm/sdroxide", rev = "77c8ee3dd7246ccced43d46455a05bdbf8c2a2c2" }
+# The model lives in its own flash partition (see src/model.rs), not in the binary.
+sdroxide-deepcw = { git = "https://github.com/sq6emm/sdroxide", rev = "77c8ee3dd7246ccced43d46455a05bdbf8c2a2c2", default-features = false }
+
+mfsk-core = { version = "0.10.0", default-features = false, features = ["std", "q65", "fft-rustfft"] }
+rustfft = "6"
+num-complex = "0.4"
+
+crossbeam-channel = "0.5"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rumqttc = { version = "0.24", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
+lzma-rs = "0.3"
+sha2 = "0.10"
+# Web UI: HTTPS (rustls on ring: pure Rust + asm, no C toolchain surprises),
+# a self-signed certificate made on first boot, WebSocket framing.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+getrandom = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+# Tests decode CW, so they compile the model in.
+sdroxide-deepcw = { git = "https://github.com/sq6emm/sdroxide", rev = "77c8ee3dd7246ccced43d46455a05bdbf8c2a2c2", features = ["embedded-model"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+panic = "abort"
+strip = true
+
+# DSP is unusably slow unoptimised, even in tests.
+[profile.dev]
+opt-level = 2
+[profile.dev.package."*"]
+opt-level = 3
+
+# TEMPORARY: two sdroxide changes sit uncommitted in the worktree
+# ../../../sdroxide-vhf (branch vhf-cw-segments):
+#  * VHF/UHF/microwave CW and beacon segments (for the CW skimmer, which
+#    trxd no longer uses: its live CW box reads the tuned station);
+#  * sdroxide-deepcw's `embedded-model` feature + set_weights(), so the model
+#    can live in flash beside the firmware slots.
+# Every sdroxide crate trxd uses is patched, so only one copy of each is built.
+# Once the branch is pushed, drop this section and bump the rev above.
+[patch."https://github.com/sq6emm/sdroxide"]
+sdroxide-types = { path = "../../../sdroxide-vhf/crates/sdroxide-types" }
+sdroxide-dsp = { path = "../../../sdroxide-vhf/crates/sdroxide-dsp" }
+sdroxide-tci = { path = "../../../sdroxide-vhf/crates/sdroxide-tci" }
+sdroxide-rigctld = { path = "../../../sdroxide-vhf/crates/sdroxide-rigctld" }
+sdroxide-deepcw = { path = "../../../sdroxide-vhf/crates/sdroxide-deepcw" }

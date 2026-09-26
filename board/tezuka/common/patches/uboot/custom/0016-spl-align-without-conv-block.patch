@@ -1,0 +1,19 @@
+From: tezuka_fw_simple
+Subject: [PATCH] spl: pad SPL image with conv=sync only
+
+`conv=block` without `cbs=` is a no-op for GNU dd but an error for uutils dd
+(the coreutils Ubuntu ships since 25.10), which breaks the SPL build with
+"conv=block or conv=unblock specified without cbs=N". Padding to 4 bytes is
+what conv=sync bs=4 alone already does.
+
+--- a/scripts/Makefile.xpl	2026-09-24 18:06:59.080583935 +0200
++++ b/scripts/Makefile.xpl	2026-09-24 18:06:59.081237912 +0200
+@@ -256,7 +256,7 @@
+ endif
+ 
+ $(obj)/$(SPL_BIN)-align.bin: $(obj)/$(SPL_BIN).bin
+-	@dd if=$< of=$@ conv=block,sync bs=4 2>/dev/null;
++	@dd if=$< of=$@ conv=sync bs=4 2>/dev/null;
+ 
+ spl/boot.bin: $(obj)/$(SPL_BIN)-align.bin FORCE
+ 	$(call if_changed,mkimage)

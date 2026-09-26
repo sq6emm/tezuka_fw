@@ -1,0 +1,301 @@
+#!/bin/sh
+#
+# fw-update: install a firmware build into the inactive A/B slot and boot it,
+# with automatic rollback. Works over SSH alone. QSPI (flash) boot and SD boot.
+#
+#   fw-update <board.zip | build-dir | http(s)://.../board.zip>
+#   fw-update --status
+#   fw-update --confirm        mark the running slot good (S99fwconfirm does this)
+#   fw-update --rollback       boot the other slot again (no checks)
+#
+# Options: --no-reboot, --force (skip the board-model check),
+#          --bootloader (SD only: also replace BOOT.bin - not covered by rollback).
+#
+# QSPI layout (docs/FLASH.md): linux-a 0x200000 and linux-b 0xE40000, 12.25 MB
+# each, and `model` 0x1A80000 (the DeepCW model, shared). The running slot is
+# never touched: the new image goes into the other one, is read back and
+# compared, and only then does the U-Boot environment point at it
+# (upgrade_available=1). U-Boot counts boots; S99fwconfirm clears the flag
+# once the network and trxd are up; the fourth unconfirmed boot (a hang is
+# rebooted by the watchdog, a panic by panic=10) switches back by itself.
+#
+# First install on a board still running tezuka (one 30 MB "qspi-linux"
+# partition): slot A is written over the old image, which cannot be kept - it
+# fills the whole region. That one write is not protected by rollback; U-Boot
+# itself (and USB DFU / JTAG recovery) is never touched.
+
+set -e
+
+# FW_* overrides exist for testing on a PC only.
+BOOT=${FW_BOOT:-/boot}
+LOG=${FW_LOG:-/mnt/jffs2/fw-update.log}
+WORK=${FW_WORK:-/tmp/fw-update}
+CMDLINE=${FW_CMDLINE:-/proc/cmdline}
+MODEL_FILE=${FW_MODEL:-/proc/device-tree/model}
+PROC_MTD=${FW_PROC_MTD:-/proc/mtd}
+DEV=${FW_DEV:-/dev}
+
+SLOT_SIZE=$((0xC40000))
+MODEL_SIZE=$((0x580000))
+LEGACY_MODEL_OFFSET=$((0x1A80000 - 0x200000))   # model's offset inside tezuka's qspi-linux
+
+log() {
+	echo "$*"
+	echo "$(date '+%F %T') $*" >> "$LOG" 2>/dev/null || true
+}
+die() {
+	log "fw-update: ERROR: $*"
+	exit 1
+}
+
+running_slot() {
+	sed -n 's/.* UBOOT_SLOT=\([ab]\).*/\1/p; s/^UBOOT_SLOT=\([ab]\).*/\1/p' "$CMDLINE"
+}
+
+boot_medium() {
+	case "${FW_MEDIUM:-$(cat "$CMDLINE")}" in
+	*qspiboot*|qspi) echo qspi ;;
+	*) echo sd ;;
+	esac
+}
+
+env_get() {
+	fw_printenv -n "$1" 2>/dev/null || true
+}
+
+# fw_setenv -s takes "name value" lines: one atomic write of the environment.
+env_set() {
+	mkdir -p "$(dirname "$WORK")"
+	printf '%s\n' "$@" > "$WORK.env"
+	fw_setenv -s "$WORK.env" || die "fw_setenv failed"
+	rm -f "$WORK.env"
+}
+
+mount_boot() {
+	if ! mountpoint -q "$BOOT"; then
+		mkdir -p "$BOOT"
+		mount /dev/mmcblk0p1 "$BOOT" || die "cannot mount the SD card's FAT partition"
+	fi
+}
+
+# /dev/mtdN for a partition label, or nothing.
+mtd_dev() {
+	d=$(sed -n "s/^\(mtd[0-9]*\):.*\"$1\"\$/\1/p" "$PROC_MTD")
+	[ -z "$d" ] || echo "$DEV/$d"
+}
+
+# Erase size of an mtd device, in bytes.
+mtd_erasesize() {
+	n=$(basename "$1")
+	printf '%d' "0x$(sed -n "s/^$n: [0-9a-f]* \([0-9a-f]*\) .*/\1/p" "$PROC_MTD")"
+}
+
+# write_mtd DEVICE OFFSET FILE: erase, write, read back and compare.
+write_mtd() {
+	dev=$1 off=$2 file=$3
+	len=$(wc -c < "$file")
+	es=$(mtd_erasesize "$dev")
+	[ "$es" -gt 0 ] || die "cannot read the erase size of $dev"
+	elen=$(( (len + es - 1) / es * es ))
+	mtd_debug erase "$dev" "$off" "$elen" > /dev/null || die "erase of $dev failed"
+	mtd_debug write "$dev" "$off" "$len" "$file" > /dev/null || die "write to $dev failed"
+	mtd_debug read "$dev" "$off" "$len" "$WORK/readback" > /dev/null || die "read-back of $dev failed"
+	cmp -s "$file" "$WORK/readback" || die "flash read-back of $dev differs from $(basename "$file")"
+	rm -f "$WORK/readback"
+}
+
+status() {
+	cur=$(running_slot)
+	echo "boot medium:       $(boot_medium)"
+	echo "running slot:      ${cur:-none (pre-A/B firmware)}"
+	echo "next boot slot:    $(env_get slot)"
+	echo "upgrade_available: $(env_get upgrade_available)"
+	echo "bootcount:         $(env_get bootcount)"
+	[ "$(env_get rolled_back)" = "1" ] && echo "rolled_back:       1 (the last update failed and was reverted)"
+	if [ "$(boot_medium)" = qspi ]; then
+		for s in a b; do
+			echo "slot $s:            $(env_get "ver_$s") $(mtd_dev "linux-$s")"
+		done
+		[ -z "$(mtd_dev linux-a)" ] && echo "flash layout:      tezuka (one qspi-linux partition); the next update converts it"
+	else
+		mount_boot
+		for s in a b; do
+			if [ -f "$BOOT/$s/VERSION" ]; then echo "slot $s:            $(cat "$BOOT/$s/VERSION")"; else echo "slot $s:            (empty)"; fi
+		done
+	fi
+	return 0
+}
+
+REBOOT=1
+FORCE=0
+BOOTLOADER=0
+SRC=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--status) status; exit 0 ;;
+	--confirm)
+		# Only the slot being tried may confirm itself: an update installed
+		# with --no-reboot must not be confirmed by the slot still running.
+		cur=$(running_slot)
+		if [ "$(env_get upgrade_available)" = "1" ] && [ "$cur" != "$(env_get slot)" ]; then
+			die "slot $(env_get slot) is pending and has not booted yet; not confirming it from slot ${cur:-?}"
+		fi
+		env_set "upgrade_available 0" "bootcount 0" "rolled_back 0"
+		log "fw-update: slot ${cur:-?} confirmed"
+		exit 0 ;;
+	--rollback)
+		cur=$(running_slot)
+		[ -n "$cur" ] || die "not booted from a slot"
+		other=$([ "$cur" = a ] && echo b || echo a)
+		env_set "slot $other" "upgrade_available 0" "bootcount 0"
+		log "fw-update: switching back to slot $other"
+		sync; reboot; exit 0 ;;
+	--no-reboot) REBOOT=0 ;;
+	--force) FORCE=1 ;;
+	--bootloader) BOOTLOADER=1 ;;
+	-h|--help) sed -n '3,25p' "$0"; exit 0 ;;
+	-*) die "unknown option $1" ;;
+	*) SRC="$1" ;;
+	esac
+	shift
+done
+[ -n "$SRC" ] || die "no firmware given (see --help)"
+
+exec 9>"${FW_LOCK:-/var/run/fw-update.lock}"
+flock -n 9 || die "another fw-update is running"
+
+rm -rf "$WORK"
+mkdir -p "$WORK"
+
+# ---- Unpack ----
+case "$SRC" in
+http://*|https://*)
+	log "fw-update: downloading $SRC"
+	wget -q -O "$WORK/fw.zip" "$SRC" || die "download failed"
+	SRC="$WORK/fw.zip" ;;
+esac
+if [ -d "$SRC" ]; then
+	PKG="$SRC"
+else
+	[ -f "$SRC" ] || die "$SRC not found"
+	unzip -q -o "$SRC" -d "$WORK/pkg" || die "cannot unzip $SRC"
+	PKG="$WORK/pkg"
+fi
+
+MODEL=$(tr -d '\0' < "$MODEL_FILE" 2>/dev/null || true)
+CUR=$(running_slot)
+if [ "$CUR" = a ]; then TARGET=b; else TARGET=a; fi
+
+install_qspi() {
+	F="$PKG/flash"
+	[ -f "$F/SHA256SUMS" ] && [ -f "$F/firmware.itb" ] || die "no flash/firmware.itb + SHA256SUMS: not an A/B build"
+	(cd "$F" && sha256sum -c -s SHA256SUMS) || die "the build's own checksums do not match: corrupted download?"
+	size=$(wc -c < "$F/firmware.itb")
+	[ "$size" -le "$SLOT_SIZE" ] || die "firmware.itb ($size bytes) is larger than a slot ($SLOT_SIZE)"
+	if [ "$FORCE" = 0 ] && [ -n "$MODEL" ] && ! grep -a -q -F "$MODEL" "$F/firmware.itb"; then
+		die "this build's device tree is not for '$MODEL' (use --force if you are sure)"
+	fi
+	[ -s "$F/uboot-ab.env" ] || die "build has no uboot-ab.env"
+
+	SLOT_DEV=$(mtd_dev "linux-$TARGET")
+	MODEL_DEV=$(mtd_dev model)
+	MODEL_OFF=0
+	if [ -z "$SLOT_DEV" ]; then
+		LEGACY=$(mtd_dev qspi-linux)
+		[ -n "$LEGACY" ] || die "no linux-a/linux-b or qspi-linux partition in $PROC_MTD"
+		[ -z "$CUR" ] || die "running from slot $CUR but no slot partitions: inconsistent"
+		TARGET=a
+		SLOT_DEV=$LEGACY
+		MODEL_DEV=$LEGACY
+		MODEL_OFF=$LEGACY_MODEL_OFFSET
+		log "fw-update: tezuka flash layout: converting (slot A replaces the old image; this write has no rollback)"
+	fi
+	VER=$(cat "$F/VERSION" 2>/dev/null || echo unknown)
+	log "fw-update: installing $VER into QSPI slot $TARGET ($SLOT_DEV, running: ${CUR:-tezuka})"
+
+	# Slot first: on a tezuka board it replaces the old image's start, and
+	# the model region below overlaps the old image's tail.
+	write_mtd "$SLOT_DEV" 0 "$F/firmware.itb"
+	log "fw-update: slot $TARGET written and verified"
+
+	if [ -f "$F/model.bin" ] && [ -n "$MODEL_DEV" ]; then
+		[ "$(wc -c < "$F/model.bin")" -le "$MODEL_SIZE" ] || die "model.bin is larger than its partition"
+		have=""
+		if mtd_debug read "$MODEL_DEV" "$MODEL_OFF" 44 "$WORK/mhead" >/dev/null 2>&1; then
+			have=$(sha256sum < "$WORK/mhead" | cut -c1-64)
+		fi
+		want=$(head -c 44 "$F/model.bin" | sha256sum | cut -c1-64)
+		if [ "$have" != "$want" ]; then
+			write_mtd "$MODEL_DEV" "$MODEL_OFF" "$F/model.bin"
+			log "fw-update: DeepCW model partition written and verified"
+		fi
+	fi
+
+	# Boot scripts and slot switch in one environment write.
+	env_set "$(cat "$F/uboot-ab.env")" "fit_size 0xC40000" "ver_$TARGET $VER" \
+		"slot $TARGET" "upgrade_available 1" "bootcount 0" "rolled_back 0"
+}
+
+install_sd() {
+	mount_boot
+	IMG="$PKG/sdimg"
+	[ -d "$IMG" ] || IMG="$PKG"
+	NEW="$IMG/a"
+	[ -f "$NEW/SHA256SUMS" ] || die "no sdimg/a/SHA256SUMS: not an A/B build"
+	(cd "$NEW" && sha256sum -c -s SHA256SUMS) || die "the build's own checksums do not match: corrupted download?"
+	for f in uImage uramdisk.image.xz devicetree.dtb system_top.bin; do
+		[ -s "$NEW/$f" ] || die "build is missing $f"
+	done
+	if [ "$FORCE" = 0 ] && [ -n "$MODEL" ] && ! grep -a -q -F "$MODEL" "$NEW/devicetree.dtb"; then
+		die "this build's device tree is not for '$MODEL' (use --force if you are sure)"
+	fi
+	[ -z "$CUR" ] && log "fw-update: first A/B install; the current files in / stay as the fallback"
+	log "fw-update: installing $(cat "$NEW/VERSION" 2>/dev/null) into SD slot $TARGET (running: ${CUR:-/})"
+
+	need=$(du -sk "$NEW" | cut -f1)
+	free=$(df -k "$BOOT" | awk 'NR==2 {print $4}')
+	old=$(du -sk "$BOOT/$TARGET" 2>/dev/null | cut -f1)
+	[ $((free + ${old:-0})) -gt $((need + 1024)) ] || die "not enough space on the SD card"
+
+	rm -rf "$BOOT/$TARGET.new"
+	mkdir "$BOOT/$TARGET.new"
+	cp "$NEW"/* "$BOOT/$TARGET.new/"
+	sync
+	echo 3 2>/dev/null > /proc/sys/vm/drop_caches || true
+	(cd "$BOOT/$TARGET.new" && sha256sum -c -s SHA256SUMS) || die "read-back verification failed: SD card problem? slot $TARGET left unchanged"
+	rm -rf "$BOOT/$TARGET"
+	mv "$BOOT/$TARGET.new" "$BOOT/$TARGET"
+	sync
+	if ! cmp -s "$IMG/uEnv.txt" "$BOOT/uEnv.txt"; then
+		grep -q '^slot_select=' "$IMG/uEnv.txt" || die "the new uEnv.txt has no A/B support"
+		cp "$BOOT/uEnv.txt" "$BOOT/uEnv.txt.bak" 2>/dev/null || true
+		cp "$IMG/uEnv.txt" "$BOOT/uEnv.txt.new"
+		sync
+		mv "$BOOT/uEnv.txt.new" "$BOOT/uEnv.txt"
+		sync
+		log "fw-update: uEnv.txt updated (previous kept as uEnv.txt.bak)"
+	fi
+	if [ "$BOOTLOADER" = 1 ]; then
+		(cd "$IMG" && sha256sum -c -s SHA256SUMS) || die "BOOT.bin checksum mismatch"
+		cp "$BOOT/BOOT.bin" "$BOOT/BOOT.bin.bak"
+		cp "$IMG/BOOT.bin" "$BOOT/BOOT.bin.new"
+		sync
+		mv "$BOOT/BOOT.bin.new" "$BOOT/BOOT.bin"
+		sync
+		log "fw-update: BOOT.bin replaced (not covered by rollback)"
+	fi
+	env_set "slot $TARGET" "upgrade_available 1" "bootcount 0" "rolled_back 0"
+}
+
+case "$(boot_medium)" in
+qspi) install_qspi ;;
+*) install_sd ;;
+esac
+rm -rf "$WORK"
+log "fw-update: slot $TARGET ready; it must confirm itself within 3 boots or the previous firmware comes back"
+
+if [ "$REBOOT" = 1 ]; then
+	log "fw-update: rebooting"
+	sync
+	reboot
+fi

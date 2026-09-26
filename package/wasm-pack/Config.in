@@ -1,9 +1,0 @@
-config BR2_PACKAGE_WASM_PACK
-	bool "wasm_pack"
-	select BR2_PACKAGE_RUST_WASM
-	depends on BR2_PACKAGE_HOST_RUSTC_TARGET_ARCH_SUPPORTS
-	select BR2_PACKAGE_HOST_RUSTC
-	help
-	  WASM_PACK utility
-
-
