@@ -4,9 +4,16 @@
 //! transcript. Text arrives about once a second: the settled part is appended
 //! for good, the last word or two stays "pending" and firms up in place.
 //!
-//! It reads the one station under the cursor, letter by letter.
+//! It reads the one station under the cursor, letter by letter. The classic
+//! decoder's AFC only reaches +/-35 Hz, so a [`Finder`] watches the whole CW
+//! filter: when nothing is locked and a keyed tone stands out elsewhere in the
+//! passband, the decoder is moved onto it (as the IC-705 copies anything in
+//! the filter, not only what sits exactly on the pitch).
 
 use std::sync::{Arc, Mutex};
+
+use num_complex::Complex32;
+use rustfft::{Fft, FftPlanner};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use sdroxide_deepcw::{Tuner, Worker};
@@ -20,8 +27,124 @@ const TEXT_CAP: usize = 4000;
 /// words in context at 10-30 WPM and the preview still updates every second.
 const WINDOW_S: f64 = 6.0;
 
+/// Finder FFT: 8192 points at 12 kHz = 1.5 Hz bins over 0.68 s.
+const FIND_N: usize = 8192;
+/// Look for a tone this often.
+const FIND_HOP_S: f64 = 0.5;
+/// A tone this far above the passband's median (per bin, after averaging) is
+/// a signal. Keyed CW at a readable SNR stands 25-50 dB out of 1.5 Hz bins.
+const FIND_MIN_DB: f32 = 15.0;
+/// Two looks this close together are the same tone.
+const FIND_SAME_HZ: f32 = 12.0;
+/// Closer than this to where the decoder listens: its own AFC pulls it in.
+const FIND_AFC_HZ: f32 = 25.0;
+/// After a move, give the decoder this long to lock before looking again.
+const FIND_SETTLE_S: f64 = 3.0;
+/// Stay this far inside the filter edges (their skirts are not signals).
+const FIND_EDGE_HZ: f32 = 30.0;
+
+/// Finds the strongest steady tone in the CW passband.
+struct Finder {
+    rate: f64,
+    fft: Arc<dyn Fft<f32>>,
+    window: Vec<f32>,
+    ring: Vec<f32>,
+    pos: usize,
+    filled: usize,
+    since: usize,
+    hop: usize,
+    /// Power spectrum, averaged over a few looks (keying comes and goes).
+    avg: Vec<f32>,
+    buf: Vec<Complex32>,
+    band: (f32, f32),
+    /// Tone seen at the last look, to require two in a row.
+    last: Option<f32>,
+    /// Samples left before the next move is allowed.
+    settle: usize,
+}
+
+impl Finder {
+    fn new(rate: f64) -> Self {
+        let window = (0..FIND_N)
+            .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / FIND_N as f32).cos())
+            .collect();
+        Finder {
+            rate,
+            fft: FftPlanner::new().plan_fft_forward(FIND_N),
+            window,
+            ring: vec![0.0; FIND_N],
+            pos: 0,
+            filled: 0,
+            since: 0,
+            hop: (FIND_HOP_S * rate) as usize,
+            avg: vec![0.0; FIND_N / 2],
+            buf: vec![Complex32::default(); FIND_N],
+            band: (300.0, 1_100.0),
+            last: None,
+            settle: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.filled = 0;
+        self.since = 0;
+        self.avg.iter_mut().for_each(|x| *x = 0.0);
+        self.last = None;
+        self.settle = 0;
+    }
+
+    /// Feed audio; `Some(hz)` when a tone has stood out twice in a row.
+    fn push(&mut self, audio: &[f32]) -> Option<f32> {
+        for &a in audio {
+            self.ring[self.pos] = a;
+            self.pos = (self.pos + 1) % FIND_N;
+        }
+        self.filled = (self.filled + audio.len()).min(FIND_N);
+        self.since += audio.len();
+        self.settle = self.settle.saturating_sub(audio.len());
+        if self.filled < FIND_N || self.since < self.hop {
+            return None;
+        }
+        self.since = 0;
+        for i in 0..FIND_N {
+            self.buf[i] = Complex32::new(self.ring[(self.pos + i) % FIND_N] * self.window[i], 0.0);
+        }
+        self.fft.process(&mut self.buf);
+        for (a, z) in self.avg.iter_mut().zip(&self.buf) {
+            *a = 0.6 * *a + 0.4 * z.norm_sqr();
+        }
+        let bin = self.rate as f32 / FIND_N as f32;
+        let lo = ((self.band.0 + FIND_EDGE_HZ) / bin).ceil() as usize;
+        let hi = (((self.band.1 - FIND_EDGE_HZ) / bin).floor() as usize).min(FIND_N / 2 - 2);
+        if hi <= lo + 8 {
+            return None;
+        }
+        let mut sorted: Vec<f32> = self.avg[lo..=hi].to_vec();
+        sorted.sort_by(f32::total_cmp);
+        let median = sorted[sorted.len() / 2].max(1e-20);
+        let (k, peak) = (lo..=hi).map(|k| (k, self.avg[k])).max_by(|a, b| a.1.total_cmp(&b.1))?;
+        let tone = if 10.0 * (peak / median).log10() >= FIND_MIN_DB {
+            // Parabolic interpolation between the neighbouring bins.
+            let (a, b, c) = (self.avg[k - 1].sqrt(), peak.sqrt(), self.avg[k + 1].sqrt());
+            let d = a - 2.0 * b + c;
+            let frac = if d.abs() > 1e-20 { 0.5 * (a - c) / d } else { 0.0 };
+            Some((k as f32 + frac.clamp(-0.5, 0.5)) * bin)
+        } else {
+            None
+        };
+        let seen = std::mem::replace(&mut self.last, tone);
+        match (seen, tone) {
+            (Some(a), Some(b)) if (a - b).abs() < FIND_SAME_HZ && self.settle == 0 => Some(b),
+            _ => None,
+        }
+    }
+}
+
 pub struct CwLive {
     rx: CwRx,
+    /// The operator's pitch (where the finder's moves are undone to on retune).
+    pitch: f32,
+    finder: Finder,
     tuner: Tuner,
     deep: Option<Worker>,
     scratch: Vec<f32>,
@@ -49,6 +172,8 @@ impl CwLive {
         let deep = if neural { start_deep() } else { None };
         CwLive {
             rx: CwRx::new(rate, pitch_hz),
+            pitch: pitch_hz,
+            finder: Finder::new(rate),
             tuner: Tuner::new(rate, pitch_hz as f64),
             deep,
             scratch: Vec::new(),
@@ -57,6 +182,11 @@ impl CwLive {
             fresh: String::new(),
             dirty: false,
         }
+    }
+
+    /// The CW filter's audio passband: where the finder looks.
+    pub fn set_band(&mut self, lo: f32, hi: f32) {
+        self.finder.band = (lo.min(hi), lo.max(hi));
     }
 
     /// Switch between DeepCW and the timing decoder; the text so far stays.
@@ -76,6 +206,12 @@ impl CwLive {
 
     /// Feed demodulated audio (not while transmitting: we would copy ourselves).
     pub fn process(&mut self, audio: &[f32]) {
+        if let Some(tone) = self.finder.push(audio) {
+            if !self.rx.locked() && (tone - self.rx.tone_hz()).abs() > FIND_AFC_HZ {
+                self.rx.set_pitch(tone);
+                self.finder.settle = (FIND_SETTLE_S * self.finder.rate) as usize;
+            }
+        }
         let classic = self.rx.process(audio);
         let Some(deep) = self.deep.as_ref() else {
             self.append(&classic);
@@ -112,6 +248,9 @@ impl CwLive {
             d.reset();
         }
         self.tuner.reset();
+        // A new station starts on the pitch again.
+        self.rx.set_pitch(self.pitch);
+        self.finder.reset();
         self.pending.clear();
         if !self.text.is_empty() && !self.text.ends_with('\n') {
             self.text.push('\n');
@@ -187,6 +326,7 @@ enum Msg {
     Flush,
     Clear,
     Neural(bool),
+    Band(f32, f32),
 }
 
 /// What the engine reads back: the display and what settled since last time.
@@ -209,6 +349,7 @@ pub struct CwLiveThread {
     shared: Arc<Mutex<Shared>>,
     seen: u64,
     warned: bool,
+    band: Option<(f32, f32)>,
 }
 
 impl CwLiveThread {
@@ -228,7 +369,7 @@ impl CwLiveThread {
                 run(CwLive::new(rate, pitch_hz, neural), rx, sh)
             })
             .expect("spawn cw-live");
-        CwLiveThread { tx, shared, seen: 0, warned: false }
+        CwLiveThread { tx, shared, seen: 0, warned: false, band: None }
     }
 
     /// Audio in; dropped (not queued, and said once) if the decoder falls
@@ -256,6 +397,13 @@ impl CwLiveThread {
     }
     pub fn set_neural(&self, on: bool) {
         let _ = self.tx.try_send(Msg::Neural(on));
+    }
+    /// The CW filter passband (audio Hz); sent on only when it changed.
+    pub fn set_band(&mut self, lo: f32, hi: f32) {
+        let b = (lo, hi);
+        if self.band != Some(b) && self.tx.try_send(Msg::Band(b.0, b.1)).is_ok() {
+            self.band = Some(b);
+        }
     }
     /// Whether DeepCW is the engine in force (false also when it failed to start).
     pub fn neural(&self) -> bool {
@@ -294,6 +442,7 @@ fn run(mut c: CwLive, rx: Receiver<Msg>, shared: Arc<Mutex<Shared>>) {
             Ok(Msg::Flush) => c.flush(),
             Ok(Msg::Clear) => c.clear(),
             Ok(Msg::Neural(on)) => c.set_neural(on),
+            Ok(Msg::Band(lo, hi)) => c.set_band(lo, hi),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
         }
@@ -354,6 +503,42 @@ mod tests {
         assert!((c.readout().tone_hz - 720.0).abs() < 8.0, "{:?}", c.readout());
         assert!(c.take_committed().contains("SQ6EMM"));
         assert!(c.take_committed().is_empty());
+    }
+
+    #[test]
+    fn finds_a_station_off_the_pitch_anywhere_in_the_filter() {
+        // 12 kHz as in trxd; 130 Hz off the pitch, far outside the AFC's reach
+        // (two boards 0.1 ppm apart at 23 cm).
+        let mut c = timing(12_000.0, 700.0);
+        c.set_band(450.0, 950.0);
+        let audio: Vec<f32> = keyed("VVV CQ TEST DE SQ6EMM SQ6EMM K", 830.0, 20.0).chunks(4).map(|q| q[0]).collect();
+        for chunk in audio.chunks(120) {
+            c.process(chunk);
+        }
+        c.poll();
+        assert!(c.text().contains("SQ6EMM"), "{:?}", c.text());
+        assert!((c.readout().tone_hz - 830.0).abs() < 10.0, "{:?}", c.readout());
+        // A retune puts the decoder back on the pitch.
+        c.restart();
+        assert_eq!(c.readout().tone_hz, 700.0);
+    }
+
+    #[test]
+    fn noise_alone_does_not_move_the_decoder() {
+        let mut c = timing(12_000.0, 700.0);
+        c.set_band(450.0, 950.0);
+        let mut seed = 3u32;
+        for _ in 0..200 {
+            let chunk: Vec<f32> = (0..120)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.1
+                })
+                .collect();
+            c.process(&chunk);
+        }
+        // (The AFC itself may wander a fraction of a hertz.)
+        assert!((c.readout().tone_hz - 700.0).abs() < 5.0, "{:?}", c.readout());
     }
 
     #[test]

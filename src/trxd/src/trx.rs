@@ -1113,6 +1113,7 @@ impl Trx {
             self.cw_audio.clear();
             self.cw_audio.extend_from_slice(&self.audio);
             self.cw_agc.process(&mut self.cw_audio);
+            self.cwlive.set_band(self.filter.0, self.filter.1);
             self.cwlive.audio(&self.cw_audio);
         }
         if !quiet {
