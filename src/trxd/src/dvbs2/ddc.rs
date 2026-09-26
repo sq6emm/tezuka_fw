@@ -69,11 +69,16 @@ impl Design {
     }
 }
 
-/// Symbol rates the DDC can take at `fs_in`: whole, even decimations to 2
-/// samples per symbol, at least 2 in the first stage.
+/// Symbol rates the DDC can take at `fs_in`: an even decimation D to 2 or
+/// more samples per symbol (below 2.7; fractional is fine, the receiver's
+/// timing loop interpolates), at least 2 in the first stage.
 pub fn symbol_rate_ok(fs_in: f64, rs: f64) -> bool {
-    let n = fs_in / rs;
-    (n - n.round()).abs() < 1e-9 && (n.round() as usize) % (2 * SPS_OUT) == 0 && n.round() as usize >= 4 * SPS_OUT
+    rs > 0.0 && half_decimation(fs_in, rs) >= 2
+}
+
+/// D / 2: FIR1 x FIR2's share (FIR3 decimates by 2).
+fn half_decimation(fs_in: f64, rs: f64) -> usize {
+    (fs_in / (2.0 * SPS_OUT as f64 * rs) + 1e-9).floor() as usize
 }
 
 /// Kaiser-window low-pass, pass band to `fp`, stop band from `fstop` (Hz at `fs`).
@@ -109,9 +114,9 @@ fn operations(n_taps: usize, decimation: usize, folded: bool) -> usize {
 /// Design the DDC for symbol rate `rs` (see [`symbol_rate_ok`]) and roll-off.
 pub fn design(fs_in: f64, rs: f64, rolloff: f32) -> Result<Design, String> {
     if !symbol_rate_ok(fs_in, rs) {
-        return Err(format!("{rs} S/s: fs/rs must be an even whole number >= 8 at {fs_in} S/s"));
+        return Err(format!("{rs} S/s: too fast for the DDC at {fs_in} S/s"));
     }
-    let rem = (fs_in / rs).round() as usize / (2 * SPS_OUT);
+    let rem = half_decimation(fs_in, rs);
     // FIR1 (and FIR2 if the rest is large): the split with the larger factor first.
     let (d1, d2) = if rem <= 8 {
         (rem.max(2), 1)
@@ -141,10 +146,11 @@ pub fn design(fs_in: f64, rs: f64, rolloff: f32) -> Result<Design, String> {
         fs = fs_next;
         (h, d2)
     });
+    // 4 samples per symbol into FIR3, or a little more when fs_in / rs is
+    // not a multiple of 4.
     let sps3 = fs / rs;
-    debug_assert!((sps3 - (2 * SPS_OUT) as f64).abs() < 1e-9);
-    let span = RRC_SPAN.min((budget(fs, 2, true, NUM_ADDR[2]) - 1) / (2 * SPS_OUT));
-    let fir3: Vec<f64> = super::rrc_taps(2 * SPS_OUT, rolloff, span).into_iter().map(|x| x as f64).collect();
+    let span = RRC_SPAN.min(((budget(fs, 2, true, NUM_ADDR[2]) - 1) as f64 / sps3) as usize);
+    let fir3: Vec<f64> = super::rrc_taps_frac(sps3, rolloff, span).into_iter().map(|x| x as f64).collect();
     let (fir1, fir2, fir3) = quantize(fir1, fir2, (fir3, 2));
     let d = Design { fs_in, rs, fir1, fir2, fir3 };
     check(&d)?;
@@ -408,13 +414,14 @@ mod tests {
 
     #[test]
     fn designs_fit_the_fpga_for_every_offered_rate() {
-        for rs in [32e3, 48e3, 64e3, 96e3, 128e3, 192e3, 256e3, 384e3] {
+        for rs in [32e3, 48e3, 64e3, 96e3, 128e3, 192e3, 250e3, 256e3, 333e3, 384e3] {
             let d = design(FS, rs, 0.35).unwrap_or_else(|e| panic!("{rs}: {e}"));
-            assert_eq!(d.fs_out(), rs * SPS_OUT as f64, "{rs}");
+            let sps = d.fs_out() / rs;
+            assert!((2.0..2.7).contains(&sps), "{rs}: {sps}");
             let r = d.registers();
             assert_eq!(r.coeffs.len(), if d.fir2.is_some() { 640 } else { 512 });
         }
-        assert!(design(FS, 250e3, 0.35).is_err(), "3.072 MS/s / 250 kS/s is not whole");
+        assert!(design(FS, 500e3, 0.35).is_err(), "500 kS/s would need FIR1 at 1");
     }
 
     /// Test vectors for maia-hdl (`test/test_datv_ddc.py`): the designs,
@@ -594,5 +601,120 @@ mod tests {
     #[test]
     fn qpsk_1_2_at_128_ksps_through_the_ddc() {
         same_as_software(128e3, Rate::R1_2, 3.5, 30);
+    }
+
+    /// Long frames (pilots) at a symbol rate that does not divide the ADC
+    /// rate: pulse-shaped at 3.072 MS/s from the continuous RRC, then the
+    /// DDC (fractional samples per symbol out) and the long-frame receiver.
+    fn long_link_ddc(rs: f64, mode: super::super::fpga_tx::LongMode, esn0_db: f32, frames: usize) -> (super::super::rx::Stats, usize) {
+        use super::super::{FrameSpec, rrc_at, rx::tests::{counter_packets, long_symbols}};
+        let spec = FrameSpec::long(mode);
+        let mut next = counter_packets();
+        let syms = long_symbols(mode, frames, &mut next);
+        // RRC table, 256 points a symbol over 12 symbols (nearest point).
+        const RES: usize = 256;
+        const SPAN: usize = 12;
+        let tab: Vec<f32> = (0..=SPAN * RES).map(|i| rrc_at(i as f64 / RES as f64 - (SPAN / 2) as f64, spec.rolloff as f64) as f32).collect();
+        let sps = FS / rs;
+        let n_out = ((syms.len() - SPAN) as f64 * sps) as usize;
+        let esn0 = 10f32.powf(esn0_db / 10.0);
+        // Pulse energy per symbol: sum of h^2 at sps samples a symbol.
+        let e: f32 = tab.iter().step_by(1).map(|h| h * h).sum::<f32>() / RES as f32 * sps as f32;
+        let sigma = (e / esn0 / 2.0).sqrt();
+        let mut seed = 23u64;
+        let mut g = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let u = ((seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-12);
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let v = (seed >> 11) as f64 / (1u64 << 53) as f64;
+            ((-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()) as f32
+        };
+        let (center, err) = (100e3, 300.0);
+        let amp = 1200.0 / (e.sqrt() + 1.0);
+        let mut rx = None;
+        let d = design(FS, rs, spec.rolloff).unwrap();
+        let mut ddc = DdcModel::new(&d, frequency_word(center, FS));
+        let mut out = Vec::new();
+        let mut adc = Vec::with_capacity(30_720);
+        for k in 0..n_out {
+            // Symbols whose pulse covers sample k (time in symbols).
+            let t = k as f64 / sps + (SPAN / 2) as f64;
+            let mut z = Complex32::default();
+            let i0 = t.ceil() as usize - SPAN / 2;
+            for i in i0..=(t.floor() as usize + SPAN / 2).min(syms.len() - 1) {
+                let x = ((t - i as f64 + (SPAN / 2) as f64) * RES as f64).round() as usize;
+                if x <= SPAN * RES {
+                    z += syms[i] * tab[x];
+                }
+            }
+            let ph = std::f64::consts::TAU * (center + err) * k as f64 / FS;
+            let v = (z * Complex32::new(ph.cos() as f32, ph.sin() as f32) + Complex32::new(sigma * g(), sigma * g())) * amp;
+            adc.push([v.re.round().clamp(-2048.0, 2047.0) as i16, v.im.round().clamp(-2048.0, 2047.0) as i16]);
+            if adc.len() == 30_720 || k + 1 == n_out {
+                let (mut y, mut c) = (Vec::new(), Vec::new());
+                ddc.process(&adc, &mut y);
+                to_complex(&y, &mut c);
+                rx.get_or_insert_with(|| Receiver::new_prefiltered_spec(spec, d.fs_out(), rs, 0.0)).process(&c, &mut out);
+                adc.clear();
+            }
+        }
+        let rx = rx.unwrap();
+        let data: Vec<_> = out.iter().filter(|p| p[1..3] != [0x1F, 0xFF]).collect();
+        let f0 = data.first().map_or(0, |p| u32::from_be_bytes(p[1..5].try_into().unwrap()));
+        for (i, p) in data.iter().enumerate() {
+            assert_eq!(u32::from_be_bytes(p[1..5].try_into().unwrap()), f0 + i as u32, "{mode:?} packet {i}; {:?}", rx.stats);
+        }
+        (rx.stats, data.len())
+    }
+
+    #[test]
+    fn long_frames_at_250_ksps_through_the_ddc() {
+        use super::super::fpga_tx::LongMode;
+        for (mode, esn0, per_frame) in [(LongMode::Qpsk12, 3.0, 21), (LongMode::Psk8_34, 10.0, 32)] {
+            let (s, n) = long_link_ddc(250e3, mode, esn0, 22);
+            eprintln!("{mode:?}: {n} packets {s:?}");
+            assert!(s.locked && (s.freq_hz - 300.0).abs() < 10.0, "{s:?}");
+            // At 3 dB the header alone gives the frequency to about 100 Hz
+            // at 250 kS/s, more than half the pilots' alias spacing (169 Hz):
+            // the first frames of the acquisition average may fail. From
+            // there on every frame.
+            assert!(n >= 12 * per_frame && s.ldpc_fail <= 8, "{mode:?}: {n} packets, {s:?}");
+        }
+    }
+
+    /// A DDC recording from a board (`touch /tmp/datv-iq`) through the
+    /// receiver: `DATV_CAP=<file.cf32> DATV_SR=250000 DATV_MODE=L-QPSK-1/2
+    /// cargo test --release replay_capture -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn replay_capture() {
+        use super::super::{FrameSpec, fpga_tx::LongMode};
+        let path = std::env::var("DATV_CAP").expect("DATV_CAP=<file.cf32>");
+        let rs: f64 = std::env::var("DATV_SR").map_or(250e3, |v| v.parse().unwrap());
+        let mode = LongMode::parse(&std::env::var("DATV_MODE").unwrap_or("L-QPSK-1/2".into())).unwrap();
+        let d = design(FS, rs, 0.35).unwrap();
+        let raw = if path == "noise" {
+            let mut seed = 5u64;
+            (0..6_000_000 * 2).flat_map(|_| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                (((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.01).to_le_bytes()
+            }).collect()
+        } else {
+            std::fs::read(path).unwrap()
+        };
+        let iq: Vec<Complex32> = raw.chunks_exact(8).map(|c| Complex32::new(f32::from_le_bytes(c[..4].try_into().unwrap()), f32::from_le_bytes(c[4..].try_into().unwrap()))).collect();
+        let p = iq.iter().map(|z| z.norm_sqr()).sum::<f32>() / iq.len() as f32;
+        eprintln!("{} samples at {} S/s ({:.1} s), mean power {p:.3e}", iq.len(), d.fs_out(), iq.len() as f64 / d.fs_out());
+        let mut rx = Receiver::new_prefiltered_spec(FrameSpec::long(mode), d.fs_out(), rs, 0.0);
+        let mut out = Vec::new();
+        let t0 = std::time::Instant::now();
+        let chunk: usize = std::env::var("DATV_CHUNK").map_or(16384, |v| v.parse().unwrap());
+        for (k, c) in iq.chunks(chunk).enumerate() {
+            rx.process(c, &mut out);
+            if k % (655_360 / chunk) == 0 {
+                eprintln!("{:.1} s: {:?}", (k * chunk) as f64 / d.fs_out(), rx.stats);
+            }
+        }
+        eprintln!("done in {:.2} s: {} packets {:?}", t0.elapsed().as_secs_f64(), out.len(), rx.stats);
     }
 }

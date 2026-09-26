@@ -94,7 +94,8 @@ under the TUNE carrier to keep RRC peaks off the DAC ceiling):
   other's; the other signal has to fall inside the same 384 kS/s stream (about
   +-120 kHz of the TX signal), and the board's own transmitter leaks into its
   receiver.
-- No BCH decoding on receive (LDPC convergence and the BBHEADER CRC stand in).
+- No BCH decoding on receive for short frames (LDPC convergence and the
+  BBHEADER CRC stand in); long frames have it (DATV-FPGA.md).
 
 ## Test tools
 

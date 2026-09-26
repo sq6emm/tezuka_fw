@@ -29,15 +29,19 @@ scopes and TCI keep working, and DATV no longer depends on its bandwidth.
 
 ## Symbol rates
 
-The DDC decimates by whole numbers, so the symbol rate must give an even
-whole number of ADC samples per symbol, at least 8: at 3.072 MS/s that is
-32, 48, 64, 96, 128, 192, 256 or 384 kS/s. 250 kS/s is not possible; 256 kS/s
-takes its place (both boards are ours, so nothing standard is lost).
-Occupied bandwidth at 256 kS/s, roll-off 0.35: 346 kHz.
+The DDC decimates by whole numbers, D = 2 x floor(3.072 MS/s / (4 rs)),
+at least 4: the output then carries 2 to 2.7 samples per symbol, fractional
+when 3.072 MS/s / rs is not a multiple of 4 (the RRC in FIR3 is designed at
+that fractional rate; the receiver's Gardner loop interpolates anyway). Every
+rate up to 384 kS/s works this way, 250 and 333 kS/s included; 500 kS/s
+would need FIR1 at /1 and is transmit only. Occupied bandwidth at 256 kS/s,
+roll-off 0.35: 346 kHz.
 
 | Symbol rate | FIR1 | FIR2 | FIR3 (RRC) | Output |
 |---|---|---|---|---|
+| 333 kS/s | /2 | bypass | /2 | 768 kS/s (2.30 per symbol) |
 | 256 kS/s | /3 | bypass | /2 | 512 kS/s |
+| 250 kS/s | /3 | bypass | /2 | 512 kS/s (2.048 per symbol) |
 | 128 kS/s | /6 | bypass | /2 | 256 kS/s |
 | 64 kS/s | /4 | /3 | /2 | 128 kS/s |
 
@@ -181,4 +185,55 @@ DAC DMA -> datv_split --(DAC GPIO bit 1)--> async FIFO -> ORI dvb_fpga encoder
 - Libre 2 to Libre 1 at 256 kS/s arrives at about 2 dB MER: 6 dB below the
   64 kS/s link, around the QPSK 1/2 threshold.
 
-Receive of long frames needs the FPGA LDPC decoder (next).
+## Long-frame receive (2026-09-26)
+
+QPSK 1/2, QPSK 3/4, 8PSK 3/4, normal frames, pilots, through the DDC at any
+rate it takes (250 kS/s included):
+
+```text
+DDC -> Receiver (FrameSpec::long: Gardner, header sync, pilot-aided carrier,
+  QPSK or max-log 8PSK LLRs, bit deinterleaving)
+  -> LDPC in the FPGA (0x43C40000, maia-hdl ldpc_axi.py; its bit-exact model
+     ldpc_fpga.rs off the board) -> BCH (bch.rs, t = 12) -> BBFRAME -> TS
+```
+
+- The decoder's early stop (every check satisfied in one pass) can stop on
+  a word with a few bits wrong, since checks are evaluated while later
+  layers still change their variables. BCH (software, t = 12, remainder
+  first, Berlekamp-Massey and Chien only when it is not zero) removes them
+  and also rescues frames LDPC nearly decoded.
+- Acquisition to tracking: the NCO's step at the end of acquisition also
+  applies to the symbols already buffered (up to an input block beyond the
+  next header); they are derotated to match, and the NCO phase is turned so
+  the following samples continue them. Before that fix the first frame after
+  acquisition always failed.
+- Tests: long_frames_* (rx.rs, 64 kS/s: every frame, every packet in
+  order at 3.0 / 6.5 / 10 dB), long_frames_at_250_ksps_through_the_ddc
+  (ddc.rs: the DDC model at 2.048 samples per symbol; at 3 dB the first
+  frames of the acquisition average may fail, since one header gives the
+  frequency to about 100 Hz, more than half the pilots' alias spacing of
+  169 Hz; every frame after that).
+- A bitstream without the decoder: trxd probes its ID from a child process
+  (the read is a bus error there) and falls back to the model in software.
+- Unlocked, the header search runs at every symbol; it now screens each
+  position on the SOF (30 symbols, prefix-summed normalization) before the
+  full 90-symbol metric: 3x cheaper, about the cost of the locked receiver.
+  Before, at 250 kS/s the A9 needed more than a core while searching, fell
+  behind and never locked.
+- The DDC ring holds 0.5 s. A thread of its own (datv-ring) drains it every
+  5 ms into a queue of about 4 s for the demodulator; reading it between
+  demodulator bursts let the DMA lap the reader unnoticed (bursts of 12 bad
+  frames over the air).
+
+Over the air (2026-09-26, Libre 2 -> Libre 1, 1255.000 MHz, 250 kS/s, Libre
+2 at 0 dB attenuation, Es/N0 about 21 dB, carrier +137 Hz):
+
+| Mode | Frames | Libre 1 CPU (one core = 100 %) |
+|---|---|---|
+| QPSK 1/2 long | 422/422 in 60 s, 532 pictures | demod 48 %, FEC 14 % |
+| QPSK 3/4 long | 309/309 in 45 s | demod 49 %, FEC 13 % |
+| 8PSK 3/4 long | 463/465 in 45 s (acquisition) | demod 60 %, FEC 21 % |
+
+FEC there is the thread handing frames to the FPGA and waiting (LLR
+quantization and the AXI copy in and out), BCH and the TS demux.
+

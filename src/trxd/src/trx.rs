@@ -73,9 +73,6 @@ const DATV_AMPLITUDE: f32 = 0.5;
 const DATV_STARVE: Duration = Duration::from_secs(10);
 /// DATV symbol rates offered: whole samples per symbol at 384 kS/s.
 const DATV_RATES: [f64; 6] = [32_000.0, 48_000.0, 64_000.0, 96_000.0, 128_000.0, 192_000.0];
-/// Receive only, through the FPGA front end (the 384 kS/s stream cannot
-/// carry them, nor send them yet).
-const DATV_RATES_FPGA_RX: [f64; 1] = [256_000.0];
 /// Unkey after this long without TX audio from the keying TCI client.
 const TCI_STARVE: Duration = Duration::from_millis(1_500);
 /// CW keyer: stay keyed this long after the last element (semi break-in).
@@ -940,27 +937,31 @@ impl Trx {
         info!(sr, rate = rate.label(), pilots, ts_rate = ts_rate.round(), video_bps = video_bps.round(), ?profile, "DATV on");
     }
 
-    /// Start (or restart) the DVB-S2 receiver on the RX frequency.
+    /// Start (or restart) the DVB-S2 receiver on the RX frequency: short
+    /// frames at the stream rates (software) or anything the FPGA DDC takes;
+    /// long frames (LDPC in the FPGA) through the DDC.
     fn datv_rx_start(&mut self, sr: f64, rate: &str, pilots: bool) {
-        use crate::dvbs2::{Params, Rate};
+        use crate::dvbs2::{FrameSpec, Params, Rate, ddc, fpga, fpga_tx::LongMode};
         self.datv_rx = None;
         self.datv_rx_stats = Default::default();
         let sps = self.rate / sr;
-        // Long frames: no receiver for them in trxd yet; the FPGA front end still
-        // runs (capture with `touch /tmp/datv-iq`), decoding as 1/2 short fails.
-        let long = crate::dvbs2::fpga_tx::LongMode::parse(rate).is_some();
-        if long {
-            warn!(rate, "DATV receive: long frames are not decoded yet (front end and capture only)");
+        let software = DATV_RATES.contains(&sr) && (sps - sps.round()).abs() < 1e-9;
+        let ddc = fpga::available() && ddc::symbol_rate_ok(fpga::FS_IN, sr);
+        let center = self.rx_eff() - self.center;
+        if let Some(mode) = LongMode::parse(rate) {
+            if !ddc {
+                warn!(sr, rate, "DATV receive: long frames need the FPGA front end at a rate it takes");
+                return;
+            }
+            info!(sr, rate, "DATV receive on");
+            self.datv_rx = Some(crate::dvbs2::rx::RxThread::start_spec(FrameSpec::long(mode), mode.label().to_string(), self.rate, sr, center));
+            return;
         }
-        let rate = if long { "1/2" } else { rate };
         match Rate::parse(rate) {
-            Some(rate)
-                if (DATV_RATES.contains(&sr) && (sps - sps.round()).abs() < 1e-9)
-                    || (DATV_RATES_FPGA_RX.contains(&sr) && crate::dvbs2::fpga::available()) =>
-            {
+            Some(rate) if software || ddc => {
                 let p = Params { rate, pilots, rolloff: 0.35 };
                 info!(sr, rate = rate.label(), "DATV receive on");
-                self.datv_rx = Some(crate::dvbs2::rx::RxThread::start(p, self.rate, sr, self.rx_eff() - self.center));
+                self.datv_rx = Some(crate::dvbs2::rx::RxThread::start(p, self.rate, sr, center));
             }
             _ => warn!(sr, rate, "DATV receive: symbol rate or code rate not offered"),
         }
@@ -1852,7 +1853,7 @@ impl Trx {
             "ports": self.settings.ports,
             "datv": self.datv_json(),
             "datv_mode": self.datv_mode,
-            "datv_rx": self.datv_rx.as_ref().map(|r| serde_json::json!({"sr": r.sr, "rate": r.params.rate.label(), "pilots": r.params.pilots, "fpga": r.uses_fpga()})),
+            "datv_rx": self.datv_rx.as_ref().map(|r| serde_json::json!({"sr": r.sr, "rate": r.label, "pilots": r.spec.pilots, "fpga": r.uses_fpga()})),
             "xvtr": self.xvtr.as_ref().map(|t| t.name.clone()),
             "xvtrs": self.settings.transverters,
             "cal_band": self.cal_band(),

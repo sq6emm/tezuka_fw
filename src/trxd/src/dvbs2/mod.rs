@@ -15,6 +15,8 @@
 pub mod ddc;
 pub mod fpga;
 pub mod fpga_tx;
+pub mod bch;
+pub mod fpga_ldpc;
 pub mod ldpc_fpga;
 mod tables;
 pub mod ldpc;
@@ -98,6 +100,67 @@ impl Rate {
         }
     }
 }
+
+/// What the receiver needs to know about the frames it receives: short
+/// QPSK (the software chain) or normal frames (QPSK or 8PSK, decoded by the
+/// FPGA's LDPC decoder).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameSpec {
+    /// LDPC codeword bits: 16200 or 64800.
+    pub n: usize,
+    /// Bits per data symbol: 2 (QPSK) or 3 (8PSK).
+    pub bps: usize,
+    pub modcod: u8,
+    pub pilots: bool,
+    /// BBFRAME bits.
+    pub kbch: usize,
+    /// Short-frame rate (software LDPC), or the long-frame rate.
+    pub short_rate: Option<Rate>,
+    pub long_rate: Option<ldpc_fpga::LongRate>,
+    pub rolloff: f32,
+    /// Es/N0 (dB) below which a frame is not worth decoding.
+    pub hopeless_db: f32,
+}
+
+impl FrameSpec {
+    pub fn short(p: Params) -> Self {
+        let hopeless_db = match p.rate {
+            Rate::R1_4 => -5.0,
+            Rate::R1_3 => -3.5,
+            Rate::R1_2 => -2.0,
+            Rate::R2_3 => 0.5,
+            Rate::R3_4 => 1.5,
+        };
+        FrameSpec { n: NLDPC, bps: 2, modcod: p.rate.modcod(), pilots: p.pilots, kbch: p.rate.kbch(), short_rate: Some(p.rate), long_rate: None, rolloff: p.rolloff, hopeless_db }
+    }
+    pub fn long(mode: fpga_tx::LongMode) -> Self {
+        use fpga_tx::LongMode::*;
+        let (bps, rate, hopeless_db) = match mode {
+            Qpsk12 => (2, ldpc_fpga::LongRate::R1_2, -2.0),
+            Qpsk34 => (2, ldpc_fpga::LongRate::R3_4, 1.0),
+            Psk8_34 => (3, ldpc_fpga::LongRate::R3_4, 5.0),
+        };
+        FrameSpec { n: 64_800, bps, modcod: mode.modcod(), pilots: true, kbch: mode.kbch(), short_rate: None, long_rate: Some(rate), rolloff: 0.35, hopeless_db }
+    }
+    pub fn is_short(&self) -> bool {
+        self.n == NLDPC
+    }
+    /// 90-symbol slots of data.
+    pub fn slots(&self) -> usize {
+        self.n / self.bps / SLOT
+    }
+    /// PLFRAME length, symbols.
+    pub fn frame_symbols(&self) -> usize {
+        let s = self.slots();
+        SLOT + s * SLOT + if self.pilots { (s - 1) / 16 * PILOT } else { 0 }
+    }
+    pub fn header(&self) -> Vec<Complex32> {
+        plheader_typed(self.modcod, self.pilots, self.is_short())
+    }
+}
+
+/// 8PSK (5.4.2, Figure 10): bits y0 y1 y2 as a number -> phase / (pi/4).
+pub const PSK8_PHASE: [u8; 8] = [1, 0, 4, 5, 2, 7, 3, 6];
 
 /// Transmission settings.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -330,10 +393,15 @@ impl Fec {
 
 /// The 90 PLHEADER symbols (5.5.2): SOF and the PLS code, pi/2-BPSK.
 fn plheader(modcod: u8, pilots: bool) -> Vec<Complex32> {
+    plheader_typed(modcod, pilots, true)
+}
+
+/// PLHEADER for either frame size (TYPE bit 1: short).
+fn plheader_typed(modcod: u8, pilots: bool, short: bool) -> Vec<Complex32> {
     const SOF: u32 = 0x18D_2E82;
     const PLS_SCRAMBLE: u64 = 0x719D_83C9_5342_2DFA;
     const G: [u32; 6] = [0x5555_5555, 0x3333_3333, 0x0F0F_0F0F, 0x00FF_00FF, 0x0000_FFFF, 0xFFFF_FFFF];
-    let index = ((modcod as u32) << 2) | 0b10 | pilots as u32; // TYPE: short frame
+    let index = ((modcod as u32) << 2) | ((short as u32) << 1) | pilots as u32;
     let mut y = 0u32;
     for (row, g) in G.iter().enumerate() {
         if (index >> (6 - row)) & 1 == 1 {
@@ -434,28 +502,31 @@ impl Encoder {
 
 // ---------------------------------------------------------------- pulse shaping
 
+/// Root-raised-cosine pulse at `t` symbols from its centre (peak
+/// 1 - b + 4b/pi).
+pub(crate) fn rrc_at(t: f64, b: f64) -> f64 {
+    let pi = std::f64::consts::PI;
+    if t.abs() < 1e-9 {
+        1.0 - b + 4.0 * b / pi
+    } else if (t.abs() - 1.0 / (4.0 * b)).abs() < 1e-9 {
+        b / 2f64.sqrt() * ((1.0 + 2.0 / pi) * (pi / (4.0 * b)).sin() + (1.0 - 2.0 / pi) * (pi / (4.0 * b)).cos())
+    } else {
+        ((pi * t * (1.0 - b)).sin() + 4.0 * b * t * (pi * t * (1.0 + b)).cos()) / (pi * t * (1.0 - (4.0 * b * t).powi(2)))
+    }
+}
+
 /// Root-raised-cosine taps, `sps` samples per symbol over `span` symbols,
 /// scaled so that unit-power symbols come out at unit power.
 fn rrc_taps(sps: usize, rolloff: f32, span: usize) -> Vec<f32> {
-    let n = span * sps + 1;
-    let b = rolloff as f64;
-    let mut h: Vec<f64> = (0..n)
-        .map(|i| {
-            let t = (i as f64 - (n - 1) as f64 / 2.0) / sps as f64;
-            if t.abs() < 1e-9 {
-                1.0 - b + 4.0 * b / std::f64::consts::PI
-            } else if (t.abs() - 1.0 / (4.0 * b)).abs() < 1e-9 {
-                let pi = std::f64::consts::PI;
-                b / 2f64.sqrt() * ((1.0 + 2.0 / pi) * (pi / (4.0 * b)).sin() + (1.0 - 2.0 / pi) * (pi / (4.0 * b)).cos())
-            } else {
-                let pi = std::f64::consts::PI;
-                ((pi * t * (1.0 - b)).sin() + 4.0 * b * t * (pi * t * (1.0 + b)).cos())
-                    / (pi * t * (1.0 - (4.0 * b * t).powi(2)))
-            }
-        })
-        .collect();
+    rrc_taps_frac(sps as f64, rolloff, span)
+}
+
+/// [`rrc_taps`] at a fractional `sps` (an odd number of taps, centred).
+pub(crate) fn rrc_taps_frac(sps: f64, rolloff: f32, span: usize) -> Vec<f32> {
+    let n = 2 * (span as f64 * sps / 2.0).round() as usize + 1;
+    let mut h: Vec<f64> = (0..n).map(|i| rrc_at((i as f64 - (n - 1) as f64 / 2.0) / sps, rolloff as f64)).collect();
     let e: f64 = h.iter().map(|x| x * x).sum();
-    let k = (sps as f64 / e).sqrt();
+    let k = (sps / e).sqrt();
     h.iter_mut().for_each(|x| *x *= k);
     h.into_iter().map(|x| x as f32).collect()
 }

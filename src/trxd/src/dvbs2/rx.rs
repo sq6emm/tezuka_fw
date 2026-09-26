@@ -18,7 +18,8 @@ use std::collections::VecDeque;
 
 use num_complex::Complex32;
 
-use super::{BBHEADER, NLDPC, PILOT, Params, SLOT, TS_LEN, bb_scrambling, crc8, ldpc::Decoder, pl_scrambling, plheader, rrc_taps};
+use super::{BBHEADER, FrameSpec, PILOT, PSK8_PHASE, Params, SLOT, TS_LEN, bb_scrambling, crc8, fpga_ldpc::Ldpc, pl_scrambling, rrc_taps};
+use super::bch::{Bch, Outcome};
 
 /// Frames `/tmp/datv-dump` captures at most (about 65 kB each).
 const DUMP_FRAMES: usize = 300;
@@ -44,6 +45,10 @@ pub struct Stats {
     /// Of `frames_bad`: LDPC did not converge / the BBHEADER CRC failed.
     pub ldpc_fail: u64,
     pub crc_fail: u64,
+    /// Long frames: bits BCH corrected; frames LDPC converged on that BCH
+    /// rejected (counted in `ldpc_fail` too).
+    pub bch_fixed: u64,
+    pub bch_fail: u64,
     pub packets: u64,
     /// IQ blocks the receiving thread could not take in time.
     pub blocks_dropped: u64,
@@ -63,7 +68,7 @@ pub struct Stats {
 }
 
 pub struct Receiver {
-    p: Params,
+    spec: FrameSpec,
     rs: f64,
     fs: f64,
     // Front end.
@@ -117,8 +122,9 @@ pub struct Receiver {
 
 /// LDPC + BBFRAME -> TS: the expensive part, which can run on its own core.
 pub struct Fec {
-    p: Params,
-    dec: Decoder,
+    spec: FrameSpec,
+    dec: Ldpc,
+    bch: Option<Bch>,
     bbscr: Vec<u8>,
     bits: Vec<u8>,
     partial: Vec<u8>,
@@ -132,28 +138,36 @@ enum FecMode {
     Thread { tx: crossbeam_channel::Sender<Vec<f32>>, fails: std::sync::Arc<std::sync::atomic::AtomicU32> },
 }
 
-/// Es/N0 (dB) below which a frame of this rate is not worth decoding.
-fn hopeless_below(rate: super::Rate) -> f32 {
-    match rate {
-        super::Rate::R1_4 => -5.0,
-        super::Rate::R1_3 => -3.5,
-        super::Rate::R1_2 => -2.0,
-        super::Rate::R2_3 => 0.5,
-        super::Rate::R3_4 => 1.5,
-    }
-}
-
 impl Fec {
-    pub fn new(p: Params) -> Self {
-        Fec { p, dec: Decoder::new(p.rate), bbscr: bb_scrambling(p.rate.kbch() / 8), bits: vec![0; NLDPC], partial: Vec::new(), have_prev: false }
+    pub fn new(spec: FrameSpec) -> Self {
+        let bch = (!spec.is_short()).then(Bch::new);
+        Fec { spec, dec: Ldpc::for_spec(&spec), bch, bbscr: bb_scrambling(spec.kbch / 8), bits: vec![0; spec.n], partial: Vec::new(), have_prev: false }
     }
 
     /// Decode one frame of LLRs; TS packets out. False if it did not decode.
     pub fn frame(&mut self, llr: &[f32], stats: &mut Stats, out: &mut Vec<[u8; TS_LEN]>) -> bool {
         let t0 = std::time::Instant::now();
         let ok = self.dec.decode(llr, &mut self.bits);
+        // Long frames: BCH cleans up what LDPC left (or falsely converged
+        // on); it also rescues a nearly converged frame.
+        let ok = match &self.bch {
+            None => ok.is_some(),
+            Some(bch) => match bch.decode(&mut self.bits[..self.spec.kbch + 192]) {
+                Outcome::Clean => true,
+                Outcome::Fixed(k) => {
+                    stats.bch_fixed += k as u64;
+                    true
+                }
+                Outcome::Failed => {
+                    if ok.is_some() {
+                        stats.bch_fail += 1;
+                    }
+                    false
+                }
+            },
+        };
         stats.ldpc_s += t0.elapsed().as_secs_f64();
-        if ok.is_none() {
+        if !ok {
             stats.frames_bad += 1;
             stats.ldpc_fail += 1;
             self.have_prev = false;
@@ -188,24 +202,29 @@ impl Receiver {
     /// `fs`: input rate; `rs`: symbol rate (fs / rs a whole number);
     /// `center_hz`: where the signal sits in the input.
     pub fn new(p: Params, fs: f64, rs: f64, center_hz: f64) -> Self {
+        Self::with_spec(FrameSpec::short(p), fs, rs, center_hz)
+    }
+
+    /// Any frame type (short QPSK, or normal QPSK / 8PSK).
+    pub fn with_spec(spec: FrameSpec, fs: f64, rs: f64, center_hz: f64) -> Self {
         let sps_in = (fs / rs).round() as usize;
         // Decimate to 2 or 3 samples per symbol inside the matched filter.
         let decim = (1..=sps_in).rev().find(|d| sps_in % d == 0 && sps_in / d >= 2).unwrap_or(1);
         let sps = sps_in / decim;
-        let rrc = rrc_taps(sps_in, p.rolloff, 12);
-        let frame_len = p.frame_symbols();
+        let rrc = rrc_taps(sps_in, spec.rolloff, 12);
+        let frame_len = spec.frame_symbols();
         let n_data = frame_len - SLOT;
         // Known blocks: the header, then each pilot block (after 16 slots).
         let mut known = vec![(0usize, SLOT)];
-        if p.pilots {
-            let slots = NLDPC / 2 / SLOT;
+        if spec.pilots {
+            let slots = spec.slots();
             for i in 1..=(slots - 1) / 16 {
                 let at = SLOT + i * 16 * SLOT + (i - 1) * PILOT;
                 known.push((at, PILOT));
             }
         }
         Receiver {
-            p,
+            spec,
             rs,
             fs,
             nco: Complex32::new(1.0, 0.0),
@@ -224,7 +243,7 @@ impl Receiver {
             agc: 1.0,
             prev_sym: Complex32::default(),
             syms: Vec::new(),
-            header: plheader(p.rate.modcod(), p.pilots),
+            header: spec.header(),
             frame_len,
             known,
             scramble: pl_scrambling(n_data),
@@ -236,8 +255,8 @@ impl Receiver {
             acq: [Complex32::default(); 3],
             fails: 0,
             noise_frames: 0,
-            fec: FecMode::Inline(Fec::new(p)),
-            llr: vec![0.0; NLDPC],
+            fec: FecMode::Inline(Fec::new(spec)),
+            llr: vec![0.0; spec.n],
             stats: Stats::default(),
             constellation: Vec::new(),
             constellation_seq: 0,
@@ -249,7 +268,11 @@ impl Receiver {
     /// or more, not necessarily a whole multiple of `rs`. Only the AFC's
     /// mixer runs here.
     pub fn new_prefiltered(p: Params, fs: f64, rs: f64, center_hz: f64) -> Self {
-        let mut r = Receiver::new(p, fs, rs, center_hz);
+        Self::new_prefiltered_spec(FrameSpec::short(p), fs, rs, center_hz)
+    }
+
+    pub fn new_prefiltered_spec(spec: FrameSpec, fs: f64, rs: f64, center_hz: f64) -> Self {
+        let mut r = Receiver::with_spec(spec, fs, rs, center_hz);
         r.rrc = vec![1.0];
         r.hist = vec![Complex32::default(); 2];
         r.hpos = 0;
@@ -347,6 +370,44 @@ impl Receiver {
         num / den.max(1e-20)
     }
 
+    /// The best header position in `start..end`: [`Self::header_metric`],
+    /// computed only where the SOF alone (its first 30 symbols, the same
+    /// chunked metric) passes a loose threshold. Unlocked, this runs for
+    /// every symbol: at 250 kS/s the full metric everywhere cost the A9 more
+    /// than a core, the receiver fell behind the ring and never locked.
+    fn search(&self, start: usize, end: usize) -> (usize, f32) {
+        const SOF: usize = 30;
+        // Noise gives about 0.28 +- 0.08 here, a header 0.7 at 0 dB Es/N0.
+        const SOF_MIN: f32 = 0.4;
+        // |s| prefix sums for the normalization.
+        let mut cum = Vec::with_capacity(end + SOF - start + 1);
+        cum.push(0f32);
+        for z in &self.syms[start..end + SOF] {
+            cum.push(cum.last().unwrap() + z.norm());
+        }
+        let mut best = (start, 0f32);
+        for k in start..end {
+            let s = &self.syms[k..k + SOF];
+            let mut num = 0f32;
+            for c in 0..SOF / 10 {
+                let mut acc = Complex32::default();
+                for i in c * 10..c * 10 + 10 {
+                    acc += s[i] * self.header[i].conj();
+                }
+                num += acc.norm();
+            }
+            let den = cum[k - start + SOF] - cum[k - start];
+            if num < SOF_MIN * den {
+                continue;
+            }
+            let m = self.header_metric(k);
+            if m > best.1 {
+                best = (k, m);
+            }
+        }
+        best
+    }
+
     fn frames(&mut self, out: &mut Vec<[u8; TS_LEN]>) {
         let l = self.frame_len;
         loop {
@@ -359,7 +420,7 @@ impl Receiver {
                         return;
                     }
                     let end = need - SLOT;
-                    let (best, m) = (start..end).map(|k| (k, self.header_metric(k))).fold((start, 0f32), |a, b| if b.1 > a.1 { b } else { a });
+                    let (best, m) = self.search(start, end);
                     if m >= SYNC_MIN {
                         if self.candidate.is_some() {
                             // Two headers one frame apart: locked.
@@ -431,6 +492,26 @@ impl Receiver {
             acc += s * r.conj();
         }
         acc / len as f32
+    }
+
+    /// Move the NCO by `df` Hz as of symbol `from` (the next header). The
+    /// symbols after it were already mixed with the old frequency (up to an
+    /// input block's worth): give them the new one too, and turn the NCO's
+    /// phase so the samples still to come continue them without a step.
+    fn retune(&mut self, df: f64, from: usize) {
+        self.afc_hz += df;
+        let w = -std::f64::consts::TAU * df / self.rs;
+        for (i, s) in self.syms.iter_mut().enumerate().skip(from) {
+            let ph = w * (i - from) as f64;
+            *s *= Complex32::new(ph.cos() as f32, ph.sin() as f32);
+        }
+        // Symbol `from` to the next input sample: the buffered symbols, the
+        // matched-filter samples not yet strobed, the filter's delay.
+        let t = self.syms.len().saturating_sub(from) as f64 / self.rs
+            + (self.mf.len() as f64 - self.t).max(0.0) * self.decim as f64 / self.fs
+            + (self.rrc.len() / 2) as f64 / self.fs;
+        let ph = -std::f64::consts::TAU * df * t;
+        self.nco *= Complex32::new(ph.cos() as f32, ph.sin() as f32);
     }
 
     fn frame(&mut self, p: usize, next: usize, out: &mut Vec<[u8; TS_LEN]>) {
@@ -515,14 +596,14 @@ impl Receiver {
         if acquiring {
             if self.frames_locked == ACQ_FRAMES {
                 // Acquired: the NCO takes the averaged estimate in one step.
-                self.afc_hz += f;
+                self.retune(f, next);
                 self.freq_est = 0.0;
             }
         } else {
             // Tracking: move the NCO slowly toward the estimate; what remains
             // is followed inside each frame by the phases above.
             self.freq_est = 0.8 * f;
-            self.afc_hz += 0.2 * f;
+            self.retune(0.2 * f, next);
         }
 
         // Phase for every symbol: linear between neighbouring known blocks.
@@ -565,11 +646,19 @@ impl Receiver {
         let scale = 2.0 * std::f32::consts::SQRT_2 * amp / sigma2 * a * std::f32::consts::SQRT_2;
         let (mut dd_sig, mut dd_err) = (0f32, 0f32);
         self.constellation.clear();
+        // Constellation display: QPSK points at (+-40, +-40); 8PSK on the
+        // same radius (about 57).
         let unit = 40.0 / (amp * a).max(1e-9);
         let mut n = 0usize; // data symbol index
         let mut k = SLOT; // position in the frame
         let mut pilot = 1usize;
-        while n < NLDPC / 2 {
+        let nsym = self.spec.n / self.spec.bps;
+        // 8PSK points (unit radius) for the soft demapper
+        let psk8: [Complex32; 8] = std::array::from_fn(|v| {
+            let a = std::f32::consts::FRAC_PI_4 * PSK8_PHASE[v] as f32;
+            Complex32::new(a.cos(), a.sin())
+        });
+        while n < nsym {
             if pilot < self.known.len() && k == self.known[pilot].0 {
                 k += PILOT;
                 pilot += 1;
@@ -578,9 +667,31 @@ impl Receiver {
             let ph = phase_at(k as f64) as f32;
             let s = self.syms[p + k] * Complex32::new(ph.cos(), -ph.sin());
             let d = super::rotate(s, (4 - self.scramble[k - SLOT]) & 3);
-            self.llr[2 * n] = scale * d.re;
-            self.llr[2 * n + 1] = scale * d.im;
-            let dec = Complex32::new(amp * a * d.re.signum(), amp * a * d.im.signum());
+            let dec = if self.spec.bps == 2 {
+                self.llr[2 * n] = scale * d.re;
+                self.llr[2 * n + 1] = scale * d.im;
+                Complex32::new(amp * a * d.re.signum(), amp * a * d.im.signum())
+            } else {
+                // 8PSK, max-log: per bit the nearest point with it 1 minus
+                // the nearest with it 0, over the noise; bits y0 y1 y2 go to
+                // the columns of the bit interleaver (rate 3/4: 0, 1, 2).
+                let dist: [f32; 8] = std::array::from_fn(|v| (d - psk8[v] * amp).norm_sqr());
+                let rows = self.spec.n / 3;
+                for bit in 0..3 {
+                    let mask = 4 >> bit;
+                    let (mut d0, mut d1) = (f32::MAX, f32::MAX);
+                    for (v, &dv) in dist.iter().enumerate() {
+                        if v & mask == 0 {
+                            d0 = d0.min(dv);
+                        } else {
+                            d1 = d1.min(dv);
+                        }
+                    }
+                    self.llr[bit * rows + n] = (d1 - d0) / sigma2;
+                }
+                let best = (0..8).min_by(|&x, &y| dist[x].total_cmp(&dist[y])).unwrap();
+                psk8[best] * amp
+            };
             dd_sig += dec.norm_sqr();
             dd_err += (d - dec).norm_sqr();
             if n % 32 == 0 {
@@ -595,10 +706,10 @@ impl Receiver {
         self.stats.frames += 1;
         // Far below what this rate decodes (no signal, carrier wrong): the
         // decoder would only burn CPU. It counts as a failure.
-        let hopeless = self.stats.esn0_db < hopeless_below(self.p.rate);
+        let hopeless = self.stats.esn0_db < self.spec.hopeless_db;
         // Far below anything decodable, twice: the "lock" was a chance
         // header match on noise. Let go (the caller sees `missed`).
-        if self.stats.esn0_db < hopeless_below(self.p.rate) - 6.0 {
+        if self.stats.esn0_db < self.spec.hopeless_db - 6.0 {
             self.noise_frames += 1;
             if self.noise_frames >= 2 {
                 self.missed = LOST_AFTER;
@@ -657,7 +768,7 @@ impl Receiver {
 impl Fec {
     /// BBFRAME -> TS packets (the reverse of [`super::Framer`]).
     fn deframe(&mut self, stats: &mut Stats, out: &mut Vec<[u8; TS_LEN]>) -> bool {
-        let n = self.p.rate.kbch() / 8;
+        let n = self.spec.kbch / 8;
         let bb: Vec<u8> = (0..n)
             .map(|i| {
                 let mut v = 0u8;
@@ -718,7 +829,9 @@ pub struct RxShared {
 pub struct RxThread {
     tx: crossbeam_channel::Sender<(Vec<Complex32>, f64)>,
     shared: std::sync::Arc<std::sync::Mutex<RxShared>>,
-    pub params: Params,
+    pub spec: FrameSpec,
+    /// The mode as the UI names it (e.g. "1/2", "L-8PSK-3/4").
+    pub label: String,
     pub sr: f64,
     fec_stats: std::sync::Arc<std::sync::Mutex<Stats>>,
     /// Blocks dropped because the thread was behind (CPU too slow).
@@ -745,6 +858,10 @@ fn publish(r: &Receiver, sh: &std::sync::Mutex<RxShared>, seen: &mut u64) {
 
 impl RxThread {
     pub fn start(p: Params, fs: f64, sr: f64, center_hz: f64) -> Self {
+        Self::start_spec(FrameSpec::short(p), p.rate.label().to_string(), fs, sr, center_hz)
+    }
+
+    pub fn start_spec(p: FrameSpec, label: String, fs: f64, sr: f64, center_hz: f64) -> Self {
         use std::sync::{Arc, Mutex, atomic::AtomicU32, atomic::Ordering};
         let (tx, rx) = crossbeam_channel::bounded::<(Vec<Complex32>, f64)>(64);
         // Slack between demodulator and decoder: about 6 s at 64 kS/s. The
@@ -777,11 +894,11 @@ impl RxThread {
                     // each fewer iterations rather than drop the next ones
                     // unread. 20 costs nothing measurable at 1/2 (ldpc.rs
                     // iteration_budget), 12 a few frames at the very edge.
-                    fec.dec.max_iter = match frx.len() {
+                    fec.dec.set_max_iter(match frx.len() {
                         0..=1 => 50,
                         2..=7 => 20,
                         _ => 12,
-                    };
+                    });
                     // Debug on a board: `touch /tmp/datv-dump` appends each
                     // frame's LLRs (f32 LE, 16200 a frame) to
                     // /tmp/datv-llr.f32, up to DUMP_FRAMES; remove it to stop.
@@ -823,7 +940,7 @@ impl RxThread {
                 let mut none = Vec::new();
                 let mut seen = 0;
                 let Some(fc) = fc else {
-                    let mut r = Receiver::new(p, fs, sr, center_hz);
+                    let mut r = Receiver::with_spec(p, fs, sr, center_hz);
                     r.fec = FecMode::Thread { tx: ftx, fails };
                     for (iq, center) in rx {
                         r.set_center(center);
@@ -832,57 +949,97 @@ impl RxThread {
                     }
                     return;
                 };
-                let mut fe = match super::fpga::FrontEnd::start(sr, p.rolloff, center_hz) {
-                    Ok(fe) => fe,
-                    Err(e) => {
-                        tracing::warn!("DATV: FPGA front end: {e}");
-                        return;
-                    }
-                };
-                tracing::info!(fs = fe.fs_out(), "DATV receive through the FPGA DDC");
-                let mut r = Receiver::new_prefiltered(p, fe.fs_out(), sr, 0.0);
-                r.fec = FecMode::Thread { tx: ftx, fails };
-                let mut buf = Vec::new();
-                let mut reported = false;
-                loop {
-                    // Until the RxThread is dropped (its sender goes).
-                    match rx.recv_timeout(std::time::Duration::from_millis(10)) {
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                        _ => {}
-                    }
-                    fe.set_center(f64::from_bits(fc.load(Ordering::Relaxed)));
-                    buf.clear();
-                    fe.read(&mut buf);
-                    // Debug on a board: `touch /tmp/datv-iq` records the DDC's
-                    // output (complex f32, 2 samples per symbol) into
-                    // /tmp/datv-iq.cf32, contiguously: the demodulator is
-                    // skipped meanwhile (it could not keep up with the ring
-                    // and a recording with holes is useless). 64 MB at most.
-                    if std::path::Path::new("/tmp/datv-iq").exists() {
-                        use std::io::Write;
-                        if !buf.is_empty() {
-                            if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/datv-iq.cf32") {
-                                if fh.metadata().map_or(0, |m| m.len()) < 64_000_000 {
-                                    let b: Vec<u8> = buf.iter().flat_map(|z| [z.re.to_le_bytes(), z.im.to_le_bytes()]).flatten().collect();
-                                    let _ = fh.write_all(&b);
+                // The ring holds 0.5 s: a reader of its own drains it every
+                // few ms into a queue of seconds, so the demodulator's bursts
+                // (a whole long frame at once) cannot let the DMA lap it.
+                let (btx, brx) = crossbeam_channel::bounded::<Vec<Complex32>>(800);
+                let (ftx_fs, frx_fs) = crossbeam_channel::bounded::<f64>(1);
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (st2, dr2) = (stop.clone(), dr.clone());
+                let rolloff = p.rolloff;
+                let ring = std::thread::Builder::new()
+                    .name("datv-ring".into())
+                    .spawn(move || {
+                        crate::stream::thread_nice(-5);
+                        let mut fe = match super::fpga::FrontEnd::start(sr, rolloff, center_hz) {
+                            Ok(fe) => fe,
+                            Err(e) => {
+                                tracing::warn!("DATV: FPGA front end: {e}");
+                                return;
+                            }
+                        };
+                        let _ = ftx_fs.send(fe.fs_out());
+                        let (mut reported, mut late_reported) = (false, false);
+                        let mut last = std::time::Instant::now();
+                        while !st2.load(Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            fe.set_center(f64::from_bits(fc.load(Ordering::Relaxed)));
+                            let mut buf = Vec::new();
+                            fe.read(&mut buf);
+                            if !late_reported && last.elapsed() > std::time::Duration::from_millis(400) {
+                                late_reported = true;
+                                dr2.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(late = ?last.elapsed(), "DATV: the ring reader was late: samples lost");
+                            }
+                            last = std::time::Instant::now();
+                            // Debug on a board: `touch /tmp/datv-iq` records the
+                            // DDC's output (complex f32, 2+ samples per symbol)
+                            // into /tmp/datv-iq.cf32, contiguously; the
+                            // demodulator gets nothing meanwhile. 64 MB at most.
+                            if std::path::Path::new("/tmp/datv-iq").exists() {
+                                use std::io::Write;
+                                if !buf.is_empty() {
+                                    if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/datv-iq.cf32") {
+                                        if fh.metadata().map_or(0, |m| m.len()) < 64_000_000 {
+                                            let b: Vec<u8> = buf.iter().flat_map(|z| [z.re.to_le_bytes(), z.im.to_le_bytes()]).flatten().collect();
+                                            let _ = fh.write_all(&b);
+                                        }
+                                    }
                                 }
+                                continue;
+                            }
+                            if !reported && fe.dropped() {
+                                reported = true;
+                                dr2.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!("DATV: the FPGA recorder dropped samples");
+                            }
+                            if !buf.is_empty() && btx.try_send(buf).is_err() {
+                                // The demodulator is seconds behind.
+                                dr2.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        continue;
+                    })
+                    .expect("spawn datv-ring");
+                let Ok(fs_out) = frx_fs.recv() else {
+                    return;
+                };
+                tracing::info!(fs = fs_out, "DATV receive through the FPGA DDC");
+                let mut r = Receiver::new_prefiltered_spec(p, fs_out, sr, 0.0);
+                r.fec = FecMode::Thread { tx: ftx, fails };
+                'run: loop {
+                    // Until the RxThread is dropped (its sender goes); the
+                    // stream IQ it sends is not used here.
+                    loop {
+                        match rx.try_recv() {
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => break 'run,
+                            Err(crossbeam_channel::TryRecvError::Empty) => break,
+                            Ok(_) => {}
+                        }
                     }
-                    if !reported && fe.dropped() {
-                        reported = true;
-                        dr.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!("DATV: the FPGA recorder dropped samples");
-                    }
-                    if !buf.is_empty() {
-                        r.process(&buf, &mut none);
-                        publish(&r, &sh, &mut seen);
+                    match brx.recv_timeout(std::time::Duration::from_millis(20)) {
+                        Ok(buf) => {
+                            r.process(&buf, &mut none);
+                            publish(&r, &sh, &mut seen);
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
                 }
+                stop.store(true, Ordering::Relaxed);
+                let _ = ring.join();
             })
             .expect("spawn datv-rx");
-        RxThread { tx, shared, fec_stats, params: p, sr, dropped, started: std::time::Instant::now(), fpga_center }
+        RxThread { tx, shared, fec_stats, spec: p, label, sr, dropped, started: std::time::Instant::now(), fpga_center }
     }
 
     /// Receiving through the FPGA front end.
@@ -962,7 +1119,148 @@ pub fn demod_cli(input: &str, output: &str, rest: &[String]) -> Result<(), Strin
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    /// Long-frame PLFRAMEs as the FPGA transmitter makes them (normal frames,
+    /// pilots, QPSK or 8PSK): BBFRAME, BB scrambling, BCH, LDPC, bit interleaving (8PSK), mapping,
+    /// header, pilots, PL scrambling. Unit-power symbols.
+    pub(crate) fn long_symbols(mode: super::super::fpga_tx::LongMode, frames: usize, next: &mut dyn FnMut() -> [u8; TS_LEN]) -> Vec<Complex32> {
+        use super::super::{Framer, PILOT as PIL, PSK8_PHASE, SLOT as SL, bb_scrambling, pl_scrambling, rotate};
+        use super::super::ldpc_fpga::{encode, N};
+        let spec = FrameSpec::long(mode);
+        let rate = spec.long_rate.unwrap();
+        let mut framer = Framer::new();
+        let bch = super::super::bch::Bch::new();
+        let bbscr = bb_scrambling(spec.kbch / 8);
+        let header = spec.header();
+        let scr = pl_scrambling(spec.frame_symbols() - SL);
+        let a = std::f32::consts::FRAC_1_SQRT_2;
+        let mut out = Vec::new();
+        for _ in 0..frames {
+            let bb = framer.frame_bytes(spec.kbch / 8, 0, next);
+            let mut info = vec![0u8; rate.k()];
+            for (i, byte) in bb.iter().enumerate() {
+                for b in 0..8 {
+                    info[i * 8 + b] = ((byte ^ bbscr[i]) >> (7 - b)) & 1;
+                }
+            }
+            bch.encode(&mut info);
+            let cw = encode(rate, &info);
+            let nsym = N / spec.bps;
+            let syms: Vec<Complex32> = (0..nsym)
+                .map(|i| {
+                    if spec.bps == 2 {
+                        let (b0, b1) = (cw[2 * i], cw[2 * i + 1]);
+                        Complex32::new(if b0 == 0 { a } else { -a }, if b1 == 0 { a } else { -a })
+                    } else {
+                        let rows = N / 3;
+                        let v = (cw[i] << 2 | cw[rows + i] << 1 | cw[2 * rows + i]) as usize;
+                        let ph = std::f32::consts::FRAC_PI_4 * PSK8_PHASE[v] as f32;
+                        Complex32::new(ph.cos(), ph.sin())
+                    }
+                })
+                .collect();
+            out.extend_from_slice(&header);
+            let mut k = 0;
+            for (n, s) in syms.iter().enumerate() {
+                if n > 0 && n % (16 * SL) == 0 {
+                    for _ in 0..PIL {
+                        out.push(rotate(Complex32::new(a, a), scr[k]));
+                        k += 1;
+                    }
+                }
+                out.push(rotate(*s, scr[k]));
+                k += 1;
+            }
+        }
+        out
+    }
+
+    pub(crate) fn counter_packets() -> impl FnMut() -> [u8; TS_LEN] {
+        let mut n = 0u32;
+        move || {
+            let mut pkt = [0u8; TS_LEN];
+            pkt[0] = 0x47;
+            pkt[1..5].copy_from_slice(&n.to_be_bytes());
+            for (i, b) in pkt[5..].iter_mut().enumerate() {
+                *b = (n as usize * 7 + i) as u8;
+            }
+            n += 1;
+            pkt
+        }
+    }
+
+    /// Long frames through RRC, noise and a carrier offset into the receiver,
+    /// decoded by the FPGA decoder's model: every packet back, in order.
+    fn long_link(mode: super::super::fpga_tx::LongMode, esn0_db: f32, frames: usize) -> (Stats, usize) {
+        let (sps, rs) = (4usize, 64_000.0);
+        let fs = rs * sps as f64;
+        let mut next = counter_packets();
+        let syms = long_symbols(mode, frames, &mut next);
+        let spec = FrameSpec::long(mode);
+        let h = super::super::rrc_taps(sps, spec.rolloff, 12);
+        let mut iq = vec![Complex32::default(); syms.len() * sps + h.len()];
+        for (i, s) in syms.iter().enumerate() {
+            for (t, &c) in h.iter().enumerate() {
+                iq[i * sps + t] += s * c;
+            }
+        }
+        let esn0 = 10f32.powf(esn0_db / 10.0);
+        let sigma = (sps as f32 / esn0 / 2.0).sqrt();
+        let mut seed = 17u64;
+        let mut g = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let u = ((seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-12);
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let v = (seed >> 11) as f64 / (1u64 << 53) as f64;
+            ((-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()) as f32
+        };
+        let off = 120.0;
+        for (k, z) in iq.iter_mut().enumerate() {
+            let ph = std::f64::consts::TAU * off * k as f64 / fs;
+            *z = *z * Complex32::new(ph.cos() as f32, ph.sin() as f32) + Complex32::new(sigma * g(), sigma * g());
+        }
+        let mut rx = Receiver::with_spec(spec, fs, rs, 0.0);
+        let mut out = Vec::new();
+        for c in iq.chunks(8192) {
+            rx.process(c, &mut out);
+        }
+        let data: Vec<_> = out.iter().filter(|p| p[1..3] != [0x1F, 0xFF]).collect();
+        if let Some(first) = data.first() {
+            let f0 = u32::from_be_bytes(first[1..5].try_into().unwrap());
+            for (i, pkt) in data.iter().enumerate() {
+                let k = f0 + i as u32;
+                assert_eq!(u32::from_be_bytes(pkt[1..5].try_into().unwrap()), k, "{mode:?}: packet {i} of {}; {:?}", data.len(), rx.stats);
+                let bad: Vec<usize> = pkt[5..].iter().enumerate().filter(|(j, b)| **b != (k as usize * 7 + j) as u8).map(|(j, _)| j + 5).collect();
+                assert!(bad.is_empty(), "{mode:?}: packet {i} of {}: {} bytes wrong, from {:?} to {:?}; {:?}", data.len(), bad.len(), bad.first(), bad.last(), rx.stats);
+            }
+        }
+        (rx.stats, data.len())
+    }
+
+    #[test]
+    fn long_frames_qpsk_1_2() {
+        let (s, n) = long_link(super::super::fpga_tx::LongMode::Qpsk12, 3.0, 22);
+        assert!(s.locked && (s.freq_hz - 120.0).abs() < 5.0, "{s:?}");
+        // 21.4 packets a frame; all but the first frame or two.
+        assert!(n >= 19 * 21 && s.ldpc_fail == 0, "{n} packets, {s:?}");
+    }
+
+    #[test]
+    fn long_frames_qpsk_3_4() {
+        let (s, n) = long_link(super::super::fpga_tx::LongMode::Qpsk34, 6.5, 22);
+        assert!(s.locked, "{s:?}");
+        // 32.1 packets a frame; all but the first frame or two.
+        assert!(n >= 19 * 32 && s.ldpc_fail == 0, "{n} packets, {s:?}");
+    }
+
+    #[test]
+    fn long_frames_8psk_3_4() {
+        let (s, n) = long_link(super::super::fpga_tx::LongMode::Psk8_34, 10.0, 22);
+        assert!(s.locked, "{s:?}");
+        // 32.1 packets a frame; all but the first frame or two.
+        assert!(n >= 19 * 32 && s.ldpc_fail == 0, "{n} packets, {s:?}");
+    }
+
     use super::*;
     use crate::dvbs2::{Modulator, Rate};
 
