@@ -275,6 +275,24 @@ pub fn file_cli(args: &[String]) -> Result<(), String> {
         let big = llr.iter().fold(0f32, |m, v| m.max(v.abs()));
         eprintln!("{name:>8}: {ok} decoded, failed {:?} (max |LLR| {big:.1})", &fails[..fails.len().min(12)]);
     }
+    // The phi decoder under iteration caps, and what each frame needed.
+    let mut dec = Decoder::new(rate);
+    let mut bits = vec![0u8; NLDPC];
+    let mut need = Vec::new();
+    for f in llr.chunks_exact(NLDPC) {
+        need.push(dec.decode(f, &mut bits));
+    }
+    let n = need.len();
+    let mut line = String::from("     cap:");
+    for cap in [50usize, 30, 20, 12, 8] {
+        line += &format!("  {cap}: {}/{n}", need.iter().filter(|x| x.is_some_and(|i| i <= cap)).count());
+    }
+    eprintln!("{line}");
+    let mut its: Vec<usize> = need.iter().flatten().copied().collect();
+    its.sort();
+    if !its.is_empty() {
+        eprintln!("     iterations when decoded: median {}, 90 % {}, max {}", its[its.len() / 2], its[its.len() * 9 / 10], its[its.len() - 1]);
+    }
     Ok(())
 }
 
@@ -295,6 +313,7 @@ pub fn helper_cli(args: &[String]) -> Result<(), String> {
         2 => Rate::R1_3,
         4 => Rate::R1_2,
         6 => Rate::R2_3,
+        7 => Rate::R3_4,
         m => return Err(format!("modcod {m} not supported")),
     };
     let mut dec = Decoder::new(rate);
@@ -431,7 +450,7 @@ mod tests {
     #[test]
     #[ignore]
     fn fer_sweep() {
-        for rate in [Rate::R1_4, Rate::R1_3, Rate::R1_2, Rate::R2_3] {
+        for rate in [Rate::R1_4, Rate::R1_3, Rate::R1_2, Rate::R2_3, Rate::R3_4] {
           for (ms, ph) in [(false, false), (false, true), (true, false)] {
             let fec = Fec::new(rate);
             let mut dec = Decoder::new(rate);
@@ -476,7 +495,7 @@ mod tests {
     #[test]
     #[ignore]
     fn decoder_speed() {
-        for (rate, esn0) in [(Rate::R1_4, -0.5f32), (Rate::R1_3, 0.5), (Rate::R1_2, 2.5), (Rate::R2_3, 5.5)] {
+        for (rate, esn0) in [(Rate::R1_4, -0.5f32), (Rate::R1_3, 0.5), (Rate::R1_2, 2.5), (Rate::R2_3, 5.5), (Rate::R3_4, 6.5)] {
             let fec = Fec::new(rate);
             let sigma = (10f32.powf(-(esn0 - 3.0) / 10.0) / 2.0).sqrt();
             let mut seed = 3u64;
@@ -502,6 +521,41 @@ mod tests {
                 }
                 eprintln!("{:>4} at {esn0:+.1} dB {name:>8}: {:.2} ms a frame, {ok}/30 ok, {:.1} iterations", rate.label(), t0.elapsed().as_secs_f64() * 1e3 / 30.0, its as f64 / ok.max(1) as f64);
             }
+        }
+    }
+
+    /// What an iteration cap costs and saves near threshold (run on the A9
+    /// for the times): `-- --ignored iteration_budget --nocapture`.
+    #[test]
+    #[ignore]
+    fn iteration_budget() {
+        let rate = Rate::R1_2;
+        let fec = Fec::new(rate);
+        for esn0 in [1.0f32, 1.5, 2.0, 2.5, 3.0] {
+            let sigma = (10f32.powf(-(esn0 - 3.0) / 10.0) / 2.0).sqrt();
+            let mut seed = 7u64;
+            let frames: Vec<(Vec<u8>, Vec<f32>)> = (0..60usize)
+                .map(|f| {
+                    let bb: Vec<u8> = (0..rate.kbch() / 8).map(|i| (i * 13 + f * 5 + 9) as u8).collect();
+                    let cw = fec.encode(&bb);
+                    let llr = cw.iter().map(|&b| { let y = if b == 0 { 1.0 } else { -1.0 } + sigma * gauss(&mut seed); 2.0 * y / (sigma * sigma) }).collect();
+                    (cw, llr)
+                })
+                .collect();
+            let mut line = format!("1/2 at {esn0:+.1} dB:");
+            for cap in [50usize, 30, 20, 12] {
+                let mut dec = Decoder::new(rate);
+                dec.max_iter = cap;
+                let mut bits = vec![0u8; NLDPC];
+                let (t0, mut ok) = (std::time::Instant::now(), 0);
+                for (cw, llr) in &frames {
+                    if dec.decode(llr, &mut bits).is_some() {
+                        ok += (&bits == cw) as usize;
+                    }
+                }
+                line += &format!("  cap {cap}: {ok}/60 ok {:.1} ms", t0.elapsed().as_secs_f64() * 1e3 / 60.0);
+            }
+            eprintln!("{line}");
         }
     }
 

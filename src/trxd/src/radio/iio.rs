@@ -94,7 +94,16 @@ impl RadioControl for IioControl {
     fn set_rx_gain(&mut self, mode: GainMode, db: f64) -> Result<(), String> {
         write_attr(&self.phy, "in_voltage0_gain_control_mode", mode.iio_name())?;
         if mode == GainMode::Manual {
-            write_attr(&self.phy, "in_voltage0_hardwaregain", &format!("{db:.0}"))?;
+            // The top of the range depends on the frequency (71 dB between
+            // 1.3 and 4 GHz, less above): take the highest the chip accepts.
+            let mut g = db.round();
+            loop {
+                match write_attr(&self.phy, "in_voltage0_hardwaregain", &format!("{g:.0}")) {
+                    Ok(()) => break,
+                    Err(_) if g > db.round() - 16.0 && g > 0.0 => g -= 1.0,
+                    Err(e) => return Err(e),
+                }
+            }
         }
         self.gain = Some((mode, db));
         Ok(())
@@ -130,6 +139,13 @@ impl RadioControl for IioControl {
         self.port = n;
         let t0 = std::time::Instant::now();
         write_attr(&dbg, "initialize", "1")?;
+        // The chip comes back with the TX LO running and little attenuation:
+        // silence it before anything slow.
+        let rf = self.tx_rf.take().unwrap_or(false);
+        let _ = write_attr(&self.phy, "out_altvoltage1_TX_LO_powerdown", if rf { "0" } else { "1" });
+        if let Some(v) = self.atten.clone() {
+            let _ = write_attr(&self.phy, "out_voltage0_hardwaregain", &v);
+        }
         info!(port = n, ms = t0.elapsed().as_millis() as u64, "AD936x re-initialised on RX{n}/TX{n}");
         if let Some(xo) = xo {
             let _ = write_attr(&self.phy, "xo_correction", &xo);
@@ -151,8 +167,7 @@ impl RadioControl for IioControl {
         if let Some(v) = self.atten.clone() {
             write_attr(&self.phy, "out_voltage0_hardwaregain", &v)?;
         }
-        // The LO comes back powered: put it back as it was.
-        let rf = self.tx_rf.take().unwrap_or(false);
+        // Once more after the LO writes, which may power it up again.
         write_attr(&self.phy, "out_altvoltage1_TX_LO_powerdown", if rf { "0" } else { "1" })?;
         self.tx_rf = Some(rf);
         Ok(())

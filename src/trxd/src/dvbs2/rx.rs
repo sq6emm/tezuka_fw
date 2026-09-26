@@ -20,6 +20,8 @@ use num_complex::Complex32;
 
 use super::{BBHEADER, NLDPC, PILOT, Params, SLOT, TS_LEN, bb_scrambling, crc8, ldpc::Decoder, pl_scrambling, plheader, rrc_taps};
 
+/// Frames `/tmp/datv-dump` captures at most (about 65 kB each).
+const DUMP_FRAMES: usize = 300;
 /// Header correlation (0..1) that counts as a PLHEADER.
 const SYNC_MIN: f32 = 0.5;
 /// Frames in a row whose header is missing before searching again.
@@ -100,6 +102,8 @@ pub struct Receiver {
     acq: [Complex32; 3],
     /// Frames in a row that failed to decode while tracking.
     fails: u32,
+    /// Frames in a row with an Es/N0 of noise (false lock).
+    noise_frames: u32,
     // FEC: inline (tests, CLI) or on a thread of its own (trxd).
     fec: FecMode,
     llr: Vec<f32>,
@@ -135,6 +139,7 @@ fn hopeless_below(rate: super::Rate) -> f32 {
         super::Rate::R1_3 => -3.5,
         super::Rate::R1_2 => -2.0,
         super::Rate::R2_3 => 0.5,
+        super::Rate::R3_4 => 1.5,
     }
 }
 
@@ -230,12 +235,28 @@ impl Receiver {
             frames_locked: 0,
             acq: [Complex32::default(); 3],
             fails: 0,
+            noise_frames: 0,
             fec: FecMode::Inline(Fec::new(p)),
             llr: vec![0.0; NLDPC],
             stats: Stats::default(),
             constellation: Vec::new(),
             constellation_seq: 0,
         }
+    }
+
+    /// Input already matched-filtered and decimated (the FPGA DDC, see
+    /// [`super::ddc`]): `fs` may be any rate of about 2 samples per symbol
+    /// or more, not necessarily a whole multiple of `rs`. Only the AFC's
+    /// mixer runs here.
+    pub fn new_prefiltered(p: Params, fs: f64, rs: f64, center_hz: f64) -> Self {
+        let mut r = Receiver::new(p, fs, rs, center_hz);
+        r.rrc = vec![1.0];
+        r.hist = vec![Complex32::default(); 2];
+        r.hpos = 0;
+        r.decim = 1;
+        r.omega = fs / rs;
+        r.omega_nom = fs / rs;
+        r
     }
 
     /// The signal moved in the input (the LO was retuned). The carrier error
@@ -575,6 +596,16 @@ impl Receiver {
         // Far below what this rate decodes (no signal, carrier wrong): the
         // decoder would only burn CPU. It counts as a failure.
         let hopeless = self.stats.esn0_db < hopeless_below(self.p.rate);
+        // Far below anything decodable, twice: the "lock" was a chance
+        // header match on noise. Let go (the caller sees `missed`).
+        if self.stats.esn0_db < hopeless_below(self.p.rate) - 6.0 {
+            self.noise_frames += 1;
+            if self.noise_frames >= 2 {
+                self.missed = LOST_AFTER;
+            }
+        } else {
+            self.noise_frames = 0;
+        }
         let fails = match &mut self.fec {
             FecMode::Inline(f) => {
                 // Debug: DVBS2_DUMP_LLR=<file> appends each frame's LLRs (f32 LE).
@@ -693,16 +724,35 @@ pub struct RxThread {
     /// Blocks dropped because the thread was behind (CPU too slow).
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     started: std::time::Instant,
+    /// Receiving through the FPGA DDC: the signal's offset from the LO
+    /// (f64 bits) for the DDC's NCO; the stream IQ is not used.
+    fpga_center: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+}
+
+/// The receiver's statistics and constellation out to the shared state.
+fn publish(r: &Receiver, sh: &std::sync::Mutex<RxShared>, seen: &mut u64) {
+    let mut s = sh.lock().unwrap();
+    s.stats = r.stats;
+    // The constellation, for the browser: [8][re, im as i8]...
+    if r.constellation_seq != *seen {
+        *seen = r.constellation_seq;
+        let mut m = Vec::with_capacity(1 + 2 * r.constellation.len());
+        m.push(8u8);
+        m.extend(r.constellation.iter().flat_map(|p| [p[0] as u8, p[1] as u8]));
+        s.msgs.push_back(m);
+    }
 }
 
 impl RxThread {
     pub fn start(p: Params, fs: f64, sr: f64, center_hz: f64) -> Self {
         use std::sync::{Arc, Mutex, atomic::AtomicU32, atomic::Ordering};
         let (tx, rx) = crossbeam_channel::bounded::<(Vec<Complex32>, f64)>(64);
-        // Slack between demodulator and decoder: about 2 s at 64 kS/s absorbs
-        // bursts of hard frames near the threshold (4 was too few over the
-        // air); beyond it whole frames are skipped and timing stays intact.
-        let (ftx, frx) = crossbeam_channel::bounded::<Vec<f32>>(16);
+        // Slack between demodulator and decoder: about 6 s at 64 kS/s. The
+        // decoder needs ~30 % of a core on average, but on the busy A9 it
+        // gets none for a while now and then; 16 frames overflowed over the
+        // air (a quarter of the frames lost as "busy" that would all have
+        // decoded). Beyond it whole frames are skipped and timing stays intact.
+        let (ftx, frx) = crossbeam_channel::bounded::<Vec<f32>>(48);
         let fails = Arc::new(AtomicU32::new(0));
         let shared = Arc::new(Mutex::new(RxShared::default()));
         let fec_stats = Arc::new(Mutex::new(Stats::default()));
@@ -710,14 +760,38 @@ impl RxThread {
         std::thread::Builder::new()
             .name("datv-fec".into())
             .spawn(move || {
+                // Ahead of the web server and scopes, behind the engine (-10).
+                crate::stream::thread_nice(-5);
                 let mut fec = Fec::new(p);
                 let mut dmx = super::ts::Demux::default();
                 let (mut ts, mut msgs) = (Vec::new(), Vec::new());
                 let mut st = Stats::default();
-                for llr in frx {
+                let mut dumped = 0usize;
+                for llr in frx.iter() {
                     if llr.is_empty() {
                         fec.lost();
                         continue;
+                    }
+                    // Near the threshold every frame runs long, and the ones
+                    // that will fail run longest: with frames waiting, give
+                    // each fewer iterations rather than drop the next ones
+                    // unread. 20 costs nothing measurable at 1/2 (ldpc.rs
+                    // iteration_budget), 12 a few frames at the very edge.
+                    fec.dec.max_iter = match frx.len() {
+                        0..=1 => 50,
+                        2..=7 => 20,
+                        _ => 12,
+                    };
+                    // Debug on a board: `touch /tmp/datv-dump` appends each
+                    // frame's LLRs (f32 LE, 16200 a frame) to
+                    // /tmp/datv-llr.f32, up to DUMP_FRAMES; remove it to stop.
+                    if dumped < DUMP_FRAMES && std::path::Path::new("/tmp/datv-dump").exists() {
+                        use std::io::Write;
+                        if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/datv-llr.f32") {
+                            let b: Vec<u8> = llr.iter().flat_map(|v| v.to_le_bytes()).collect();
+                            let _ = fh.write_all(&b);
+                            dumped += 1;
+                        }
                     }
                     if fec.frame(&llr, &mut st, &mut ts) {
                         fl.store(0, Ordering::Relaxed);
@@ -736,34 +810,76 @@ impl RxThread {
             })
             .expect("spawn datv-fec");
         let sh = shared.clone();
+        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // The FPGA front end when the bitstream has it and the rate suits it:
+        // the DDC hands over matched-filtered samples at 2 per symbol.
+        let fpga = super::fpga::available() && super::ddc::symbol_rate_ok(super::fpga::FS_IN, sr);
+        let fpga_center = fpga.then(|| Arc::new(std::sync::atomic::AtomicU64::new(center_hz.to_bits())));
+        let (fc, dr) = (fpga_center.clone(), dropped.clone());
         std::thread::Builder::new()
             .name("datv-rx".into())
             .spawn(move || {
-                let mut r = Receiver::new(p, fs, sr, center_hz);
-                r.fec = FecMode::Thread { tx: ftx, fails };
+                crate::stream::thread_nice(-5);
                 let mut none = Vec::new();
                 let mut seen = 0;
-                for (iq, center) in rx {
-                    r.set_center(center);
-                    r.process(&iq, &mut none);
-                    let mut s = sh.lock().unwrap();
-                    s.stats = r.stats;
-                    // The constellation, for the browser: [8][re, im as i8]...
-                    if r.constellation_seq != seen {
-                        seen = r.constellation_seq;
-                        let mut m = Vec::with_capacity(1 + 2 * r.constellation.len());
-                        m.push(8u8);
-                        m.extend(r.constellation.iter().flat_map(|p| [p[0] as u8, p[1] as u8]));
-                        s.msgs.push_back(m);
+                let Some(fc) = fc else {
+                    let mut r = Receiver::new(p, fs, sr, center_hz);
+                    r.fec = FecMode::Thread { tx: ftx, fails };
+                    for (iq, center) in rx {
+                        r.set_center(center);
+                        r.process(&iq, &mut none);
+                        publish(&r, &sh, &mut seen);
+                    }
+                    return;
+                };
+                let mut fe = match super::fpga::FrontEnd::start(sr, p.rolloff, center_hz) {
+                    Ok(fe) => fe,
+                    Err(e) => {
+                        tracing::warn!("DATV: FPGA front end: {e}");
+                        return;
+                    }
+                };
+                tracing::info!(fs = fe.fs_out(), "DATV receive through the FPGA DDC");
+                let mut r = Receiver::new_prefiltered(p, fe.fs_out(), sr, 0.0);
+                r.fec = FecMode::Thread { tx: ftx, fails };
+                let mut buf = Vec::new();
+                let mut reported = false;
+                loop {
+                    // Until the RxThread is dropped (its sender goes).
+                    match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                        _ => {}
+                    }
+                    fe.set_center(f64::from_bits(fc.load(Ordering::Relaxed)));
+                    buf.clear();
+                    fe.read(&mut buf);
+                    if !reported && fe.dropped() {
+                        reported = true;
+                        dr.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!("DATV: the FPGA recorder dropped samples");
+                    }
+                    if !buf.is_empty() {
+                        r.process(&buf, &mut none);
+                        publish(&r, &sh, &mut seen);
                     }
                 }
             })
             .expect("spawn datv-rx");
-        RxThread { tx, shared, fec_stats, params: p, sr, dropped: Default::default(), started: std::time::Instant::now() }
+        RxThread { tx, shared, fec_stats, params: p, sr, dropped, started: std::time::Instant::now(), fpga_center }
+    }
+
+    /// Receiving through the FPGA front end.
+    pub fn uses_fpga(&self) -> bool {
+        self.fpga_center.is_some()
     }
 
     /// A block of stream IQ; the signal sits `center_hz` from its centre.
+    /// With the FPGA front end only the centre matters (the DDC's NCO).
     pub fn feed(&self, iq: &[Complex32], center_hz: f64) {
+        if let Some(c) = &self.fpga_center {
+            c.store(center_hz.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         if self.tx.try_send((iq.to_vec(), center_hz)).is_err() {
             self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }

@@ -17,10 +17,15 @@ use crate::radio::{RxStream, TxStream};
 /// dropped block, while a late decode is only late. Needs root; elsewhere
 /// (the simulator on a PC) it quietly stays at the default.
 pub fn realtime_thread() {
+    thread_nice(-10);
+}
+
+/// Set the calling thread's nice value (lower runs first).
+pub fn thread_nice(nice: i32) {
     // SAFETY: setpriority on our own thread id, no pointers involved.
     unsafe {
         let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
-        libc::setpriority(libc::PRIO_PROCESS, tid, -10);
+        libc::setpriority(libc::PRIO_PROCESS, tid, nice);
     }
 }
 

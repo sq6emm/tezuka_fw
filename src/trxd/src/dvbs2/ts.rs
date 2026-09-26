@@ -47,8 +47,11 @@ impl Profile {
             Profile { width: 160, height: 120, fps: 2.0, audio_bps: 6_000.0, audio_per_pes: 40, psi_every_s: 2.0 }
         } else if ts_rate < 80_000.0 {
             Profile { width: 320, height: 240, fps: 5.0, audio_bps: 12_000.0, audio_per_pes: 10, psi_every_s: 1.0 }
-        } else {
+        } else if ts_rate < 200_000.0 {
             Profile { width: 320, height: 240, fps: 10.0, audio_bps: 16_000.0, audio_per_pes: 10, psi_every_s: 1.0 }
+        } else {
+            // 192 kS/s and up at 2/3-3/4 (FPGA front end): 240-360 kbit/s.
+            Profile { width: 640, height: 480, fps: 10.0, audio_bps: 24_000.0, audio_per_pes: 10, psi_every_s: 1.0 }
         }
     }
 
@@ -543,7 +546,7 @@ impl Demux {
 /// on the mux's own clock and write the constant-rate TS, 2 s past the end.
 pub fn mux_cli(input: &str, output: &str, rest: &[String]) -> Result<(), String> {
     let sr: f64 = rest.first().ok_or("symbol rate")?.parse().map_err(|_| "symbol rate: a number")?;
-    let rate = rest.get(1).map_or(Some(super::Rate::R1_2), |s| super::Rate::parse(s)).ok_or("rate: 1/4, 1/3, 1/2 or 2/3")?;
+    let rate = rest.get(1).map_or(Some(super::Rate::R1_2), |s| super::Rate::parse(s)).ok_or("rate: 1/4, 1/3, 1/2, 2/3 or 3/4")?;
     let p = super::Params { rate, pilots: rest.iter().any(|s| s == "pilots"), rolloff: 0.35 };
     let raw = std::fs::read(input).map_err(|e| format!("{input}: {e}"))?;
     let mut msgs = Vec::new();

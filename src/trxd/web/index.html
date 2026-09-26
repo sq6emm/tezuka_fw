@@ -322,11 +322,11 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <div class="row datv-only">
         <select id="datv-sr" title="Symbol rate: lower is narrower and more sensitive">
           <option value="32000">32 kS/s</option><option value="48000">48 kS/s</option>
-          <option value="64000" selected>64 kS/s</option><option value="96000">96 kS/s</option><option value="128000">128 kS/s</option>
+          <option value="64000" selected>64 kS/s</option><option value="96000">96 kS/s</option><option value="128000">128 kS/s</option><option value="192000">192 kS/s</option><option value="256000">256 kS/s (receive, FPGA)</option>
         </select>
         <select id="datv-fec" title="QPSK code rate: lower is more robust, carries less">
           <option value="1/4">QPSK 1/4</option><option value="1/3">QPSK 1/3</option>
-          <option value="1/2" selected>QPSK 1/2</option><option value="2/3">QPSK 2/3</option>
+          <option value="1/2" selected>QPSK 1/2</option><option value="2/3">QPSK 2/3</option><option value="3/4">QPSK 3/4</option>
         </select>
         <label class="note"><input type="checkbox" id="datv-pilots" checked> pilots</label>
       </div>
@@ -1419,7 +1419,7 @@ window.__rc28 = RC28; // for tests
 const DATV = (() => {
   let W = 320, H = 240;
   // TS payload bits per short PLFRAME (Kbch - 80), per QPSK rate.
-  const PAYLOAD = { "1/4": 2992, "1/3": 5152, "1/2": 6952, "2/3": 10552 };
+  const PAYLOAD = { "1/4": 2992, "1/3": 5152, "1/2": 6952, "2/3": 10552, "3/4": 11632 };
   let on = false, starting = false, stream = null, venc = null, aenc = null, capNode = null, capSrc = null, timer = 0;
   let cfg = null, forceKey = false, frames = 0, sent = 0, aSamples = 0, aT0 = 0, micIn = 0, micOut = 0, micErr = "";
   const tsRate = (sr, fec, pilots) => sr * PAYLOAD[fec] / (pilots ? 8370 : 8190);
@@ -1614,7 +1614,7 @@ const DATV = (() => {
     get receiving() { return rxOn; },
     keyframe() { forceKey = true; },
     meter(d, r) {
-      if (rxOn && r) $("datv-rxstat").innerHTML = `<b>${r.locked ? "LOCK" : "searching"}</b><br>MER ${r.mer.toFixed(1)} dB · Es/N0 ${r.esn0.toFixed(1)} dB<br>carrier ${r.freq >= 0 ? "+" : ""}${r.freq} Hz<br>frames ${r.frames - r.bad}/${r.frames} · shown ${rxFrames}<br>dropped: IQ ${r.dropped}, frames ${r.busy}<br>CPU: demod ${r.demod_pct} %, FEC ${r.fec_pct} %`;
+      if (rxOn && r) $("datv-rxstat").innerHTML = `<b>${r.locked ? "LOCK" : "searching"}</b><br>MER ${r.mer.toFixed(1)} dB · Es/N0 ${r.esn0.toFixed(1)} dB<br>carrier ${r.freq >= 0 ? "+" : ""}${r.freq} Hz<br>frames ${r.frames - r.bad}/${r.frames} · shown ${rxFrames}<br>dropped: IQ ${r.dropped}, frames ${r.busy}<br>CPU: demod ${r.demod_pct} %, FEC ${r.fec_pct} %${S.st && S.st.datv_rx && S.st.datv_rx.fpga ? " · front end: FPGA" : ""}`;
       if (!on || !cfg) return;
       $("datv-stat").textContent = `${cfg.width}x${cfg.height} ${cfg.fps} fps · video ${(cfg.video_bps / 1000).toFixed(0)}k · audio ${(cfg.audio_bps / 1000).toFixed(0)}k` +
         (d ? ` · queue ${d.backlog.toFixed(1)} s · dropped ${d.dropped}` : "") + ` · sent ${(sent / 1024).toFixed(0)} KiB` +

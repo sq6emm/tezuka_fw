@@ -83,6 +83,9 @@ under the TUNE carrier to keep RRC peaks off the DAC ceiling):
 
 ## Not yet done
 
+- Higher rates (256 kS/s QPSK 3/4) with the FPGA doing the front end: see
+  `DATV-FPGA.md` (designed and simulated, not yet in a bitstream).
+
 - More than 64 kS/s QPSK 1/2 on the A9: 128 kS/s or rate 1/4 cost more
   decoding per second; measure before relying on them. Ideas if needed:
   skip the SSB demodulator while DATV receives, min-sum for rates >= 1/2,

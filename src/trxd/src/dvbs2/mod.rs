@@ -12,6 +12,8 @@
 
 // 3/4 is generated with the others but not offered (leansdr encodes it wrong).
 #[allow(dead_code)]
+pub mod ddc;
+pub mod fpga;
 mod tables;
 pub mod ldpc;
 pub mod rx;
@@ -37,6 +39,7 @@ pub enum Rate {
     R1_3,
     R1_2,
     R2_3,
+    R3_4,
 }
 
 impl Rate {
@@ -46,6 +49,7 @@ impl Rate {
             "1/3" => Rate::R1_3,
             "1/2" => Rate::R1_2,
             "2/3" => Rate::R2_3,
+            "3/4" => Rate::R3_4,
             _ => return None,
         })
     }
@@ -55,6 +59,7 @@ impl Rate {
             Rate::R1_3 => "1/3",
             Rate::R1_2 => "1/2",
             Rate::R2_3 => "2/3",
+            Rate::R3_4 => "3/4",
         }
     }
     /// MODCOD number (QPSK).
@@ -64,6 +69,7 @@ impl Rate {
             Rate::R1_3 => 2,
             Rate::R1_2 => 4,
             Rate::R2_3 => 6,
+            Rate::R3_4 => 7,
         }
     }
     /// BCH message (= BBFRAME) size, bits (Table 5b).
@@ -73,6 +79,7 @@ impl Rate {
             Rate::R1_3 => 5_232,
             Rate::R1_2 => 7_032,
             Rate::R2_3 => 10_632,
+            Rate::R3_4 => 11_712,
         }
     }
     /// LDPC message (= BCH codeword) size, bits.
@@ -85,6 +92,7 @@ impl Rate {
             Rate::R1_3 => tables::SF_1_3,
             Rate::R1_2 => tables::SF_1_2,
             Rate::R2_3 => tables::SF_2_3,
+            Rate::R3_4 => tables::SF_3_4,
         }
     }
 }
@@ -612,7 +620,7 @@ mod tests {
 
     #[test]
     fn ldpc_codewords_satisfy_every_parity_check() {
-        for rate in [Rate::R1_4, Rate::R1_3, Rate::R1_2, Rate::R2_3] {
+        for rate in [Rate::R1_4, Rate::R1_3, Rate::R1_2, Rate::R2_3, Rate::R3_4] {
             let fec = Fec::new(rate);
             let bb: Vec<u8> = (0..rate.kbch() / 8).map(|i| (i * 101 + 7) as u8).collect();
             let bits = fec.encode(&bb);

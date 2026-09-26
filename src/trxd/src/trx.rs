@@ -72,7 +72,10 @@ const DATV_AMPLITUDE: f32 = 0.5;
 /// DATV: unkey when the browser sent no video or audio for this long.
 const DATV_STARVE: Duration = Duration::from_secs(10);
 /// DATV symbol rates offered: whole samples per symbol at 384 kS/s.
-const DATV_RATES: [f64; 5] = [32_000.0, 48_000.0, 64_000.0, 96_000.0, 128_000.0];
+const DATV_RATES: [f64; 6] = [32_000.0, 48_000.0, 64_000.0, 96_000.0, 128_000.0, 192_000.0];
+/// Receive only, through the FPGA front end (the 384 kS/s stream cannot
+/// carry them, nor send them yet).
+const DATV_RATES_FPGA_RX: [f64; 1] = [256_000.0];
 /// Unkey after this long without TX audio from the keying TCI client.
 const TCI_STARVE: Duration = Duration::from_millis(1_500);
 /// CW keyer: stay keyed this long after the last element (semi break-in).
@@ -837,7 +840,7 @@ impl Trx {
     fn datv_start(&mut self, client: u64, sr: f64, rate: &str, pilots: bool) {
         use crate::dvbs2::{Modulator, Params, Rate, ts::Mux, ts::Profile};
         let Some(rate) = Rate::parse(rate) else {
-            warn!(rate, "DATV: code rate must be 1/4, 1/3, 1/2 or 2/3");
+            warn!(rate, "DATV: code rate must be 1/4, 1/3, 1/2, 2/3 or 3/4");
             return;
         };
         let sps = self.rate / sr;
@@ -873,7 +876,10 @@ impl Trx {
         self.datv_rx_stats = Default::default();
         let sps = self.rate / sr;
         match Rate::parse(rate) {
-            Some(rate) if DATV_RATES.contains(&sr) && (sps - sps.round()).abs() < 1e-9 => {
+            Some(rate)
+                if (DATV_RATES.contains(&sr) && (sps - sps.round()).abs() < 1e-9)
+                    || (DATV_RATES_FPGA_RX.contains(&sr) && crate::dvbs2::fpga::available()) =>
+            {
                 let p = Params { rate, pilots, rolloff: 0.35 };
                 info!(sr, rate = rate.label(), "DATV receive on");
                 self.datv_rx = Some(crate::dvbs2::rx::RxThread::start(p, self.rate, sr, self.rx_eff() - self.center));
@@ -1747,7 +1753,7 @@ impl Trx {
             "ports": self.settings.ports,
             "datv": self.datv_json(),
             "datv_mode": self.datv_mode,
-            "datv_rx": self.datv_rx.as_ref().map(|r| serde_json::json!({"sr": r.sr, "rate": r.params.rate.label(), "pilots": r.params.pilots})),
+            "datv_rx": self.datv_rx.as_ref().map(|r| serde_json::json!({"sr": r.sr, "rate": r.params.rate.label(), "pilots": r.params.pilots, "fpga": r.uses_fpga()})),
             "xvtr": self.xvtr.as_ref().map(|t| t.name.clone()),
             "xvtrs": self.settings.transverters,
             "cal_band": self.cal_band(),
