@@ -853,6 +853,23 @@ impl RxThread {
                     fe.set_center(f64::from_bits(fc.load(Ordering::Relaxed)));
                     buf.clear();
                     fe.read(&mut buf);
+                    // Debug on a board: `touch /tmp/datv-iq` records the DDC's
+                    // output (complex f32, 2 samples per symbol) into
+                    // /tmp/datv-iq.cf32, contiguously: the demodulator is
+                    // skipped meanwhile (it could not keep up with the ring
+                    // and a recording with holes is useless). 64 MB at most.
+                    if std::path::Path::new("/tmp/datv-iq").exists() {
+                        use std::io::Write;
+                        if !buf.is_empty() {
+                            if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/datv-iq.cf32") {
+                                if fh.metadata().map_or(0, |m| m.len()) < 64_000_000 {
+                                    let b: Vec<u8> = buf.iter().flat_map(|z| [z.re.to_le_bytes(), z.im.to_le_bytes()]).flatten().collect();
+                                    let _ = fh.write_all(&b);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if !reported && fe.dropped() {
                         reported = true;
                         dr.fetch_add(1, Ordering::Relaxed);

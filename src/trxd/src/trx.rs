@@ -145,7 +145,16 @@ struct Datv {
     sr: f64,
     profile: crate::dvbs2::ts::Profile,
     video_bps: f64,
-    modulator: crate::dvbs2::Modulator,
+    /// Software modulator (short frames at the stream rate), or None when
+    /// the FPGA transmits (`fpga`).
+    modulator: Option<crate::dvbs2::Modulator>,
+    fpga: Option<crate::dvbs2::fpga_tx::Transmitter>,
+    /// Encoder bytes not yet written (FPGA).
+    pending: Vec<u8>,
+    rate_label: String,
+    pilots: bool,
+    rolloff: f32,
+    ts_rate: f64,
     mux: crate::dvbs2::ts::Mux,
     last_media: Instant,
     buf: Vec<Complex32>,
@@ -249,7 +258,7 @@ pub struct Trx {
     tx_out: VecDeque<Complex32>,
     pace: TxPace,
     tci_last_audio: Instant,
-    tx_sink: Sender<Vec<Complex32>>,
+    tx_sink: Sender<crate::stream::TxBlock>,
     /// Speech compressor (controlled-envelope SSB) and its drive, dB.
     comp: Option<Cessb>,
     /// The band whose socket mapping was last applied (see `follow_port`).
@@ -309,7 +318,7 @@ impl Trx {
     pub fn new(
         cfg: Config,
         radio: Box<dyn RadioControl>,
-        tx_sink: Sender<Vec<Complex32>>,
+        tx_sink: Sender<crate::stream::TxBlock>,
         mqtt: Mqtt,
         web: Option<WebHandle>,
     ) -> Self {
@@ -832,20 +841,76 @@ impl Trx {
     /// has room for that, and the signal stays inside the TX passband.
     fn datv_lo_offset(&self) -> Option<f64> {
         let d = self.datv.as_ref().filter(|_| matches!(self.tx_on, Some(TxSource::Datv(_))))?;
-        let half = d.sr * (1.0 + d.modulator.params().rolloff as f64) / 2.0;
+        if d.fpga.is_some() {
+            // The FPGA's samples go to the DAC as they are: LO on the signal.
+            return Some(0.0);
+        }
+        let half = d.sr * (1.0 + d.rolloff as f64) / 2.0;
         Some((half + 10e3).min(self.rate * 0.38 - half).max(0.0))
+    }
+
+    /// Tell the browser why DATV did not start.
+    fn datv_refuse(&self, client: u64, why: &str) {
+        if let Some(w) = &self.web {
+            w.send_json_to(client, &serde_json::json!({"type": "datv_error", "msg": why}));
+        }
     }
 
     /// Start DATV for `client`: validate, build the modulator and mux, key.
     fn datv_start(&mut self, client: u64, sr: f64, rate: &str, pilots: bool) {
         use crate::dvbs2::{Modulator, Params, Rate, ts::Mux, ts::Profile};
+        use crate::dvbs2::fpga_tx::{LongMode, Transmitter};
+        if let Some(mode) = LongMode::parse(rate) {
+            // Long frames, pilots: the FPGA encoder and interpolator.
+            if !(8_000.0..=1_200_000.0).contains(&sr) {
+                warn!(sr, "DATV: symbol rate out of range for the FPGA transmitter");
+                self.datv_refuse(client, "symbol rate out of range for the FPGA transmitter");
+                return;
+            }
+            let fx = match Transmitter::start(mode, sr, 0.35) {
+                Ok(fx) => fx,
+                Err(e) => {
+                    warn!("DATV: {e}");
+                    self.datv_refuse(client, &e);
+                    return;
+                }
+            };
+            let ts_rate = mode.ts_rate(sr);
+            let profile = Profile::for_rate(ts_rate);
+            let video_bps = profile.video_budget(ts_rate);
+            self.datv = Some(Datv {
+                sr,
+                profile,
+                video_bps,
+                modulator: None,
+                fpga: Some(fx),
+                pending: Vec::new(),
+                rate_label: mode.label().into(),
+                pilots: true,
+                rolloff: 0.35,
+                ts_rate,
+                mux: Mux::new(ts_rate, &self.callsign()),
+                last_media: Instant::now(),
+                buf: Vec::new(),
+            });
+            self.key(TxSource::Datv(client));
+            if self.tx_on != Some(TxSource::Datv(client)) {
+                self.datv = None;
+                return;
+            }
+            self.retune(true);
+            info!(sr, mode = mode.label(), ts_rate = ts_rate.round(), video_bps = video_bps.round(), ?profile, "DATV on (FPGA)");
+            return;
+        }
         let Some(rate) = Rate::parse(rate) else {
             warn!(rate, "DATV: code rate must be 1/4, 1/3, 1/2, 2/3 or 3/4");
+            self.datv_refuse(client, "code rate must be 1/4, 1/3, 1/2, 2/3 or 3/4");
             return;
         };
         let sps = self.rate / sr;
         if !DATV_RATES.contains(&sr) || (sps - sps.round()).abs() > 1e-9 {
             warn!(sr, stream = self.rate, "DATV: symbol rate not offered at this stream rate");
+            self.datv_refuse(client, "this symbol rate needs a long-frame mode (FPGA transmitter)");
             return;
         }
         let p = Params { rate, pilots, rolloff: 0.35 };
@@ -856,7 +921,13 @@ impl Trx {
             sr,
             profile,
             video_bps,
-            modulator: Modulator::new(p, sps.round() as usize),
+            modulator: Some(Modulator::new(p, sps.round() as usize)),
+            fpga: None,
+            pending: Vec::new(),
+            rate_label: rate.label().into(),
+            pilots,
+            rolloff: 0.35,
+            ts_rate,
             mux: Mux::new(ts_rate, &self.callsign()),
             last_media: Instant::now(),
             buf: Vec::new(),
@@ -875,6 +946,13 @@ impl Trx {
         self.datv_rx = None;
         self.datv_rx_stats = Default::default();
         let sps = self.rate / sr;
+        // Long frames: no receiver for them in trxd yet; the FPGA front end still
+        // runs (capture with `touch /tmp/datv-iq`), decoding as 1/2 short fails.
+        let long = crate::dvbs2::fpga_tx::LongMode::parse(rate).is_some();
+        if long {
+            warn!(rate, "DATV receive: long frames are not decoded yet (front end and capture only)");
+        }
+        let rate = if long { "1/2" } else { rate };
         match Rate::parse(rate) {
             Some(rate)
                 if (DATV_RATES.contains(&sr) && (sps - sps.round()).abs() < 1e-9)
@@ -905,8 +983,7 @@ impl Trx {
     fn datv_json(&self) -> serde_json::Value {
         match &self.datv {
             Some(d) => {
-                let p = d.modulator.params();
-                serde_json::json!({"sr": d.sr, "rate": p.rate.label(), "pilots": p.pilots, "ts_rate": p.ts_rate(d.sr).round(),
+                serde_json::json!({"sr": d.sr, "rate": d.rate_label, "pilots": d.pilots, "ts_rate": d.ts_rate.round(), "fpga": d.fpga.is_some(),
                     "video_bps": d.video_bps.round(), "audio_bps": d.profile.audio_bps, "fps": d.profile.fps,
                     "width": d.profile.width, "height": d.profile.height})
             }
@@ -1508,17 +1585,34 @@ impl Trx {
                             w.send_json_to(client, &serde_json::json!({"type": "datv_key"}));
                         }
                     }
-                    // Straight at the stream rate: no DUC, only the offset from the LO.
-                    d.buf.resize(self.block, Complex32::default());
-                    let (m, x) = (&mut d.modulator, &mut d.mux);
-                    m.fill(&mut d.buf, &mut || x.next());
-                    let g = self.drive * DATV_AMPLITUDE;
-                    for z in d.buf.iter_mut() {
-                        *z *= g;
+                    if let Some(fx) = &mut d.fpga {
+                        // Encoder bytes as fast as the DMA takes them: the
+                        // writer blocks on it, so a few blocks queued is all
+                        // the pacing needed (the encoder runs at the symbol rate).
+                        let bytes = self.block * 4;
+                        while self.tx_sink.len() < 3 {
+                            while d.pending.len() < bytes {
+                                let x = &mut d.mux;
+                                fx.frame(0, &mut || x.next(), &mut d.pending);
+                            }
+                            let blk: Vec<u8> = d.pending.drain(..bytes).collect();
+                            if self.tx_sink.try_send(crate::stream::TxBlock::Raw(blk)).is_err() {
+                                break;
+                            }
+                        }
+                    } else if let Some(m) = &mut d.modulator {
+                        // Straight at the stream rate: no DUC, only the offset from the LO.
+                        d.buf.resize(self.block, Complex32::default());
+                        let x = &mut d.mux;
+                        m.fill(&mut d.buf, &mut || x.next());
+                        let g = self.drive * DATV_AMPLITUDE;
+                        for z in d.buf.iter_mut() {
+                            *z *= g;
+                        }
+                        let mut mixed = Vec::with_capacity(d.buf.len());
+                        self.tx_nco.mix(&d.buf, &mut mixed);
+                        self.tx_out.extend(mixed);
                     }
-                    let mut mixed = Vec::with_capacity(d.buf.len());
-                    self.tx_nco.mix(&d.buf, &mut mixed);
-                    self.tx_out.extend(mixed);
                     if d.last_media.elapsed() > DATV_STARVE {
                         warn!("DATV: nothing from the browser for {} s; unkeying", DATV_STARVE.as_secs());
                         starved = true;
@@ -1606,6 +1700,11 @@ impl Trx {
             }
         }
 
+        // The FPGA transmits DATV from the encoder bytes queued above: no IQ.
+        if matches!(self.tx_on, Some(TxSource::Datv(_))) && self.datv.as_ref().is_some_and(|d| d.fpga.is_some()) {
+            return;
+        }
+
         // CESSB for SSB voice only: never on data (it would distort the
         // digital signal), CW, AM/FM or the tune carrier.
         let ssb = matches!(self.mode, Mode::Usb | Mode::Lsb) && !self.datv_mode;
@@ -1645,7 +1744,7 @@ impl Trx {
                 *z = z.conj();
             }
         }
-        if self.tx_sink.try_send(block).is_err() {
+        if self.tx_sink.try_send(crate::stream::TxBlock::Iq(block)).is_err() {
             debug!("TX queue full");
         }
     }

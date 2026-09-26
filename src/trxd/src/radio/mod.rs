@@ -53,6 +53,11 @@ pub trait RxStream: Send {
 pub trait TxStream: Send {
     /// Queue `iq` for transmission, blocking while the DAC queue is full.
     fn write(&mut self, iq: &[Complex32]) -> Result<(), String>;
+    /// Bytes straight into the DAC DMA buffer (DATV in the FPGA: the
+    /// encoder's input), blocking likewise.
+    fn write_raw(&mut self, _bytes: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub struct Radio {

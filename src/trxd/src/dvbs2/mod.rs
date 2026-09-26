@@ -14,6 +14,7 @@
 #[allow(dead_code)]
 pub mod ddc;
 pub mod fpga;
+pub mod fpga_tx;
 mod tables;
 pub mod ldpc;
 pub mod rx;
@@ -120,7 +121,7 @@ impl Params {
     pub fn ts_rate(&self, symbol_rate: f64) -> f64 {
         symbol_rate * self.payload_bits() as f64 / self.frame_symbols() as f64
     }
-    fn rolloff_code(&self) -> u8 {
+    pub(crate) fn rolloff_code(&self) -> u8 {
         if self.rolloff > 0.3 {
             0
         } else if self.rolloff > 0.225 {
@@ -148,7 +149,7 @@ fn crc8(data: &[u8]) -> u8 {
 /// Packs TS packets into BBFRAMEs (5.1): packetized TS, single stream, CCM.
 /// A packet may straddle two frames (SYNCD says where the first whole one
 /// starts); each sync byte is replaced by the CRC-8 of the packet before it.
-struct Framer {
+pub(crate) struct Framer {
     /// The unsent tail of the last packet (its first byte already replaced).
     rest: Vec<u8>,
     /// CRC-8 of the last packet taken, for the next one's sync byte.
@@ -156,17 +157,21 @@ struct Framer {
 }
 
 impl Framer {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Framer { rest: Vec::new(), crc: 0 }
     }
 
     /// One BBFRAME of `p.rate.kbch() / 8` bytes.
     fn frame(&mut self, p: &Params, next: &mut dyn FnMut() -> [u8; TS_LEN]) -> Vec<u8> {
-        let len = p.rate.kbch() / 8;
+        self.frame_bytes(p.rate.kbch() / 8, p.rolloff_code(), next)
+    }
+
+    /// One BBFRAME of `len` bytes (Kbch / 8, any frame size and rate).
+    pub(crate) fn frame_bytes(&mut self, len: usize, rolloff_code: u8, next: &mut dyn FnMut() -> [u8; TS_LEN]) -> Vec<u8> {
         let mut f = Vec::with_capacity(len);
         let dfl = (len - BBHEADER) * 8;
         let syncd = self.rest.len() * 8;
-        f.push(0xC0 | 0x20 | 0x10 | p.rolloff_code()); // TS, SIS, CCM, roll-off
+        f.push(0xC0 | 0x20 | 0x10 | rolloff_code); // TS, SIS, CCM, roll-off
         f.push(0); // MATYPE-2
         f.extend_from_slice(&((TS_LEN * 8) as u16).to_be_bytes()); // UPL
         f.extend_from_slice(&(dfl as u16).to_be_bytes());

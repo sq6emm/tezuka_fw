@@ -147,19 +147,38 @@ Symbol rates:
   symbol, RX through the DDC.
 - 256 kS/s, receive only, needs the DDC.
 
-## Transmit at 256 kS/s (not started)
+## Transmit in the FPGA (done 2026-09-26)
 
-The software modulator is cheap (Libre 2 sent 64 kS/s at 16-36 % of a
-core), but 256 kS/s does not fit the TX side of the 384 kS/s stream either.
-Options:
-- Bypass the DAC's x8 interpolator only while DATV transmits
-  (`0x790240BC` bit 0 is separate from the RX bit) and write 3.072 MS/s
-  (12 samples/symbol, integer).
-  - Costs about 8x the TX DMA and modulator work. The RRC polyphase at
-    12 sps is roughly 3M x 24 MAC/s; NEON could make that affordable.
-  - trxd paces TX by RX blocks, so a DATV TX block would be 8x the RX block.
-- F5OEO's DVB-S2 encoder, already in the maia-sdr checkout (`dvb_fpga`, the
-  `modulator` IP) from the original Maia/tezuka: TS in by DMA, the
-  modulated signal to the DAC at the full rate. The software modulator
-  (bit-exact against leandvbtx) and the receiver above can check it.
-Measure the first before building the second.
+Long frames with pilots, QPSK 1/2 (MODCOD 4), QPSK 3/4 (7), 8PSK 3/4 (14),
+any symbol rate from 8 kS/s to 1.2 MS/s (UI: 250, 256, 333, 500 kS/s):
+
+```text
+DAC DMA -> datv_split --(DAC GPIO bit 1)--> async FIFO -> ORI dvb_fpga encoder
+  (F5OEO's in-band config: 0xB8, config byte = 0x20 | MODCOD, BBFRAME)
+  -> datv_tx (maia_hdl/arb_interp.py: 16-symbol RRC, 256 phases, any rate)
+  -> async FIFO -> datv_merge (in place of the x8 interpolator) -> XO NCO -> DAC
+```
+
+- trxd (`src/dvbs2/fpga_tx.rs`) builds the BBFRAMEs and writes them into
+  the IIO TX buffer as raw bytes (`TxBlock::Raw`). The encoder's pace sets
+  the rate, and the LO sits on the signal.
+- Registers: datv_tx at 0x43C20000 (step, RRC table, id "DTX1"); encoder at
+  0x43C30000.
+- The encoder packs Q in bits 31:16 and I in 15:0. Reading it the other way
+  round inverted every second header symbol and garbled all the data.
+- Interpolator: bit-exact against its model (test_arb_interp.py). At
+  250 kS/s from 3.072 MS/s: MER 38.6 dB, out-of-band -48 dB.
+- Over the air, verified with an independent checker
+  (`/data/claude/datv-ref/harness/verify_s2_long.py`, first validated on
+  leandvbtx: 0 parity errors):
+  - Libre 1 sending and recording itself through the DDC, 256 kS/s, QPSK
+    1/2 long: 32/32 frames with every LDPC parity bit and the BBHEADER
+    CRC right, MER 36-37 dB.
+  - The TS carries service SQ6EMM / SQTRX with H.264 and Opus.
+- Not checked on air yet: QPSK 3/4 and 8PSK 3/4 (same encoder path), and
+  exactly 250 kS/s (the DDC needs whole ratios; the interpolator is
+  verified in simulation).
+- Libre 2 to Libre 1 at 256 kS/s arrives at about 2 dB MER: 6 dB below the
+  64 kS/s link, around the QPSK 1/2 threshold.
+
+Receive of long frames needs the FPGA LDPC decoder (next).

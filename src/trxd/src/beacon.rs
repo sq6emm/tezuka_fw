@@ -233,7 +233,7 @@ struct BeaconTxState<'a> {
     time_synced: bool,
 }
 
-pub fn run_tx(cfg: Config, mut radio: Box<dyn RadioControl>, rx: Receiver<RxBlock>, tx_sink: Sender<Vec<Complex32>>, mqtt: Mqtt) {
+pub fn run_tx(cfg: Config, mut radio: Box<dyn RadioControl>, rx: Receiver<RxBlock>, tx_sink: Sender<crate::stream::TxBlock>, mqtt: Mqtt) {
     let rate = radio.stream_rate();
     let block = cfg.radio.buffer_samples;
     let lo = cfg.beacon.freq_hz - cfg.radio.lo_offset_hz;
@@ -313,7 +313,7 @@ pub fn run_tx(cfg: Config, mut radio: Box<dyn RadioControl>, rx: Receiver<RxBloc
         }
         let mut out = vec![Complex32::default(); block];
         synth.render(&mut out);
-        if tx_sink.send(out).is_err() {
+        if tx_sink.send(crate::stream::TxBlock::Iq(out)).is_err() {
             break;
         }
         for (name, payload) in mqtt.poll_cmds() {
@@ -379,7 +379,7 @@ pub fn measure_carrier(audio: &[f32], expect_hz: f64, search_hz: f64) -> Option<
     Some((freq, snr, level))
 }
 
-pub fn run_rx(cfg: Config, mut radio: Box<dyn RadioControl>, rx: Receiver<RxBlock>, tx_sink: Sender<Vec<Complex32>>, mqtt: Mqtt) {
+pub fn run_rx(cfg: Config, mut radio: Box<dyn RadioControl>, rx: Receiver<RxBlock>, tx_sink: Sender<crate::stream::TxBlock>, mqtt: Mqtt) {
     let rate = radio.stream_rate();
     let br = &cfg.beacon_rx;
     let dial = br.freq_hz - br.audio_offset_hz;
@@ -409,7 +409,7 @@ pub fn run_rx(cfg: Config, mut radio: Box<dyn RadioControl>, rx: Receiver<RxBloc
     let mut last_state = Instant::now() - Duration::from_secs(60);
     for b in rx {
         // Keep the DAC fed with silence (TX RF is off).
-        let _ = tx_sink.try_send(silence.clone());
+        let _ = tx_sink.try_send(crate::stream::TxBlock::Iq(silence.clone()));
         chan.clear();
         ddc.process(&b.iq, &mut chan);
         filtered.clear();

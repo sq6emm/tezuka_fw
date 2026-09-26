@@ -133,8 +133,15 @@ pub fn spawn_rx(mut rx: Box<dyn RxStream>, rate: f64, block: usize) -> Receiver<
 /// transmit latency, in blocks, and the jitter margin it buys.
 pub const TX_PREFILL_BLOCKS: usize = 2;
 
-pub fn spawn_tx(mut tx: Box<dyn TxStream>, block: usize) -> Sender<Vec<Complex32>> {
-    let (send, blocks) = bounded::<Vec<Complex32>>(8);
+/// What goes to the DAC DMA: IQ samples, or (DATV in the FPGA) bytes for
+/// the DVB-S2 encoder, written as they are.
+pub enum TxBlock {
+    Iq(Vec<Complex32>),
+    Raw(Vec<u8>),
+}
+
+pub fn spawn_tx(mut tx: Box<dyn TxStream>, block: usize) -> Sender<TxBlock> {
+    let (send, blocks) = bounded::<TxBlock>(8);
     std::thread::Builder::new()
         .name("tx".into())
         .spawn(move || {
@@ -146,7 +153,11 @@ pub fn spawn_tx(mut tx: Box<dyn TxStream>, block: usize) -> Sender<Vec<Complex32
                 }
             }
             for b in blocks {
-                if let Err(e) = tx.write(&b) {
+                let r = match b {
+                    TxBlock::Iq(b) => tx.write(&b),
+                    TxBlock::Raw(b) => tx.write_raw(&b),
+                };
+                if let Err(e) = r {
                     error!("{e}");
                     std::thread::sleep(Duration::from_millis(100));
                 }

@@ -32,6 +32,11 @@ pub const FS_IN: f64 = 3_072_000.0;
 const PLATFORM_DATV: u32 = 0xD5;
 const DT_RING: &str = "/proc/device-tree/reserved-memory/maia_sdr_datv_ring@16100000";
 
+/// The newest front end started. A receiver being replaced lets go of the
+/// hardware after its successor has set it up (the web UI restarts the
+/// receiver on every setting): only the newest may stop the ring.
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 const REG_ID: usize = 0x00;
 const REG_VERSION: usize = 0x04;
 const REG_REC_CONTROL: usize = 0x10;
@@ -101,6 +106,7 @@ pub struct FrontEnd {
     /// Next physical address to read.
     rd: u32,
     center_hz: f64,
+    generation: u64,
 }
 
 impl FrontEnd {
@@ -121,6 +127,9 @@ impl FrontEnd {
         if !std::path::Path::new(DT_RING).exists() {
             return Err("no DATV ring reserved in the device tree".into());
         }
+        // Claim the hardware first: from here on an older front end being
+        // dropped leaves it alone.
+        let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let (mem, regs) = Self::open_regs()?;
         if !is_datv_core(&regs) {
             return Err(format!("the FPGA has no DATV ring recorder (version {:#010x})", regs.rd32(REG_VERSION)));
@@ -152,7 +161,7 @@ impl FrontEnd {
         );
         // 16-bit mode (0), start: the ring fills from RING_START.
         regs.wr32(REG_REC_CONTROL, 1);
-        Ok(FrontEnd { _mem: mem, regs, ring, design, rd: RING_START, center_hz })
+        Ok(FrontEnd { _mem: mem, regs, ring, design, rd: RING_START, center_hz, generation })
     }
 
     /// Output rate (2 samples per symbol).
@@ -204,6 +213,10 @@ impl FrontEnd {
 
 impl Drop for FrontEnd {
     fn drop(&mut self) {
+        // A newer front end owns the hardware now: leave it running.
+        if GENERATION.load(std::sync::atomic::Ordering::SeqCst) != self.generation {
+            return;
+        }
         self.regs.wr32(REG_REC_CONTROL, 1 << 1);
         let ctl = self.regs.rd32(REG_DDC_CONTROL);
         self.regs.wr32(REG_DDC_CONTROL, ctl & !(1 << 24));

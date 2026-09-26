@@ -324,6 +324,10 @@ impl TxStream for IioTx {
         };
         self.dev.write_all(bytes).map_err(|e| format!("TX write: {e}"))
     }
+
+    fn write_raw(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.dev.write_all(bytes).map_err(|e| format!("TX write: {e}"))
+    }
 }
 
 pub fn open(cfg: &RadioConfig) -> Result<Radio, String> {

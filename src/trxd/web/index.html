@@ -322,11 +322,11 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <div class="row datv-only">
         <select id="datv-sr" title="Symbol rate: lower is narrower and more sensitive">
           <option value="32000">32 kS/s</option><option value="48000">48 kS/s</option>
-          <option value="64000" selected>64 kS/s</option><option value="96000">96 kS/s</option><option value="128000">128 kS/s</option><option value="192000">192 kS/s</option><option value="256000">256 kS/s (receive, FPGA)</option>
+          <option value="64000" selected>64 kS/s</option><option value="96000">96 kS/s</option><option value="128000">128 kS/s</option><option value="192000">192 kS/s</option><option value="250000">250 kS/s (FPGA TX)</option><option value="256000">256 kS/s (FPGA)</option><option value="333000">333 kS/s (FPGA TX)</option><option value="500000">500 kS/s (FPGA TX)</option>
         </select>
         <select id="datv-fec" title="QPSK code rate: lower is more robust, carries less">
           <option value="1/4">QPSK 1/4</option><option value="1/3">QPSK 1/3</option>
-          <option value="1/2" selected>QPSK 1/2</option><option value="2/3">QPSK 2/3</option><option value="3/4">QPSK 3/4</option>
+          <option value="1/2" selected>QPSK 1/2</option><option value="2/3">QPSK 2/3</option><option value="3/4">QPSK 3/4</option><option value="L-QPSK-1/2">QPSK 1/2 long (FPGA TX)</option><option value="L-QPSK-3/4">QPSK 3/4 long (FPGA TX)</option><option value="L-8PSK-3/4">8PSK 3/4 long (FPGA TX)</option>
         </select>
         <label class="note"><input type="checkbox" id="datv-pilots" checked> pilots</label>
       </div>
@@ -533,6 +533,7 @@ function onJson(m) {
   else if (m.type === "decode") addDecode(m);
   else if (m.type === "cw") renderCw(m);
   else if (m.type === "datv_key") DATV.keyframe();
+  else if (m.type === "datv_error") DATV.refused(m.msg);
 }
 function renderCw(m) {
   const box = $("cwbox"), atEnd = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
@@ -1422,7 +1423,9 @@ const DATV = (() => {
   const PAYLOAD = { "1/4": 2992, "1/3": 5152, "1/2": 6952, "2/3": 10552, "3/4": 11632 };
   let on = false, starting = false, stream = null, venc = null, aenc = null, capNode = null, capSrc = null, timer = 0;
   let cfg = null, forceKey = false, frames = 0, sent = 0, aSamples = 0, aT0 = 0, micIn = 0, micOut = 0, micErr = "";
-  const tsRate = (sr, fec, pilots) => sr * PAYLOAD[fec] / (pilots ? 8370 : 8190);
+  // Long frames (FPGA TX): [TS bits per frame, PLFRAME symbols with pilots].
+  const LONG = { "L-QPSK-1/2": [32128, 33282], "L-QPSK-3/4": [48328, 33282], "L-8PSK-3/4": [48328, 22194] };
+  const tsRate = (sr, fec, pilots) => LONG[fec] ? sr * LONG[fec][0] / LONG[fec][1] : sr * PAYLOAD[fec] / (pilots ? 8370 : 8190);
   const settings = () => ({ sr: +$("datv-sr").value, rate: $("datv-fec").value, pilots: $("datv-pilots").checked });
   function info() {
     const { sr, rate, pilots } = settings(), f = S.st ? curFreq() : 0;
@@ -1439,7 +1442,17 @@ const DATV = (() => {
     send({ cmd: "datv_mode", on: true, ...settings() });
     audioStart().catch(() => {});   // a click: the browser allows audio now
   }
+  // Symbol rates only the FPGA transmitter reaches (not whole at 384 kS/s):
+  // there only the long-frame modes, which go through it.
+  const FPGA_ONLY_SR = [250000, 256000, 333000, 500000];
+  function limitModes() {
+    const fpgaOnly = FPGA_ONLY_SR.includes(+$("datv-sr").value);
+    for (const o of $("datv-fec").options) o.disabled = fpgaOnly && !o.value.startsWith("L-");
+    if (fpgaOnly && !$("datv-fec").value.startsWith("L-")) $("datv-fec").value = "L-QPSK-1/2";
+  }
+  let refusal = null;
   function settingsChanged() {
+    limitModes();
     info();
     // A new setting restarts the receiver (not while sending: that has its own).
     if (S.st && S.st.datv_mode && !on) send({ cmd: "datv_rx", on: true, ...settings() });
@@ -1455,9 +1468,10 @@ const DATV = (() => {
         audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
     } catch (e) { starting = false; render(); alert("Camera/microphone: " + e.message); return; }
     const v = $("datv-preview"); v.srcObject = stream; v.play().catch(() => {});
+    refusal = null;
     send({ cmd: "datv", on: true, ...settings() });
-    for (let i = 0; i < 30 && !(S.st && S.st.datv); i++) await new Promise((r) => setTimeout(r, 100));
-    if (!(S.st && S.st.datv)) { stop(false); alert("The board did not start DATV (already transmitting, TX not allowed, or a receive-only transverter)."); return; }
+    for (let i = 0; i < 30 && !(S.st && S.st.datv) && !refusal; i++) await new Promise((r) => setTimeout(r, 100));
+    if (!(S.st && S.st.datv)) { stop(false); alert("The board did not start DATV: " + (refusal || "already transmitting, TX not allowed, or a receive-only transverter") + "."); return; }
     cfg = S.st.datv; on = true; starting = false; frames = 0; sent = 0; aSamples = 0; aT0 = 0; micIn = 0; micOut = 0; micErr = "";
     W = cfg.width || 320; H = cfg.height || 240;
     try { await startVideo(); await startAudio(); }
@@ -1598,6 +1612,7 @@ const DATV = (() => {
     init() {
       $("datv-go").onclick = () => (on ? stop(true) : start());
       for (const id of ["datv-sr", "datv-fec", "datv-pilots"]) $(id).onchange = settingsChanged;
+      limitModes();
       window.addEventListener("pagehide", () => { if (on) stop(true); });
       info();
     },
@@ -1611,6 +1626,7 @@ const DATV = (() => {
       if (st.datv_mode) info();
     },
     rxVideo, rxAudio, rxConst,
+    refused(msg) { refusal = msg; },
     get receiving() { return rxOn; },
     keyframe() { forceKey = true; },
     meter(d, r) {
