@@ -237,3 +237,44 @@ Over the air (2026-09-26, Libre 2 -> Libre 1, 1255.000 MHz, 250 kS/s, Libre
 FEC there is the thread handing frames to the FPGA and waiting (LLR
 quantization and the AXI copy in and out), BCH and the TS demux.
 
+
+## Demodulator in the FPGA, step by step (2026-09-26 night)
+
+Each block has a bit-exact Rust model in trxd, used by the receiver tests,
+and an Amaranth implementation checked against vectors the model writes.
+
+```text
+DDC (2 to 2.7 samples/symbol)
+  -> symsync.py (timing recovery; trxd src/dvbs2/symsync.rs)
+  -> hdrdet.py  (SOF screening; trxd src/dvbs2/hdrdet.rs)
+  -> recorder ring: one word a symbol, header candidates in bit 16
+  -> Receiver::new_symbols_spec + process_flagged (AFC, AGC, frames,
+     carrier, LLRs) -> FPGA LDPC -> BCH -> TS
+```
+
+1. **Timing recovery (symsync).** Gardner error, Catmull-Rom cubic
+   interpolation, PI loop; integers only: positions Q.24, mu Q0.16, the
+   error normalized by the AGC's power of two, gains as shifts (kp 7, ki
+   13: about the software receiver's 0.01 / 1e-4). Sequential on one
+   multiplier, about 45 clocks a symbol at 62.5 MHz. Registers: Maia 0x38
+   datv_symsync (0 enable, 5:1 kp, 10:6 ki), 0x3C datv_omega (Q8.24). The
+   model decodes the same frames as the float receiver (3 dB QPSK 1/2 and
+   10 dB 8PSK 3/4 at 250 kS/s through the DDC model; both board
+   recordings, 90/90 frames), and it cuts the locked demodulator's CPU by
+   more than half (PC: 0.206 -> 0.087 s per 12 s of signal).
+2. **Header screening (hdrdet).** The last 26 symbols against the SOF in
+   two coherent chunks of 13, adds only (SOF symbols are (+-1 +-j)/sqrt2),
+   magnitudes as max + 3/8 min, flag when 16 num >= 12 den. 0.3-0.7 % of
+   symbols flagged on data and noise, every header of the recordings
+   flagged. Enable: datv_symsync bit 11. The receiver's unlocked search
+   evaluates its 90-symbol metric only where flagged.
+
+trxd turns them on when the bitstream has them (the omega register and the
+hdrdet bit read back) unless TRXD_NO_SYMSYNC=1 / TRXD_NO_HDRDET=1, and
+always writes datv_symsync, so an older trxd on a newer bitstream gets
+samples as before.
+
+On the boards (both flashed, firmware v0.3.21-25-g7d23 plus these; Libre 2
+-> Libre 1 over the air, 250 kS/s QPSK 1/2 long, 60 s): 422/422 frames,
+534 pictures, Libre 1 demodulator 18 % of a core and FEC 12 % (51 % and 13 %
+with TRXD_NO_SYMSYNC=1 on the same link, same MER of about 15 dB).

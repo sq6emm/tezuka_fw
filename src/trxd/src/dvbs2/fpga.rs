@@ -9,7 +9,13 @@
 //! dropped_samples); 0x18 recorder_committed_address; 0x24 ddc_coeff_addr;
 //! 0x28 ddc_coeff (0 wren, 18:1 data); 0x2C ddc_decimation (6:0, 12:7,
 //! 19:13); 0x30 ddc_frequency (27:0); 0x34 ddc_control (6:0, 12:7, 19:13
-//! operations - 1, 20/21 odd operations 1/3, 22/23 bypass 2/3, 24 enable).
+//! operations - 1, 20/21 odd operations 1/3, 22/23 bypass 2/3, 24 enable);
+//! 0x38 datv_symsync (0 enable, 5:1 kp shift, 10:6 ki shift, 11 header
+//! detector [`super::hdrdet`]: flags in the ring word's bit 16) and 0x3C
+//! datv_omega (samples per symbol, Q8.24): the timing recovery between DDC
+//! and recorder ([`super::symsync`]), in bitstreams that have it (0x3C
+//! reads back what was written; 0 otherwise). With it on, the ring holds
+//! one sample a symbol.
 //!
 //! Only a core that says it is the ring one (platform 0xD5) is touched, and
 //! only when the device tree reserves the ring: any other Maia core's
@@ -46,6 +52,8 @@ const REG_COEFF: usize = 0x28;
 const REG_DECIMATION: usize = 0x2C;
 const REG_FREQUENCY: usize = 0x30;
 const REG_DDC_CONTROL: usize = 0x34;
+const REG_SYMSYNC: usize = 0x38;
+const REG_OMEGA: usize = 0x3C;
 
 struct Mapping {
     ptr: *mut u8,
@@ -107,6 +115,10 @@ pub struct FrontEnd {
     rd: u32,
     center_hz: f64,
     generation: u64,
+    /// The ring holds symbols (the FPGA's timing recovery is on).
+    symbols: bool,
+    /// ... with header candidate flags in bit 16 (bit 0 of im).
+    flagged: bool,
 }
 
 impl FrontEnd {
@@ -159,14 +171,40 @@ impl FrontEnd {
                 | (r.bypass3 as u32) << 23
                 | 1 << 24,
         );
+        // Timing recovery in the FPGA when the bitstream has it (and it is
+        // not turned off for comparison: TRXD_NO_SYMSYNC=1). Always written:
+        // disabled, it also resets the loop.
+        let ss = super::symsync::Params::new(design.fs_out(), rs);
+        regs.wr32(REG_SYMSYNC, 0);
+        regs.wr32(REG_OMEGA, ss.omega);
+        let symbols = regs.rd32(REG_OMEGA) == ss.omega && std::env::var_os("TRXD_NO_SYMSYNC").is_none();
+        let mut flagged = false;
+        if symbols {
+            // The header detector too, if this core has it (its bit reads
+            // back) and it is not turned off (TRXD_NO_HDRDET=1).
+            let want = std::env::var_os("TRXD_NO_HDRDET").is_none();
+            regs.wr32(REG_SYMSYNC, ss.kp_shift << 1 | ss.ki_shift << 6 | (want as u32) << 11);
+            flagged = want && regs.rd32(REG_SYMSYNC) & (1 << 11) != 0;
+            regs.wr32(REG_SYMSYNC, 1 | ss.kp_shift << 1 | ss.ki_shift << 6 | (flagged as u32) << 11);
+        }
         // 16-bit mode (0), start: the ring fills from RING_START.
         regs.wr32(REG_REC_CONTROL, 1);
-        Ok(FrontEnd { _mem: mem, regs, ring, design, rd: RING_START, center_hz, generation })
+        Ok(FrontEnd { _mem: mem, regs, ring, design, rd: RING_START, center_hz, generation, symbols, flagged })
     }
 
     /// Output rate (2 samples per symbol).
     pub fn fs_out(&self) -> f64 {
         self.design.fs_out()
+    }
+
+    /// One ring sample a symbol (the FPGA recovers the timing).
+    pub fn symbols(&self) -> bool {
+        self.symbols
+    }
+
+    /// Symbols carry header candidate flags (read with [`Self::read_flagged`]).
+    pub fn flagged(&self) -> bool {
+        self.flagged
     }
 
     /// The signal moved (LO retuned): move the DDC's NCO with it.
@@ -185,21 +223,30 @@ impl FrontEnd {
     /// Everything the DMA has committed since the last call, as complex
     /// samples (full scale 1.0). Call often: the ring holds 0.5 s at 512 kS/s.
     pub fn read(&mut self, out: &mut Vec<Complex32>) {
+        self.read_inner(out, None);
+    }
+
+    /// [`Self::read`], and each word's bit 16 (the header detector's flag).
+    pub fn read_flagged(&mut self, out: &mut Vec<Complex32>, flags: &mut Vec<bool>) {
+        self.read_inner(out, Some(flags));
+    }
+
+    fn read_inner(&mut self, out: &mut Vec<Complex32>, mut flags: Option<&mut Vec<bool>>) {
         let c = self.regs.rd32(REG_REC_COMMITTED);
         if !(RING_START..RING_END).contains(&c) {
             return;
         }
         let (a, b) = (self.rd, c);
         if b >= a {
-            self.copy(a, b, out);
+            self.copy(a, b, out, flags.as_deref_mut());
         } else {
-            self.copy(a, RING_END, out);
-            self.copy(RING_START, b, out);
+            self.copy(a, RING_END, out, flags.as_deref_mut());
+            self.copy(RING_START, b, out, flags.as_deref_mut());
         }
         self.rd = c;
     }
 
-    fn copy(&self, from: u32, to: u32, out: &mut Vec<Complex32>) {
+    fn copy(&self, from: u32, to: u32, out: &mut Vec<Complex32>, mut flags: Option<&mut Vec<bool>>) {
         let (s, e) = ((from - RING_START) as usize, (to - RING_START) as usize);
         out.reserve((e - s) / 4);
         for off in (s..e).step_by(4) {
@@ -207,6 +254,9 @@ impl FrontEnd {
             // Recorder16IQ: re in the low half, im in the high half.
             let (re, im) = (w as u16 as i16, (w >> 16) as u16 as i16);
             out.push(Complex32::new(re as f32 / 32768.0, im as f32 / 32768.0));
+            if let Some(f) = flags.as_deref_mut() {
+                f.push(w & (1 << 16) != 0);
+            }
         }
     }
 }

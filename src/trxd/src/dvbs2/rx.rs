@@ -118,6 +118,12 @@ pub struct Receiver {
     pub constellation: Vec<[i8; 2]>,
     /// Frames the constellation has been taken from (to see a new one).
     pub constellation_seq: u64,
+    /// Symbols in (see [`Self::new_symbols_spec`]).
+    symbol_input: bool,
+    /// Header candidates from the FPGA ([`super::hdrdet`]), one a symbol
+    /// in step with `syms` (only when `flagged`): the search looks there only.
+    flags: Vec<bool>,
+    flagged: bool,
 }
 
 /// LDPC + BBFRAME -> TS: the expensive part, which can run on its own core.
@@ -260,7 +266,19 @@ impl Receiver {
             stats: Stats::default(),
             constellation: Vec::new(),
             constellation_seq: 0,
+            symbol_input: false,
+            flags: Vec::new(),
+            flagged: false,
         }
+    }
+
+    /// Input one sample a symbol, timing already recovered (the FPGA's
+    /// [`super::symsync`]): only the AFC's mixer and the AGC run before
+    /// frame sync.
+    pub fn new_symbols_spec(spec: FrameSpec, rs: f64, center_hz: f64) -> Self {
+        let mut r = Receiver::with_spec(spec, rs, rs, center_hz);
+        r.symbol_input = true;
+        r
     }
 
     /// Input already matched-filtered and decimated (the FPGA DDC, see
@@ -290,15 +308,40 @@ impl Receiver {
 
     /// Feed input samples; whole TS packets come out as frames complete.
     pub fn process(&mut self, iq: &[Complex32], out: &mut Vec<[u8; TS_LEN]>) {
+        self.process_flagged(iq, None, out);
+    }
+
+    /// Symbols (see [`Self::new_symbols_spec`]) with the FPGA's header
+    /// candidate flags, one per symbol.
+    pub fn process_flagged(&mut self, iq: &[Complex32], flags: Option<&[bool]>, out: &mut Vec<[u8; TS_LEN]>) {
         let t0 = std::time::Instant::now();
         let ldpc0 = self.stats.ldpc_s;
-        self.process_inner(iq, out);
+        self.process_inner(iq, flags, out);
         self.stats.other_s += t0.elapsed().as_secs_f64() - (self.stats.ldpc_s - ldpc0);
     }
 
-    fn process_inner(&mut self, iq: &[Complex32], out: &mut Vec<[u8; TS_LEN]>) {
+    fn process_inner(&mut self, iq: &[Complex32], flags: Option<&[bool]>, out: &mut Vec<[u8; TS_LEN]>) {
         let w = -std::f64::consts::TAU * (self.center_hz + self.afc_hz) / self.fs;
         let step = Complex32::new(w.cos() as f32, w.sin() as f32);
+        if self.symbol_input {
+            self.flagged = flags.is_some();
+            if let Some(f) = flags {
+                self.flags.extend_from_slice(f);
+            }
+            for &x in iq {
+                let y = x * self.nco;
+                self.nco *= step;
+                self.nco_n += 1;
+                if self.nco_n == 1024 {
+                    self.nco_n = 0;
+                    self.nco /= self.nco.norm();
+                }
+                self.agc += 0.001 * (y.norm_sqr().max(1e-20) - self.agc);
+                self.syms.push(y / self.agc.sqrt());
+            }
+            self.frames(out);
+            return;
+        }
         let n = self.rrc.len();
         for &x in iq {
             let y = x * self.nco;
@@ -375,7 +418,30 @@ impl Receiver {
     /// chunked metric) passes a loose threshold. Unlocked, this runs for
     /// every symbol: at 250 kS/s the full metric everywhere cost the A9 more
     /// than a core, the receiver fell behind the ring and never locked.
+    /// Drop the first `n` symbols (and their flags).
+    fn drain_syms(&mut self, n: usize) {
+        let n = n.min(self.syms.len());
+        self.syms.drain(..n);
+        if self.flagged {
+            let k = n.min(self.flags.len());
+            self.flags.drain(..k);
+        }
+    }
+
     fn search(&self, start: usize, end: usize) -> (usize, f32) {
+        if self.flagged {
+            let mut best = (start, 0f32);
+            let last = super::hdrdet::SOF_LEN - 1;
+            for k in start..end {
+                if self.flags.get(k + last) == Some(&true) {
+                    let m = self.header_metric(k);
+                    if m > best.1 {
+                        best = (k, m);
+                    }
+                }
+            }
+            return best;
+        }
         const SOF: usize = 30;
         // Noise gives about 0.28 +- 0.08 here, a header 0.7 at 0 dB Es/N0.
         const SOF_MIN: f32 = 0.4;
@@ -435,7 +501,7 @@ impl Receiver {
                     } else {
                         self.candidate = None;
                         let drop = end.saturating_sub(SLOT);
-                        self.syms.drain(..drop.min(self.syms.len()));
+                        self.drain_syms(drop);
                     }
                 }
                 Some(p) => {
@@ -466,11 +532,11 @@ impl Receiver {
                                 let _ = tx.try_send(Vec::new());
                             }
                         }
-                        self.syms.drain(..next);
+                        self.drain_syms(next);
                         continue;
                     }
                     // Keep the next frame at the front.
-                    self.syms.drain(..next);
+                    self.drain_syms(next);
                     self.locked_at = Some(0);
                 }
             }
@@ -507,9 +573,10 @@ impl Receiver {
         }
         // Symbol `from` to the next input sample: the buffered symbols, the
         // matched-filter samples not yet strobed, the filter's delay.
-        let t = self.syms.len().saturating_sub(from) as f64 / self.rs
-            + (self.mf.len() as f64 - self.t).max(0.0) * self.decim as f64 / self.fs
-            + (self.rrc.len() / 2) as f64 / self.fs;
+        let mut t = self.syms.len().saturating_sub(from) as f64 / self.rs;
+        if !self.symbol_input {
+            t += (self.mf.len() as f64 - self.t).max(0.0) * self.decim as f64 / self.fs + (self.rrc.len() / 2) as f64 / self.fs;
+        }
         let ph = -std::f64::consts::TAU * df * t;
         self.nco *= Complex32::new(ph.cos() as f32, ph.sin() as f32);
     }
@@ -952,8 +1019,8 @@ impl RxThread {
                 // The ring holds 0.5 s: a reader of its own drains it every
                 // few ms into a queue of seconds, so the demodulator's bursts
                 // (a whole long frame at once) cannot let the DMA lap it.
-                let (btx, brx) = crossbeam_channel::bounded::<Vec<Complex32>>(800);
-                let (ftx_fs, frx_fs) = crossbeam_channel::bounded::<f64>(1);
+                let (btx, brx) = crossbeam_channel::bounded::<(Vec<Complex32>, Option<Vec<bool>>)>(800);
+                let (ftx_fs, frx_fs) = crossbeam_channel::bounded::<(f64, bool, bool)>(1);
                 let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let (st2, dr2) = (stop.clone(), dr.clone());
                 let rolloff = p.rolloff;
@@ -968,14 +1035,18 @@ impl RxThread {
                                 return;
                             }
                         };
-                        let _ = ftx_fs.send(fe.fs_out());
+                        let _ = ftx_fs.send((fe.fs_out(), fe.symbols(), fe.flagged()));
                         let (mut reported, mut late_reported) = (false, false);
                         let mut last = std::time::Instant::now();
                         while !st2.load(Ordering::Relaxed) {
                             std::thread::sleep(std::time::Duration::from_millis(5));
                             fe.set_center(f64::from_bits(fc.load(Ordering::Relaxed)));
                             let mut buf = Vec::new();
-                            fe.read(&mut buf);
+                            let mut flags = fe.flagged().then(Vec::new);
+                            match flags.as_mut() {
+                                Some(f) => fe.read_flagged(&mut buf, f),
+                                None => fe.read(&mut buf),
+                            }
                             if !late_reported && last.elapsed() > std::time::Duration::from_millis(400) {
                                 late_reported = true;
                                 dr2.fetch_add(1, Ordering::Relaxed);
@@ -1003,18 +1074,18 @@ impl RxThread {
                                 dr2.fetch_add(1, Ordering::Relaxed);
                                 tracing::warn!("DATV: the FPGA recorder dropped samples");
                             }
-                            if !buf.is_empty() && btx.try_send(buf).is_err() {
+                            if !buf.is_empty() && btx.try_send((buf, flags)).is_err() {
                                 // The demodulator is seconds behind.
                                 dr2.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     })
                     .expect("spawn datv-ring");
-                let Ok(fs_out) = frx_fs.recv() else {
+                let Ok((fs_out, symbols, flagged)) = frx_fs.recv() else {
                     return;
                 };
-                tracing::info!(fs = fs_out, "DATV receive through the FPGA DDC");
-                let mut r = Receiver::new_prefiltered_spec(p, fs_out, sr, 0.0);
+                tracing::info!(fs = fs_out, symbols, flagged, "DATV receive through the FPGA DDC");
+                let mut r = if symbols { Receiver::new_symbols_spec(p, sr, 0.0) } else { Receiver::new_prefiltered_spec(p, fs_out, sr, 0.0) };
                 r.fec = FecMode::Thread { tx: ftx, fails };
                 'run: loop {
                     // Until the RxThread is dropped (its sender goes); the
@@ -1027,8 +1098,8 @@ impl RxThread {
                         }
                     }
                     match brx.recv_timeout(std::time::Duration::from_millis(20)) {
-                        Ok(buf) => {
-                            r.process(&buf, &mut none);
+                        Ok((buf, flags)) => {
+                            r.process_flagged(&buf, flags.as_deref(), &mut none);
                             publish(&r, &sh, &mut seen);
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}

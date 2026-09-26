@@ -407,7 +407,7 @@ pub fn to_complex(iq: &[[i16; 2]], out: &mut Vec<Complex32>) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Modulator, Params, Rate, TS_LEN, rx::Receiver};
+    use super::super::{Modulator, Params, Rate, TS_LEN, rx::Receiver, symsync::SymSync, hdrdet::HdrDet};
     use super::*;
 
     const FS: f64 = 3_072_000.0;
@@ -606,7 +606,7 @@ mod tests {
     /// Long frames (pilots) at a symbol rate that does not divide the ADC
     /// rate: pulse-shaped at 3.072 MS/s from the continuous RRC, then the
     /// DDC (fractional samples per symbol out) and the long-frame receiver.
-    fn long_link_ddc(rs: f64, mode: super::super::fpga_tx::LongMode, esn0_db: f32, frames: usize) -> (super::super::rx::Stats, usize) {
+    fn long_link_ddc(rs: f64, mode: super::super::fpga_tx::LongMode, esn0_db: f32, frames: usize, symsync: bool) -> (super::super::rx::Stats, usize) {
         use super::super::{FrameSpec, rrc_at, rx::tests::{counter_packets, long_symbols}};
         let spec = FrameSpec::long(mode);
         let mut next = counter_packets();
@@ -632,6 +632,8 @@ mod tests {
         let (center, err) = (100e3, 300.0);
         let amp = 1200.0 / (e.sqrt() + 1.0);
         let mut rx = None;
+        let mut ss: Option<SymSync> = None;
+        let mut hd = HdrDet::default();
         let d = design(FS, rs, spec.rolloff).unwrap();
         let mut ddc = DdcModel::new(&d, frequency_word(center, FS));
         let mut out = Vec::new();
@@ -653,8 +655,24 @@ mod tests {
             if adc.len() == 30_720 || k + 1 == n_out {
                 let (mut y, mut c) = (Vec::new(), Vec::new());
                 ddc.process(&adc, &mut y);
-                to_complex(&y, &mut c);
-                rx.get_or_insert_with(|| Receiver::new_prefiltered_spec(spec, d.fs_out(), rs, 0.0)).process(&c, &mut out);
+                if symsync {
+                    let ss = ss.get_or_insert_with(|| SymSync::new(super::super::symsync::Params::new(d.fs_out(), rs)));
+                    let mut sy: Vec<[i16; 2]> = y.iter().filter_map(|&x| ss.push(x)).collect();
+                    // And the header detector, flags as the ring carries them.
+                    let fl: Vec<bool> = sy
+                        .iter_mut()
+                        .map(|y| {
+                            let f = hd.push(*y);
+                            *y = HdrDet::mark(*y, f);
+                            f
+                        })
+                        .collect();
+                    to_complex(&sy, &mut c);
+                    rx.get_or_insert_with(|| Receiver::new_symbols_spec(spec, rs, 0.0)).process_flagged(&c, Some(&fl), &mut out);
+                } else {
+                    to_complex(&y, &mut c);
+                    rx.get_or_insert_with(|| Receiver::new_prefiltered_spec(spec, d.fs_out(), rs, 0.0)).process(&c, &mut out);
+                }
                 adc.clear();
             }
         }
@@ -671,13 +689,26 @@ mod tests {
     fn long_frames_at_250_ksps_through_the_ddc() {
         use super::super::fpga_tx::LongMode;
         for (mode, esn0, per_frame) in [(LongMode::Qpsk12, 3.0, 21), (LongMode::Psk8_34, 10.0, 32)] {
-            let (s, n) = long_link_ddc(250e3, mode, esn0, 22);
+            let (s, n) = long_link_ddc(250e3, mode, esn0, 22, false);
             eprintln!("{mode:?}: {n} packets {s:?}");
             assert!(s.locked && (s.freq_hz - 300.0).abs() < 10.0, "{s:?}");
             // At 3 dB the header alone gives the frequency to about 100 Hz
             // at 250 kS/s, more than half the pilots' alias spacing (169 Hz):
             // the first frames of the acquisition average may fail. From
             // there on every frame.
+            assert!(n >= 12 * per_frame && s.ldpc_fail <= 8, "{mode:?}: {n} packets, {s:?}");
+        }
+    }
+
+    /// The same through the FPGA's timing recovery and header detector
+    /// (their models) and the receiver on flagged symbols.
+    #[test]
+    fn long_frames_at_250_ksps_through_the_ddc_and_symsync() {
+        use super::super::fpga_tx::LongMode;
+        for (mode, esn0, per_frame) in [(LongMode::Qpsk12, 3.0, 21), (LongMode::Psk8_34, 10.0, 32)] {
+            let (s, n) = long_link_ddc(250e3, mode, esn0, 22, true);
+            eprintln!("{mode:?} symsync: {n} packets {s:?}");
+            assert!(s.locked && (s.freq_hz - 300.0).abs() < 10.0, "{s:?}");
             assert!(n >= 12 * per_frame && s.ldpc_fail <= 8, "{mode:?}: {n} packets, {s:?}");
         }
     }
@@ -705,16 +736,50 @@ mod tests {
         let iq: Vec<Complex32> = raw.chunks_exact(8).map(|c| Complex32::new(f32::from_le_bytes(c[..4].try_into().unwrap()), f32::from_le_bytes(c[4..].try_into().unwrap()))).collect();
         let p = iq.iter().map(|z| z.norm_sqr()).sum::<f32>() / iq.len() as f32;
         eprintln!("{} samples at {} S/s ({:.1} s), mean power {p:.3e}", iq.len(), d.fs_out(), iq.len() as f64 / d.fs_out());
-        let mut rx = Receiver::new_prefiltered_spec(FrameSpec::long(mode), d.fs_out(), rs, 0.0);
+        // DATV_SYMSYNC=1: through the timing recovery model first.
+        // DATV_HDRDET=1: and the header detector's model, flags to the receiver.
+        let hdr = std::env::var_os("DATV_HDRDET").is_some();
+        let symsync = hdr || std::env::var_os("DATV_SYMSYNC").is_some();
+        let mut hd = HdrDet::default();
+        let (mut nflags, mut nsyms) = (0usize, 0usize);
+        let mut ss = SymSync::new(super::super::symsync::Params::new(d.fs_out(), rs));
+        let mut rx = if symsync { Receiver::new_symbols_spec(FrameSpec::long(mode), rs, 0.0) } else { Receiver::new_prefiltered_spec(FrameSpec::long(mode), d.fs_out(), rs, 0.0) };
         let mut out = Vec::new();
         let t0 = std::time::Instant::now();
         let chunk: usize = std::env::var("DATV_CHUNK").map_or(16384, |v| v.parse().unwrap());
         for (k, c) in iq.chunks(chunk).enumerate() {
-            rx.process(c, &mut out);
+            if symsync {
+                let q = |v: f32| (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
+                let mut sy: Vec<[i16; 2]> = c.iter().filter_map(|z| ss.push([q(z.re), q(z.im)])).collect();
+                let mut cs = Vec::new();
+                if hdr {
+                    // As the ring delivers them: flag in bit 0 of im.
+                    for y in sy.iter_mut() {
+                        let f = hd.push(*y);
+                        *y = HdrDet::mark(*y, f);
+                    }
+                    let fl: Vec<bool> = sy.iter().map(|y| y[1] & 1 == 1).collect();
+                    nflags += fl.iter().filter(|&&f| f).count();
+                    nsyms += fl.len();
+                    to_complex(&sy, &mut cs);
+                    rx.process_flagged(&cs, Some(&fl), &mut out);
+                } else {
+                    to_complex(&sy, &mut cs);
+                    rx.process(&cs, &mut out);
+                }
+            } else {
+                rx.process(c, &mut out);
+            }
             if k % (655_360 / chunk) == 0 {
                 eprintln!("{:.1} s: {:?}", (k * chunk) as f64 / d.fs_out(), rx.stats);
             }
         }
         eprintln!("done in {:.2} s: {} packets {:?}", t0.elapsed().as_secs_f64(), out.len(), rx.stats);
+        if symsync {
+            eprintln!("symsync omega {:.6} (nominal {:.6})", ss.omega(), d.fs_out() / rs);
+        }
+        if hdr {
+            eprintln!("hdrdet: {nflags} flags in {nsyms} symbols ({:.3} %)", 100.0 * nflags as f64 / nsyms.max(1) as f64);
+        }
     }
 }
