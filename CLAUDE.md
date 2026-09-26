@@ -9,8 +9,9 @@
 `BR2_EXTERNAL` tree for Zynq-7000/AD936x SDRs), turning a PlutoSky R2 or
 LibreSDR into a headless remote transceiver (TCI + rigctld, SSB/CW/data, Q65/PI4,
 neural CW skimmer) or an IARU-R1 MGM beacon transmitter/receiver with MQTT
-output. See `docs/PLAN.md` for architecture and `docs/REFERENCE.md` for the
-frequency-reference design.
+output. See `docs/PLAN.md` for architecture, `docs/REFERENCE.md` for the
+frequency-reference design and `docs/DATV.md` for DVB-S2 video (trxd
+`src/dvbs2/`: TX, RX, TS mux/demux; web UI DATV panel).
 
 Boards: `plutoskyr2`, `libre` (both xc7z020). `boards.json` is the single
 source of truth for `build.sh` and CI.

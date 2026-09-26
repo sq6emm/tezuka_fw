@@ -66,6 +66,13 @@ const EDGE_MARGIN_HZ: f64 = 5_000.0;
 /// MUTE AT TX: the receiver stays muted this long after unkeying (T/R switching,
 /// the tail of our own signal).
 const RX_RECOVER: Duration = Duration::from_millis(150);
+/// DATV: baseband amplitude (RMS) before Drive; the RRC-shaped QPSK peaks
+/// stay under full scale.
+const DATV_AMPLITUDE: f32 = 0.5;
+/// DATV: unkey when the browser sent no video or audio for this long.
+const DATV_STARVE: Duration = Duration::from_secs(10);
+/// DATV symbol rates offered: whole samples per symbol at 384 kS/s.
+const DATV_RATES: [f64; 5] = [32_000.0, 48_000.0, 64_000.0, 96_000.0, 128_000.0];
 /// Unkey after this long without TX audio from the keying TCI client.
 const TCI_STARVE: Duration = Duration::from_millis(1_500);
 /// CW keyer: stay keyed this long after the last element (semi break-in).
@@ -125,6 +132,20 @@ enum TxSource {
     Key,
     /// A browser's microphone (web UI), identified by its connection.
     Web(u64),
+    /// DATV from a browser's camera and microphone (DVB-S2).
+    Datv(u64),
+}
+
+/// A DATV transmission in progress: the browser's H.264/Opus multiplexed
+/// into MPEG-TS and modulated as DVB-S2 at the stream rate.
+struct Datv {
+    sr: f64,
+    profile: crate::dvbs2::ts::Profile,
+    video_bps: f64,
+    modulator: crate::dvbs2::Modulator,
+    mux: crate::dvbs2::ts::Mux,
+    last_media: Instant,
+    buf: Vec<Complex32>,
 }
 
 pub struct Trx {
@@ -206,6 +227,10 @@ pub struct Trx {
     /// MUTE AT TX: the receiver is muted until then after TX.
     rx_quiet_until: Option<Instant>,
     modulator: Option<Box<dyn Modulator>>,
+    datv: Option<Datv>,
+    /// DATV reception (DVB-S2 receiver thread), when switched on.
+    datv_rx: Option<crate::dvbs2::rx::RxThread>,
+    datv_rx_stats: crate::dvbs2::rx::Stats,
     duc: Duc,
     tx_nco: Nco,
     keyer: CwKeyer,
@@ -397,6 +422,9 @@ impl Trx {
             tx_since: None,
             rx_quiet_until: None,
             modulator: None,
+            datv: None,
+            datv_rx: None,
+            datv_rx_stats: Default::default(),
             duc: Duc::new(CH_RATE, rate),
             tx_nco: Nco::new(0.0, rate),
             keyer: CwKeyer::new(CH_RATE, CW_PITCH_HZ, cfg.trx.cw_wpm as f32),
@@ -530,19 +558,23 @@ impl Trx {
             off.abs() < half - EDGE_MARGIN_HZ && off.abs() > EDGE_MARGIN_HZ
         };
         let fits_all = |c: f64| fits(rx, c) && (self.tx_on.is_none() || fits(tx, c));
-        if !force && fits_all(self.center) && clear(self.center) {
+        let datv = self.datv_lo_offset();
+        if datv.is_none() && !force && fits_all(self.center) && clear(self.center) {
             self.apply_offsets();
             return;
         }
-        let anchor = if self.tx_on.is_some() && !fits(tx, self.center) { tx } else { rx };
+        let anchor = if datv.is_some() || (self.tx_on.is_some() && !fits(tx, self.center)) { tx } else { rx };
         let xvtr = self.settings.transverter(anchor).cloned();
         // The LO sits `lo_offset` below the signal on the air, which through an
         // inverting transverter is above it on the AD936x.
-        let mut lo = anchor - self.cfg.radio.lo_offset_hz * if xvtr.as_ref().is_some_and(|t| t.inverted) { -1.0 } else { 1.0 };
+        let mut lo = match datv {
+            Some(off) => tx - off,
+            None => anchor - self.cfg.radio.lo_offset_hz * if xvtr.as_ref().is_some_and(|t| t.inverted) { -1.0 } else { 1.0 },
+        };
         // With the web scope open, the DC spike goes beside the view: halfway
         // between the view and the farthest the VFO (and TX) may be from the
         // LO, for the most tuning before the next move.
-        if let Some((a, b)) = keepout.filter(|_| !clear(lo)) {
+        if let Some((a, b)) = keepout.filter(|_| datv.is_none() && !clear(lo)) {
             let reach = half - EDGE_MARGIN_HZ;
             let (lo_min, lo_max) = if self.tx_on.is_some() {
                 (rx.max(tx) - reach, rx.min(tx) + reach)
@@ -717,12 +749,66 @@ impl Trx {
     /// while a browser is watching. `None`: anywhere will do.
     fn dc_keepout(&self) -> Option<(f64, f64)> {
         let watching = self.web.as_ref().is_some_and(|w| w.clients() > 0);
-        if !watching || self.web_span > DC_AVOID_SPAN_MAX {
+        if !watching || self.web_span > DC_AVOID_SPAN_MAX || self.datv_lo_offset().is_some() {
             return None;
         }
         let c = if self.web_center == 0.0 { self.rx_vfo() } else { self.web_center };
         let h = self.web_span / 2.0 + DC_GUARD_HZ;
         Some((c - h, c + h))
+    }
+
+    /// Sending DATV: how far below the DVB-S2 signal's centre the LO goes, so
+    /// that the TX carrier leak sits just outside the signal where the stream
+    /// has room for that, and the signal stays inside the TX passband.
+    fn datv_lo_offset(&self) -> Option<f64> {
+        let d = self.datv.as_ref().filter(|_| matches!(self.tx_on, Some(TxSource::Datv(_))))?;
+        let half = d.sr * (1.0 + d.modulator.params().rolloff as f64) / 2.0;
+        Some((half + 10e3).min(self.rate * 0.38 - half).max(0.0))
+    }
+
+    /// Start DATV for `client`: validate, build the modulator and mux, key.
+    fn datv_start(&mut self, client: u64, sr: f64, rate: &str, pilots: bool) {
+        use crate::dvbs2::{Modulator, Params, Rate, ts::Mux, ts::Profile};
+        let Some(rate) = Rate::parse(rate) else {
+            warn!(rate, "DATV: code rate must be 1/4, 1/3, 1/2 or 2/3");
+            return;
+        };
+        let sps = self.rate / sr;
+        if !DATV_RATES.contains(&sr) || (sps - sps.round()).abs() > 1e-9 {
+            warn!(sr, stream = self.rate, "DATV: symbol rate not offered at this stream rate");
+            return;
+        }
+        let p = Params { rate, pilots, rolloff: 0.35 };
+        let ts_rate = p.ts_rate(sr);
+        let profile = Profile::for_rate(ts_rate);
+        let video_bps = profile.video_budget(ts_rate);
+        self.datv = Some(Datv {
+            sr,
+            profile,
+            video_bps,
+            modulator: Modulator::new(p, sps.round() as usize),
+            mux: Mux::new(ts_rate, &self.callsign()),
+            last_media: Instant::now(),
+            buf: Vec::new(),
+        });
+        self.key(TxSource::Datv(client));
+        if self.tx_on != Some(TxSource::Datv(client)) {
+            self.datv = None;
+            return;
+        }
+        info!(sr, rate = rate.label(), pilots, ts_rate = ts_rate.round(), video_bps = video_bps.round(), ?profile, "DATV on");
+    }
+
+    fn datv_json(&self) -> serde_json::Value {
+        match &self.datv {
+            Some(d) => {
+                let p = d.modulator.params();
+                serde_json::json!({"sr": d.sr, "rate": p.rate.label(), "pilots": p.pilots, "ts_rate": p.ts_rate(d.sr).round(),
+                    "video_bps": d.video_bps.round(), "audio_bps": d.profile.audio_bps, "fps": d.profile.fps,
+                    "width": d.profile.width, "height": d.profile.height})
+            }
+            None => serde_json::Value::Null,
+        }
     }
 
     /// Where the web scope is centred for this row: it stays put while the
@@ -767,7 +853,7 @@ impl Trx {
         self.tx_since = Some(Instant::now());
         // Nothing more of the other station while we send: settle its tail.
         self.cwlive.flush();
-        if let (TxSource::Web(client), Some(w)) = (source, &self.web) {
+        if let (TxSource::Web(client) | TxSource::Datv(client), Some(w)) = (source, &self.web) {
             w.set_mic_owner(Some(client));
             self.mic_started = false;
             self.mic_last = Instant::now();
@@ -796,6 +882,9 @@ impl Trx {
         }
         self.tx_since = None;
         self.rx_quiet_until = Some(Instant::now() + RX_RECOVER);
+        if self.datv.take().is_some() {
+            info!("DATV off");
+        }
         self.keyer.abort();
         if let Some(w) = &self.web {
             w.set_mic_owner(None);
@@ -1071,6 +1160,9 @@ impl Trx {
             }
         }
 
+        if let Some(r) = &self.datv_rx {
+            r.feed(iq, self.rx_eff() - self.center);
+        }
         self.lap(0, &mut mark);
         // The channel.
         self.chan.clear();
@@ -1248,7 +1340,9 @@ impl Trx {
 
         // Safety rails first.
         if let Some(since) = self.tx_since {
-            if since.elapsed() > Duration::from_secs(self.cfg.trx.max_tx_seconds as u64) {
+            // DATV runs long by nature; it stops when its browser goes quiet instead.
+            let datv = matches!(self.tx_on, Some(TxSource::Datv(_)));
+            if !datv && since.elapsed() > Duration::from_secs(self.cfg.trx.max_tx_seconds as u64) {
                 warn!("TX time-out ({} s), unkeying", self.cfg.trx.max_tx_seconds);
                 self.unkey();
             }
@@ -1287,6 +1381,41 @@ impl Trx {
                     self.tx_bb.push(Complex32::new(self.tune_phase.cos() as f32, self.tune_phase.sin() as f32) * a);
                 }
                 if !self.key_down && self.key_env == 0.0 {
+                    self.unkey();
+                }
+            }
+            Some(TxSource::Datv(client)) => {
+                let mut starved = self.datv.is_none();
+                if let Some(d) = &mut self.datv {
+                    if let Some(w) = &self.web {
+                        for b in w.take_media() {
+                            if let Some(m) = crate::dvbs2::ts::Media::from_ws(&b) {
+                                d.mux.push(m);
+                                d.last_media = Instant::now();
+                            }
+                        }
+                        if d.mux.want_key {
+                            d.mux.want_key = false;
+                            w.send_json_to(client, &serde_json::json!({"type": "datv_key"}));
+                        }
+                    }
+                    // Straight at the stream rate: no DUC, only the offset from the LO.
+                    d.buf.resize(self.block, Complex32::default());
+                    let (m, x) = (&mut d.modulator, &mut d.mux);
+                    m.fill(&mut d.buf, &mut || x.next());
+                    let g = self.drive * DATV_AMPLITUDE;
+                    for z in d.buf.iter_mut() {
+                        *z *= g;
+                    }
+                    let mut mixed = Vec::with_capacity(d.buf.len());
+                    self.tx_nco.mix(&d.buf, &mut mixed);
+                    self.tx_out.extend(mixed);
+                    if d.last_media.elapsed() > DATV_STARVE {
+                        warn!("DATV: nothing from the browser for {} s; unkeying", DATV_STARVE.as_secs());
+                        starved = true;
+                    }
+                }
+                if starved {
                     self.unkey();
                 }
             }
@@ -1459,6 +1588,7 @@ impl Trx {
                 TxSource::Tune => "tune",
                 TxSource::Key => "key",
                 TxSource::Web(_) => "web",
+                TxSource::Datv(_) => "datv",
             }),
             "drive": (self.drive * 100.0).round(),
             "tx_att_db": self.tx_att_db,
@@ -1502,6 +1632,8 @@ impl Trx {
             "cw_hang_ms": self.cw_hang.as_millis() as u64,
             "scope_center": self.scope_center,
             "mute_at_tx": self.settings.mute_at_tx,
+            "datv": self.datv_json(),
+            "datv_rx": self.datv_rx.as_ref().map(|r| serde_json::json!({"sr": r.sr, "rate": r.params.rate.label(), "pilots": r.params.pilots})),
             "xvtr": self.xvtr.as_ref().map(|t| t.name.clone()),
             "xvtrs": self.settings.transverters,
             "cal_band": self.cal_band(),
@@ -1531,6 +1663,15 @@ impl Trx {
             self.apply_web(c.client, &c.msg);
         }
         let Some(w) = &self.web else { return };
+        if let Some(r) = &self.datv_rx {
+            let (stats, msgs) = r.take();
+            self.datv_rx_stats = stats;
+            if w.clients() > 0 {
+                for m in msgs {
+                    w.send_bin(m);
+                }
+            }
+        }
         if w.clients() == 0 {
             return;
         }
@@ -1541,7 +1682,13 @@ impl Trx {
                 serde_json::json!({"tone_hz": r.tone_hz.round(), "wpm": r.wpm.round(), "snr_db": r.snr_db.round(), "locked": r.locked})
             });
             let dbm = self.settings.dbm(&self.cal_band(), self.reading_db);
-            w.send_json(&serde_json::json!({"type": "meter", "s_dbfs": self.s_dbfs, "tx": tx, "rx_gain_db": self.hw_gain_db, "cw": cw,
+            let datv = self.datv.as_ref().map(|d| serde_json::json!({"backlog": (d.mux.backlog_s() * 10.0).round() / 10.0, "dropped": d.mux.dropped_frames}));
+            let s = &self.datv_rx_stats;
+            let datv_rx = self.datv_rx.as_ref().map(|_| serde_json::json!({"locked": s.locked, "esn0": (s.esn0_db * 10.0).round() / 10.0,
+                "freq": s.freq_hz.round(), "frames": s.frames, "bad": s.frames_bad, "packets": s.packets,
+                "dropped": s.blocks_dropped, "skipped": s.frames_skipped, "busy": s.frames_fec_busy,
+                "demod_pct": (100.0 * s.other_s / s.wall_s.max(1e-9)).round(), "fec_pct": (100.0 * s.ldpc_s / s.wall_s.max(1e-9)).round()}));
+            w.send_json(&serde_json::json!({"type": "meter", "s_dbfs": self.s_dbfs, "tx": tx, "rx_gain_db": self.hw_gain_db, "cw": cw, "datv": datv, "datv_rx": datv_rx,
                 "dbm": (dbm * 10.0).round() / 10.0, "s": crate::settings::s_units(self.rx_eff(), dbm),
                 "reading": (self.reading_db * 10.0).round() / 10.0, "sq": self.squelch_open}));
         }
@@ -1576,6 +1723,11 @@ impl Trx {
                     self.apply(Command::SetFilter { rx: sdroxide_types::RxId::Main, lo: lo as f32, hi: hi as f32 });
                 }
             }
+            // DATV has its own start/stop (and stops when its page goes
+            // quiet); voice PTT, pressed or released, leaves it alone.
+            "ptt" if matches!(self.tx_on, Some(TxSource::Datv(_))) => {
+                debug!("PTT ignored: DATV is transmitting");
+            }
             "ptt" => {
                 if self.mode == Mode::Cw {
                     // In CW the web PTT is a straight key; release lets the
@@ -1594,6 +1746,36 @@ impl Trx {
                 }
             }
             "tune" => self.apply(Command::SetTune(on)),
+            "datv_rx" => {
+                self.datv_rx = None;
+                self.datv_rx_stats = Default::default();
+                if on {
+                    use crate::dvbs2::{Params, Rate};
+                    let sr = num("sr").unwrap_or(64_000.0);
+                    let sps = self.rate / sr;
+                    match Rate::parse(m["rate"].as_str().unwrap_or("1/2")) {
+                        Some(rate) if DATV_RATES.contains(&sr) && (sps - sps.round()).abs() < 1e-9 => {
+                            let p = Params { rate, pilots: m["pilots"].as_bool().unwrap_or(true), rolloff: 0.35 };
+                            info!(sr, rate = rate.label(), "DATV receive on");
+                            self.datv_rx = Some(crate::dvbs2::rx::RxThread::start(p, self.rate, sr, self.rx_eff() - self.center));
+                        }
+                        _ => warn!(sr, "DATV receive: symbol rate or code rate not offered"),
+                    }
+                }
+            }
+            "datv" => {
+                if on {
+                    if self.tx_on.is_some() {
+                        warn!("DATV refused: already transmitting");
+                    } else {
+                        let sr = num("sr").unwrap_or(64_000.0);
+                        let rate = m["rate"].as_str().unwrap_or("1/2").to_string();
+                        self.datv_start(client, sr, &rate, m["pilots"].as_bool().unwrap_or(true));
+                    }
+                } else if matches!(self.tx_on, Some(TxSource::Datv(_))) {
+                    self.unkey();
+                }
+            }
             "vfo" => {
                 let v = if m["sel"].as_str() == Some("B") { Vfo::B } else { Vfo::A };
                 self.apply(Command::SelectVfo(v));
@@ -1742,6 +1924,10 @@ impl Trx {
                 }
                 if self.tx_on == Some(TxSource::Web(client)) {
                     warn!("web client holding PTT disconnected; unkeying");
+                    self.unkey();
+                }
+                if self.tx_on == Some(TxSource::Datv(client)) {
+                    warn!("web client sending DATV disconnected; unkeying");
                     self.unkey();
                 }
             }

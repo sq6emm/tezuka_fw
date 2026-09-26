@@ -142,6 +142,9 @@ table.xv th { color: var(--dim); text-align: left; font-weight: 600; padding: 2p
 table.xv input[type=text] { width: 100%; min-width: 60px; padding: 3px 5px; text-transform: none; }
 .offs { font: 600 13px ui-monospace, Menlo, monospace; min-width: 70px; text-align: center; cursor: ns-resize;
   background: var(--lcd); border: 1px solid var(--lcd-edge); border-radius: var(--r); padding: 4px 6px; }
+#datvmenu { position: fixed; top: 34px; right: 10px; z-index: 12; width: min(460px, 96vw); box-shadow: 0 10px 30px rgba(0,0,0,.6); }
+#datv-preview { width: 320px; max-width: 100%; aspect-ratio: 4 / 3; background: #000; border-radius: var(--r); border: 1px solid var(--lcd-edge); }
+#datv-go.on { background: var(--tx); border-color: #ff8080; color: #fff; }
 #rc28menu { position: fixed; top: 34px; right: 10px; z-index: 10; width: min(360px, 94vw); box-shadow: 0 10px 30px rgba(0,0,0,.6); }
 select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd-edge); border-radius: var(--r); padding: 4px; }
 .note { color: var(--dim); font-size: 12px; }
@@ -179,6 +182,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
     <span title="System clock synchronised (chrony/GPS)"><span class="dot" id="d-time"></span>TIME</span>
     <span id="temps" title="Die temperatures: Zynq FPGA (XADC) and AD9361"></span>
     <button class="k" id="setbtn" title="Callsign, S-meter calibration, transverters">SET</button>
+    <button class="k" id="datvbtn" title="DATV: send this browser's camera and microphone as DVB-S2">DATV</button>
     <button class="k" id="rc28" title="Icom RC-28 (WebHID: Chrome/Edge over HTTPS)">RC-28</button>
     <span id="clients"></span>
     <span id="utc"></span>
@@ -193,6 +197,30 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       Knob: tuning step per detent, faster when spun quickly. TRANSMIT: hold for PTT,
       tap to latch (tap again to release). Click MIC once per visit first: browsers only open the
       microphone after a click, and a HID button does not count as one.</div>
+  </div>
+
+  <div id="datvmenu" class="card hidden">
+    <h3>DATV <span class="note">DVB-S2 from this browser's camera and microphone, on the TX frequency</span></h3>
+    <div class="row">
+      <select id="datv-sr" title="Symbol rate">
+        <option value="32000">32 kS/s</option><option value="48000">48 kS/s</option>
+        <option value="64000" selected>64 kS/s</option><option value="96000">96 kS/s</option><option value="128000">128 kS/s</option>
+      </select>
+      <select id="datv-fec" title="QPSK code rate: lower is more robust, slower">
+        <option value="1/4">QPSK 1/4</option><option value="1/3">QPSK 1/3</option>
+        <option value="1/2" selected>QPSK 1/2</option><option value="2/3">QPSK 2/3</option>
+      </select>
+      <label class="note"><input type="checkbox" id="datv-pilots" checked> pilots</label>
+    </div>
+    <div class="note" id="datv-info">—</div>
+    <video id="datv-preview" muted playsinline autoplay></video>
+    <div class="row"><button class="k" id="datv-go">START</button><button class="k" id="datv-close">CLOSE</button>
+      <span class="note" id="datv-stat"></span></div>
+    <div class="note">Chrome or Edge (WebCodecs). Short frames, CCM, roll-off 0.35; MUTE AT TX and Drive apply.
+      It stops by itself when this page goes quiet for 10 s.</div>
+    <h3>RECEIVE <span class="note">decodes DVB-S2 on the RX frequency with the settings above (pilots needed)</span></h3>
+    <canvas id="datv-rxview" width="320" height="240" style="width:320px;max-width:100%;background:#000;border-radius:var(--r);border:1px solid var(--lcd-edge)"></canvas>
+    <div class="row"><button class="k" id="datv-rx">RECEIVE</button><span class="note" id="datv-rxstat"></span></div>
   </div>
 
   <div id="setmenu" class="card hidden">
@@ -466,7 +494,11 @@ function onBinary(buf) {
     autoLevel(S.row);
     pushWaterfall(S.row);
   } else if (u8[0] === 2) {
-    audioIn(u8.subarray(1));
+    if (!DATV.receiving) audioIn(u8.subarray(1));
+  } else if (u8[0] === 6) {
+    DATV.rxVideo(u8);
+  } else if (u8[0] === 7) {
+    DATV.rxAudio(u8);
   }
 }
 
@@ -475,6 +507,7 @@ function onJson(m) {
   else if (m.type === "meter") renderMeter(m);
   else if (m.type === "decode") addDecode(m);
   else if (m.type === "cw") renderCw(m);
+  else if (m.type === "datv_key") DATV.keyframe();
 }
 function renderCw(m) {
   const box = $("cwbox"), atEnd = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
@@ -624,6 +657,7 @@ function renderCal(st) {
 // ============================================================ state rendering
 function renderState() {
   const st = S.st;
+  DATV.state(st);
   $("callsign").textContent = st.call || "";
   renderFreq();
   $("t-vfo").textContent = "VFO " + st.active;
@@ -694,6 +728,7 @@ function setSlider(id, v) {
 // ============================================================ meter
 const S_SCALE = ["1", "3", "5", "7", "9", "+20", "+40", "+60"];
 function renderMeter(m) {
+  DATV.meter(m.datv, m.datv_rx);
   // S-meter from dBFS at the channel and the hardware gain: -73 dBm = S9
   // needs a per-board calibration; this reads S9 at -73 dBm with a nominal
   // 0 dBFS = -10 dBm at 0 dB gain front end. Good for relative readings.
@@ -1148,7 +1183,8 @@ function buildStatic() {
     else if (e.code === "ArrowLeft" || e.code === "ArrowDown") { e.preventDefault(); tuneBy(-1); }
   });
   window.addEventListener("keyup", (e) => { if (e.code === "Space" && e.target.tagName !== "INPUT") { e.preventDefault(); pttUp(false); } });
-  window.addEventListener("blur", () => { if (S.st && S.st.ptt && !S.pttLatched) pttUp(false); });
+  // Focus lost while holding voice PTT: let go. (Not DATV: that is not a held key.)
+  window.addEventListener("blur", () => { if (S.st && S.st.ptt && S.st.tx_source === "web" && !S.pttLatched) pttUp(false); });
 
   const sendCw = () => { const t = $("cwtext").value.trim(); if (t) { send({ cmd: "cw", text: t.toUpperCase() }); $("cwtext").value = ""; } };
   $("cwsend").onclick = sendCw;
@@ -1299,6 +1335,200 @@ const RC28 = (() => {
   return { init, onReport, get connected() { return !!dev; } };
 })();
 window.__rc28 = RC28; // for tests
+
+// ============================================================ DATV (camera -> DVB-S2 on the board)
+// WebCodecs encode here; the board muxes (MPEG-TS) and modulates (DVB-S2).
+// Messages up: [4][key][i64 us][H.264 Annex B], [5][i64 us][Opus].
+const DATV = (() => {
+  let W = 320, H = 240;
+  // TS payload bits per short PLFRAME (Kbch - 80), per QPSK rate.
+  const PAYLOAD = { "1/4": 2992, "1/3": 5152, "1/2": 6952, "2/3": 10552 };
+  let on = false, starting = false, stream = null, venc = null, aenc = null, readers = [];
+  let cfg = null, forceKey = false, frames = 0, lastV = 0, sent = 0, t0 = 0, aSamples = 0, aRate = 0;
+  const tsRate = (sr, fec, pilots) => sr * PAYLOAD[fec] / (pilots ? 8370 : 8190);
+  function info() {
+    const sr = +$("datv-sr").value, fec = $("datv-fec").value, p = $("datv-pilots").checked;
+    const f = S.st ? curFreq() : 0;
+    $("datv-info").textContent = `TS ${(tsRate(sr, fec, p) / 1000).toFixed(1)} kbit/s · occupies ${(sr * 1.35 / 1000).toFixed(0)} kHz` +
+      (f ? ` centred on ${(f / 1e6).toFixed(3)} MHz` : "");
+  }
+  function sendBin(b) { if (ws && ws.readyState === 1 && ws.bufferedAmount < 256e3) { ws.send(b); sent += b.length; return true; } return false; }
+  function stamp(b, at, us) { new DataView(b.buffer).setBigInt64(at, BigInt(Math.round(us)), true); }
+  async function start() {
+    if (!window.VideoEncoder || !window.AudioEncoder || !window.MediaStreamTrackProcessor) { alert("DATV needs WebCodecs: Chrome or Edge."); return; }
+    starting = true; render();
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: W }, height: { ideal: H }, frameRate: { ideal: 15 } },
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    } catch (e) { starting = false; render(); alert("Camera/microphone: " + e.message); return; }
+    $("datv-preview").srcObject = stream;
+    send({ cmd: "datv", on: true, sr: +$("datv-sr").value, rate: $("datv-fec").value, pilots: $("datv-pilots").checked });
+    for (let i = 0; i < 30 && !(S.st && S.st.datv); i++) await new Promise((r) => setTimeout(r, 100));
+    if (!(S.st && S.st.datv)) { stop(false); alert("The board did not start DATV (already transmitting, TX not allowed, or a receive-only transverter)."); return; }
+    cfg = S.st.datv; on = true; starting = false; frames = 0; lastV = 0; sent = 0; t0 = 0; aSamples = 0;
+    W = cfg.width || 320; H = cfg.height || 240;
+    try { await startVideo(stream.getVideoTracks()[0]); await startAudio(stream.getAudioTracks()[0]); }
+    catch (e) { stop(true); alert("Encoder: " + e.message); return; }
+    render();
+  }
+  async function startVideo(track) {
+    venc = new VideoEncoder({
+      output: (chunk) => {
+        const b = new Uint8Array(10 + chunk.byteLength); b[0] = 4; b[1] = chunk.type === "key" ? 1 : 0;
+        stamp(b, 2, chunk.timestamp); chunk.copyTo(b.subarray(10));
+        if (!sendBin(b)) forceKey = true;   // lost to a full socket: resync on a keyframe
+      },
+      error: (e) => { console.error(e); stop(true); } });
+    const base = { width: W, height: H, bitrate: Math.max(4000, cfg.video_bps), framerate: cfg.fps, latencyMode: "realtime", avc: { format: "annexb" } };
+    // (160x120 below 40 kbit/s: the board's profile.)
+    let conf = null;
+    for (const codec of ["avc1.42E01E", "avc1.42001E", "avc1.4D401E"]) for (const bitrateMode of ["constant", "variable"]) {
+      const c = { ...base, codec, bitrateMode };
+      if (!conf && (await VideoEncoder.isConfigSupported(c)).supported) conf = c;
+    }
+    if (!conf) throw new Error("no H.264 encoder in this browser");
+    venc.configure(conf);
+    const cv = new OffscreenCanvas(W, H), ctx = cv.getContext("2d");
+    const rd = new MediaStreamTrackProcessor({ track }).readable.getReader(); readers.push(rd);
+    (async () => {
+      for (;;) {
+        const { value: fr, done } = await rd.read(); if (done || !on) { if (fr) fr.close(); break; }
+        const now = performance.now();
+        if (now - lastV >= 1000 / cfg.fps - 5 && venc.encodeQueueSize < 2) {
+          // Centre crop to 4:3, scale to 320x240.
+          const sw = fr.displayWidth, sh = fr.displayHeight, cw = Math.min(sw, sh * 4 / 3), ch = cw * 3 / 4;
+          ctx.drawImage(fr, (sw - cw) / 2, (sh - ch) / 2, cw, ch, 0, 0, W, H);
+          const vf = new VideoFrame(cv, { timestamp: Math.round(now * 1000) });
+          venc.encode(vf, { keyFrame: forceKey || frames % Math.round(2 * cfg.fps) === 0 });
+          vf.close(); forceKey = false; frames++; lastV = now;
+        }
+        fr.close();
+      }
+    })();
+  }
+  async function startAudio(track) {
+    aenc = new AudioEncoder({
+      output: (chunk) => { const b = new Uint8Array(9 + chunk.byteLength); b[0] = 5; stamp(b, 1, chunk.timestamp); chunk.copyTo(b.subarray(9)); sendBin(b); },
+      error: (e) => { console.error(e); stop(true); } });
+    const rd = new MediaStreamTrackProcessor({ track }).readable.getReader(); readers.push(rd);
+    (async () => {
+      for (;;) {
+        const { value: ad, done } = await rd.read(); if (done || !on) { if (ad) ad.close(); break; }
+        const n = ad.numberOfFrames, sr = ad.sampleRate, chs = ad.numberOfChannels;
+        if (aenc.state === "unconfigured") {
+          aRate = sr;
+          aenc.configure({ codec: "opus", sampleRate: sr, numberOfChannels: 1, bitrate: cfg.audio_bps, opus: { frameDuration: 20000, complexity: 5 } });
+        }
+        // Mono, stamped on the same clock as the video (performance.now); re-anchored if the mic clock wanders.
+        const mono = new Float32Array(n), tmp = new Float32Array(n);
+        for (let c = 0; c < chs; c++) { ad.copyTo(tmp, { planeIndex: c, format: "f32-planar" }); for (let i = 0; i < n; i++) mono[i] += tmp[i] / chs; }
+        ad.close();
+        const nowUs = performance.now() * 1000 - n / sr * 1e6;
+        let ts = t0 + aSamples / aRate * 1e6;
+        if (!t0 || Math.abs(ts - nowUs) > 100e3) { t0 = nowUs; aSamples = 0; ts = t0; }
+        aSamples += n;
+        const md = new AudioData({ format: "f32-planar", sampleRate: sr, numberOfFrames: n, numberOfChannels: 1, timestamp: Math.round(ts), data: mono });
+        aenc.encode(md); md.close();
+      }
+    })();
+  }
+  function stop(tellBoard) {
+    if (tellBoard) send({ cmd: "datv", on: false });
+    on = false; starting = false;
+    for (const r of readers) r.cancel().catch(() => {});
+    readers = [];
+    for (const e of [venc, aenc]) if (e && e.state !== "closed") try { e.close(); } catch { /* closed */ }
+    venc = aenc = null;
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    stream = null; $("datv-preview").srcObject = null;
+    render();
+  }
+  // ---- receive: [6][key][i64 us][H.264], [7][i64 us][Opus] from the board
+  let rxOn = false, vdec = null, adec = null, actx = null, nextT = 0, needKey = true, rxFrames = 0;
+  const rxCtx = () => $("datv-rxview").getContext("2d");
+  function rxStart() {
+    if (!window.VideoDecoder || !window.AudioDecoder) { alert("DATV needs WebCodecs: Chrome or Edge."); return; }
+    actx = new AudioContext({ sampleRate: 48000 }); nextT = 0; needKey = true; rxFrames = 0;
+    send({ cmd: "datv_rx", on: true, sr: +$("datv-sr").value, rate: $("datv-fec").value, pilots: $("datv-pilots").checked });
+    rxOn = true; rxRender();
+  }
+  function rxStop(tellBoard) {
+    if (tellBoard) send({ cmd: "datv_rx", on: false });
+    rxOn = false;
+    for (const d of [vdec, adec]) if (d && d.state !== "closed") try { d.close(); } catch { /* closed */ }
+    vdec = adec = null;
+    if (actx) actx.close().catch(() => {});
+    actx = null; rxRender();
+  }
+  function newVdec() {
+    vdec = new VideoDecoder({
+      output: (f) => { rxCtx().drawImage(f, 0, 0, 320, 240); f.close(); rxFrames++; },   // scaled up if 160x120
+      error: (e) => { console.warn("DATV video", e); vdec = null; needKey = true; } });
+    vdec.configure({ codec: "avc1.42E01E", optimizeForLatency: true });
+  }
+  function rxVideo(u8) {
+    if (!rxOn) return;
+    const key = u8[1] === 1, ts = Number(new DataView(u8.buffer, u8.byteOffset).getBigInt64(2, true));
+    if (needKey && !key) return;
+    if (!vdec || vdec.state === "closed") newVdec();
+    try { vdec.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: ts, data: u8.subarray(10) })); needKey = false; }
+    catch (e) { console.warn(e); vdec = null; needKey = true; }
+  }
+  function rxAudio(u8) {
+    if (!rxOn || !actx) return;
+    if (!adec || adec.state === "closed") {
+      adec = new AudioDecoder({ output: play, error: (e) => { console.warn("DATV audio", e); adec = null; } });
+      adec.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1 });
+    }
+    const ts = Number(new DataView(u8.buffer, u8.byteOffset).getBigInt64(1, true));
+    try { adec.decode(new EncodedAudioChunk({ type: "key", timestamp: ts, data: u8.subarray(9) })); } catch (e) { console.warn(e); adec = null; }
+  }
+  function play(ad) {
+    if (!actx) { ad.close(); return; }
+    const n = ad.numberOfFrames, buf = actx.createBuffer(1, n, ad.sampleRate), ch = new Float32Array(n);
+    ad.copyTo(ch, { planeIndex: 0, format: "f32-planar" }); ad.close();
+    buf.copyToChannel(ch, 0);
+    const src = actx.createBufferSource(); src.buffer = buf; src.connect(actx.destination);
+    // A small jitter buffer, kept short: late means dropped, not delayed forever.
+    const now = actx.currentTime;
+    if (nextT < now + 0.05 || nextT > now + 0.6) nextT = now + 0.15;
+    src.start(nextT); nextT += n / ad.sampleRate;
+  }
+  function rxRender() {
+    const b = $("datv-rx"); b.textContent = rxOn ? "STOP RX" : "RECEIVE"; b.classList.toggle("on", rxOn);
+    if (!rxOn) $("datv-rxstat").textContent = "";
+  }
+  function render() {
+    const b = $("datv-go");
+    b.textContent = on ? "STOP" : starting ? "STARTING…" : "START"; b.classList.toggle("on", on);
+    for (const id of ["datv-sr", "datv-fec", "datv-pilots"]) $(id).disabled = on || starting;
+    if (!on) $("datv-stat").textContent = "";
+    $("datvbtn").classList.toggle("warn", on);
+  }
+  return {
+    init() {
+      $("datvbtn").onclick = () => { const m = $("datvmenu"); m.classList.toggle("hidden"); info(); };
+      $("datv-close").onclick = () => $("datvmenu").classList.add("hidden");
+      $("datv-go").onclick = () => (on ? stop(true) : start());
+      $("datv-rx").onclick = () => (rxOn ? rxStop(true) : rxStart());
+      for (const id of ["datv-sr", "datv-fec", "datv-pilots"]) $(id).onchange = info;
+      window.addEventListener("pagehide", () => { if (on) stop(true); });
+    },
+    // The board ended it (browser quiet, TX off elsewhere): stop here too.
+    state(st) { if (on && !st.datv) stop(false); if (rxOn && !st.datv_rx) rxStop(false); },
+    rxVideo, rxAudio,
+    get receiving() { return rxOn; },
+    keyframe() { forceKey = true; },
+    meter(d, r) {
+      if (rxOn && r) $("datv-rxstat").textContent = `${r.locked ? "LOCK" : "searching"} · Es/N0 ${r.esn0.toFixed(1)} dB · carrier ${r.freq >= 0 ? "+" : ""}${r.freq} Hz · frames ${r.frames - r.bad}/${r.frames} · shown ${rxFrames} · dropped: IQ ${r.dropped}, frames ${r.busy} · CPU demod ${r.demod_pct} % FEC ${r.fec_pct} % of a core`;
+      if (!on || !cfg) return;
+      $("datv-stat").textContent = `${cfg.fps} fps · video ${(cfg.video_bps / 1000).toFixed(0)}k · audio ${(cfg.audio_bps / 1000).toFixed(0)}k` +
+        (d ? ` · queue ${d.backlog.toFixed(1)} s · dropped ${d.dropped}` : "") + ` · sent ${(sent / 1024).toFixed(0)} KiB`;
+    },
+  };
+})();
+DATV.init();
 
 boot();
 })();

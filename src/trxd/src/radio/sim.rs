@@ -109,7 +109,9 @@ impl RxStream for SimRx {
             let mut s = self.shared.lock().unwrap();
             let n = out.len().min(s.loopback.len());
             let lb: Vec<Complex32> = s.loopback.drain(..n).collect();
-            (s.lo_hz, s.signal_hz, lb)
+            // The test station stands by while we transmit (our own signal is
+            // what the loopback is for, e.g. a wideband DATV check).
+            (s.lo_hz, s.signal_hz.filter(|_| !s.tx_on), lb)
         };
         let dot_samples = (crate::morse::dot_seconds(TEST_SIGNAL_WPM) * self.rate) as u64;
         let rise = 1.0 / (0.005 * self.rate as f32);
@@ -138,6 +140,9 @@ impl RxStream for SimRx {
 pub struct SimTx {
     shared: Arc<Mutex<Shared>>,
     cap: usize,
+    /// `TRXD_SIM_TX_DUMP=<file>`: everything sent while keyed, as complex
+    /// f32 at the stream rate (what would go to the DAC), for offline checks.
+    dump: Option<std::fs::File>,
 }
 
 impl TxStream for SimTx {
@@ -145,6 +150,11 @@ impl TxStream for SimTx {
         let mut s = self.shared.lock().unwrap();
         if !s.tx_on {
             return Ok(());
+        }
+        if let Some(f) = &mut self.dump {
+            use std::io::Write;
+            let bytes: Vec<u8> = iq.iter().flat_map(|z| [z.re.to_le_bytes(), z.im.to_le_bytes()]).flatten().collect();
+            let _ = f.write_all(&bytes);
         }
         s.loopback.extend(iq.iter().copied());
         let excess = s.loopback.len().saturating_sub(self.cap);
@@ -174,7 +184,11 @@ pub fn open(cfg: &RadioConfig) -> Radio {
             keying: crate::morse::timeline(TEST_SIGNAL_TEXT),
             envelope: 0.0,
         }),
-        tx: Box::new(SimTx { shared, cap: cfg.buffer_samples * 16 }),
+        tx: Box::new(SimTx {
+            shared,
+            cap: cfg.buffer_samples * 16,
+            dump: std::env::var_os("TRXD_SIM_TX_DUMP").and_then(|p| std::fs::File::create(p).ok()),
+        }),
     }
 }
 

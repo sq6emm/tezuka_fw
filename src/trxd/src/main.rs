@@ -13,6 +13,7 @@ mod cwlive;
 mod settings;
 mod temps;
 mod decode;
+mod dvbs2;
 mod keyer;
 mod maia;
 mod morse;
@@ -36,7 +37,7 @@ use tracing::{error, info};
 use config::{Backend, Config, Role};
 
 fn usage() -> ! {
-    eprintln!("usage: trxd [--config FILE] [--sim] [--check] | --pack-model IN.onnx OUT.bin | --bench-deepcw MODEL [N]");
+    eprintln!("usage: trxd [--config FILE] [--sim] [--check] | --pack-model IN.onnx OUT.bin | --bench-deepcw MODEL [N] | --dvbs2-mod IN.ts OUT.cf32 [RATE] [SPS] [pilots] | --datv-mux MEDIA OUT.ts SR [RATE] [pilots]");
     std::process::exit(2);
 }
 
@@ -73,6 +74,49 @@ fn main() -> ExitCode {
                 let Some(m) = args.next() else { usage() };
                 let n = args.next().and_then(|v| v.parse().ok()).unwrap_or(5);
                 return match model::bench_cli(&m, n) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        error!("{e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            "--dvbs2-mod" => {
+                let (Some(i), Some(o)) = (args.next(), args.next()) else { usage() };
+                let rest: Vec<String> = args.by_ref().collect();
+                return match dvbs2::mod_cli(&i, &o, &rest) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        error!("{e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            "--dvbs2-demod" => {
+                let (Some(i), Some(o)) = (args.next(), args.next()) else { usage() };
+                let rest: Vec<String> = args.by_ref().collect();
+                return match dvbs2::rx::demod_cli(&i, &o, &rest) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        error!("{e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            "--ldpc-helper" => {
+                let rest: Vec<String> = args.by_ref().collect();
+                return match dvbs2::ldpc::helper_cli(&rest) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        error!("{e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            "--datv-mux" => {
+                let (Some(i), Some(o)) = (args.next(), args.next()) else { usage() };
+                let rest: Vec<String> = args.by_ref().collect();
+                return match dvbs2::ts::mux_cli(&i, &o, &rest) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => {
                         error!("{e}");

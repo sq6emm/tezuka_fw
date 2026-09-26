@@ -1,0 +1,102 @@
+# DATV: DVB-S2 between two boards (trxd)
+
+Low-rate digital amateur television from the web UI: a browser's camera and
+microphone go out as DVB-S2, and a board receives DVB-S2 and shows it in the
+browser. Everything runs in trxd software on the 384 kS/s stream; the FPGA is
+unchanged. Target: reliable, narrow links (terrestrial, 23 cm), not picture quality.
+
+## Chain
+
+```text
+TX  browser: camera -> OffscreenCanvas (4:3 crop) -> VideoEncoder H.264 (Constrained Baseline, Annex B)
+             mic -> mono -> AudioEncoder Opus (20 ms)
+             -> WebSocket [4][key][i64 us][H.264] / [5][i64 us][Opus]
+    trxd:    dvbs2::ts::Mux (MPEG-TS, constant rate, pulled by the modulator)
+             -> dvbs2::Modulator (BBFRAME, BB scrambling, BCH, LDPC, QPSK, PLFRAME,
+                pilots, PL scrambling, RRC 0.35) -> TX NCO -> DAC
+
+RX  trxd:    stream IQ -> dvbs2::rx::RxThread (own thread): NCO + RRC matched filter
+             (2-3 samples/symbol) -> Gardner timing -> PLHEADER sync -> carrier (averaged
+             acquisition, pilot tracking) -> LLRs -> LDPC (layered BP) -> BBFRAME -> TS
+             -> dvbs2::ts::Demux (PAT/PMT/PES) -> WebSocket [6][key][i64 us][H.264] / [7][i64 us][Opus]
+    browser: VideoDecoder -> canvas, AudioDecoder -> AudioContext (short jitter buffer)
+```
+
+Web UI: header button **DATV**. START sends on the TX frequency (the VFO, or the
+split TX VFO); RECEIVE decodes on the RX frequency. Both use the panel's symbol
+rate, code rate and pilots settings, which must match the other station.
+
+## Settings and what they carry
+
+QPSK, short FECFRAMEs, CCM, roll-off 0.35, pilots on (the receiver needs them).
+Symbol rates are those with whole samples per symbol at 384 kS/s: 32, 48, 64,
+96 and 128 kS/s. Occupied bandwidth is 1.35 x the symbol rate.
+
+| Symbol rate, code rate | TS kbit/s | Profile (board picks it from the TS rate) |
+|---|---|---|
+| 64 kS/s, 1/4 | 22.9 | 160x120, 2 fps, video ~9.6 k, Opus 6 k in 800 ms PES, PSI every 2 s |
+| 32 kS/s, 1/2 | 26.6 | same |
+| 64 kS/s, 1/2 | 53.2 | 320x240, 5 fps, video ~24.5 k, Opus 12 k in 200 ms PES |
+| 128 kS/s, 2/3 | 161.4 | 320x240, 10 fps, video ~104 k, Opus 16 k |
+
+At these rates the 188-byte TS packet is the unit of cost: one 20 ms Opus frame
+per PES would cost 50 packets a second. The mux packs audio into long PES,
+sends PSI rarely, stamps PCRs exactly when the modulator pulls a packet, and
+fills idle slots with PCR-only or null packets. With over 1 s of video queued
+it drops non-key frames and asks the browser for a keyframe; over 3 s it
+flushes.
+
+The TS carries an SDT: service name = the callsign from SET, provider SQTRV.
+Opus in TS follows ffmpeg (registration descriptor "Opus", control header per
+access unit); ffprobe, ffmpeg and VLC read it.
+
+## Verified (2026-09-26, on power)
+
+- Symbols bit-exact against leandvbtx (leansdr work branch) for QPSK 1/4, 1/3,
+  1/2, 2/3 short, with and without pilots, over 320-1131 frames each.
+- LDPC tables for those rates checked equal between leansdr and GNU Radio
+  gr-dtv (leansdr's short 2/5 and 3/4 tables have rows with a wrong entry
+  count; not used here).
+- leandvb decodes the modulator's output back to the identical TS.
+- Browser path (Chrome 153, fake camera and microphone, headless) through
+  trxd --sim: DVB-S2 frames 319/319, about 5 fps shown, about 0.85 s end to end.
+- Receiver against impairments (20 s recordings of a real browser stream):
+  +121 Hz and 30 ppm, +1 kHz and 50 ppm, -1.4 kHz and -50 ppm all acquired;
+  QPSK 1/2 decodes every frame after acquisition down to Es/N0 1.5 dB
+  (DVB-S2 nominal about 1 dB). Acquisition takes 16 frames (about 2 s at 64 kS/s).
+- Decoder alone (ideal LLRs): frames clean from Es/N0 -2.5 dB (1/4),
+  0 dB (1/3), +0.5 dB (1/2), about 4 dB (2/3).
+
+## Over the air (2026-09-26, Libre 2 -> Libre 1, 1255.000 MHz, indoors)
+
+64 kS/s, QPSK 1/2, pilots, Libre 2 at 0 dB TX attenuation (DATV runs 6 dB
+under the TUNE carrier to keep RRC peaks off the DAC ceiling):
+- Libre 1 locked in about 10 s at +130 Hz (Libre 2's crystal); Es/N0
+  wandered 0-5 dB without losing lock; 376 of 418 frames decoded, the losses
+  almost all during acquisition; about 4 pictures a second shown.
+- CPU on Libre 1 (Cortex-A9, 2 cores): demodulator 32-52 % of a core, LDPC
+  and demux 55-66 % of the other (they run on separate threads), 72-82 % of
+  both cores in all. Libre 2 while sending: 16-36 %.
+- The receiver has to keep up in real time: with demodulation and decoding
+  on one thread, the A9 dropped IQ blocks and never held lock. Decoding on its
+  own thread, behind a 4-frame queue, drops whole frames instead when busy.
+
+## Not yet done
+
+- More than 64 kS/s QPSK 1/2 on the A9: 128 kS/s or rate 1/4 cost more
+  decoding per second; measure before relying on them. Ideas if needed:
+  skip the SSB demodulator while DATV receives, min-sum for rates >= 1/2,
+  fixed-point NEON LDPC.
+- Two-way at once: each board would send on its own frequency and receive the
+  other's; the other signal has to fall inside the same 384 kS/s stream (about
+  +-120 kHz of the TX signal), and the board's own transmitter leaks into its
+  receiver.
+- No BCH decoding on receive (LDPC convergence and the BBHEADER CRC stand in).
+
+## Test tools
+
+`trxd --dvbs2-mod`, `--datv-mux`, `--dvbs2-demod` and `--ldpc-helper` (leandvb's
+external LDPC decoder protocol) are command-line entry points for offline
+tests; `cargo test` covers the encoder, mux/demux round trip and an end-to-end
+modulate-impair-receive test. With `TRXD_SIM_TX_DUMP=<file>`, `--sim` writes
+everything it transmits as complex f32 at the stream rate.

@@ -7,7 +7,10 @@
 //!   - binary frames out: `[1][f64 center][f64 span][u16 n][n x u8]` a
 //!     spectrum row (u8 = (dBFS + 160) * 1.5, 0 = no data),
 //!     `[2][u8...]` 12 kHz mu-law RX audio;
-//!   - binary frames in: `[3][u8...]` 12 kHz mu-law microphone audio.
+//!   - binary frames in: `[3][u8...]` 12 kHz mu-law microphone audio;
+//!     `[4][flags][i64 us][H.264]` and `[5][i64 us][Opus]` DATV video and
+//!     audio (see [`crate::dvbs2::ts::Media::from_ws`]), from the client
+//!     that holds the transmitter only.
 //! * Port 80 only redirects to HTTPS: browsers give the microphone to secure
 //!   pages alone.
 //!
@@ -80,8 +83,10 @@ struct Shared {
     sessions: Mutex<HashMap<String, Instant>>,
     password: String,
     mic: Mutex<VecDeque<f32>>,
-    /// Client currently transmitting from its microphone.
+    /// Client currently transmitting from its microphone (or camera).
     mic_owner: Mutex<Option<u64>>,
+    /// DATV video/audio messages from that client, as received.
+    media: Mutex<VecDeque<Vec<u8>>>,
 }
 
 /// A command from a browser, tagged with the connection it came from.
@@ -133,6 +138,11 @@ impl WebHandle {
         self.broadcast(|| Out::Bin(b.clone()));
     }
 
+    /// Any binary message to every browser (DATV video/audio).
+    pub fn send_bin(&self, b: Vec<u8>) {
+        self.broadcast(|| Out::Bin(b.clone()));
+    }
+
     /// 12 kHz audio, -1..1.
     pub fn send_audio(&self, audio: &[f32]) {
         if audio.is_empty() {
@@ -169,7 +179,13 @@ impl WebHandle {
         *self.shared.mic_owner.lock().unwrap() = client;
         if client.is_none() {
             self.shared.mic.lock().unwrap().clear();
+            self.shared.media.lock().unwrap().clear();
         }
+    }
+
+    /// DATV messages received since the last call.
+    pub fn take_media(&self) -> Vec<Vec<u8>> {
+        self.shared.media.lock().unwrap().drain(..).collect()
     }
 }
 
@@ -472,11 +488,22 @@ fn run_ws(stream: Tls, shared: Arc<Shared>, cmd_tx: Sender<WebCmd>, joined_tx: S
                     Err(e) => debug!("web: bad JSON: {e}"),
                 },
                 Ok(Message::Binary(b)) => {
-                    if b.first() == Some(&3) && *shared.mic_owner.lock().unwrap() == Some(id) {
-                        let mut m = shared.mic.lock().unwrap();
-                        m.extend(b[1..].iter().map(|&u| mulaw_decode(u)));
-                        let excess = m.len().saturating_sub(MIC_CAP);
-                        m.drain(..excess);
+                    let owner = *shared.mic_owner.lock().unwrap() == Some(id);
+                    match b.first() {
+                        Some(&3) if owner => {
+                            let mut m = shared.mic.lock().unwrap();
+                            m.extend(b[1..].iter().map(|&u| mulaw_decode(u)));
+                            let excess = m.len().saturating_sub(MIC_CAP);
+                            m.drain(..excess);
+                        }
+                        Some(&4 | &5) if owner => {
+                            let mut m = shared.media.lock().unwrap();
+                            // The engine drains this every block; a cap only for a stuck engine.
+                            if m.len() < 500 {
+                                m.push_back(b.to_vec());
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Ok(Message::Close(_)) => break 'outer,
@@ -569,6 +596,7 @@ pub fn start(cfg: &WebConfig) -> Option<WebHandle> {
         password,
         mic: Mutex::new(VecDeque::new()),
         mic_owner: Mutex::new(None),
+        media: Mutex::new(VecDeque::new()),
     });
     let (cmd_tx, cmd_rx) = unbounded();
     let (joined_tx, joined_rx) = unbounded();
