@@ -1153,8 +1153,11 @@ impl RxThread {
             .name("datv-rx".into())
             .spawn(move || {
                 crate::stream::thread_nice(-5);
-                let (btx, brx) = crossbeam_channel::bounded::<Vec<Complex32>>(800);
-                let (ftx_fs, frx_fs) = crossbeam_channel::bounded::<f64>(1);
+                // Samples (no FFT front end) or front-end words; commands back.
+                let (btx, brx) = crossbeam_channel::bounded::<Result<Vec<Complex32>, Vec<u32>>>(800);
+                let (ctx, crx) = crossbeam_channel::unbounded::<crate::dvbt2::fe::Ctl>();
+                let (ftx_fs, frx_fs) = crossbeam_channel::bounded::<(f64, bool)>(1);
+                let params = mode.p;
                 let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let (st2, dr2) = (stop.clone(), dr.clone());
                 let fs_nominal = mode.fs();
@@ -1162,41 +1165,98 @@ impl RxThread {
                     .name("datv-ring".into())
                     .spawn(move || {
                         crate::stream::thread_nice(-5);
-                        let mut fe = match super::fpga::FrontEnd::start_t2(fs_nominal) {
+                        let mut fe = match super::fpga::FrontEnd::start_t2(fs_nominal, &params) {
                             Ok(fe) => fe,
                             Err(e) => {
                                 tracing::warn!("DVB-T2: FPGA front end: {e}");
                                 return;
                             }
                         };
-                        let _ = ftx_fs.send(fe.fs_out());
+                        let _ = ftx_fs.send((fe.fs_out(), fe.t2_fe()));
                         let mut reported = false;
+                        // (`touch /tmp/t2-words-all` too: from the start, the search included)
+                        let mut rec_on = std::path::Path::new("/tmp/t2-words-all").exists();
+                        let mut gap = false;
+                        let (mut last_read, mut late) = (std::time::Instant::now(), 0u64);
                         let (mut read_s, mut t_log) = (0f64, std::time::Instant::now());
                         while !st2.load(Ordering::Relaxed) {
                             std::thread::sleep(std::time::Duration::from_millis(5));
+                            for c in crx.try_iter() {
+                                fe.t2_ctl(c);
+                            }
+                            // The ring holds about 140 ms of words: read later
+                            // than 100 ms after the last time and the DMA may
+                            // have lapped it (words lost, unnoticed otherwise).
+                            if last_read.elapsed() > std::time::Duration::from_millis(100) {
+                                gap = true;
+                                late += 1;
+                                if late == 1 || late % 100 == 0 {
+                                    tracing::warn!(late, "DVB-T2: the ring reader was late (words lost)");
+                                }
+                            }
+                            last_read = std::time::Instant::now();
                             let t0 = std::time::Instant::now();
-                            let mut buf = Vec::new();
-                            fe.read(&mut buf);
+                            let buf = if fe.t2_fe() {
+                                let mut w = Vec::new();
+                                fe.read_words(&mut w);
+                                Err(w)
+                            } else {
+                                let mut b = Vec::new();
+                                fe.read(&mut b);
+                                Ok(b)
+                            };
                             read_s += t0.elapsed().as_secs_f64();
+                            // Debug on a board: `touch /tmp/t2-words` appends the
+                            // front end's ring words (u32 LE) to /tmp/t2-words.u32
+                            // once it sends carriers, 64 MB at most (the receiver
+                            // still gets them).
+                            if let Err(w) = &buf {
+                                // (from the first carrier words on: not the search)
+                                rec_on |= w.iter().any(|&v| v & 0x1_0001 == 0x1_0001);
+                                if rec_on && std::path::Path::new("/tmp/t2-words").exists() {
+                                    use std::io::Write;
+                                    if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/t2-words.u32") {
+                                        if fh.metadata().map_or(0, |m| m.len()) < 64_000_000 {
+                                            let b: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+                                            let _ = fh.write_all(&b);
+                                        }
+                                    }
+                                }
+                            }
                             if t_log.elapsed() > std::time::Duration::from_secs(30) {
                                 tracing::info!(ring_read_cpu = format!("{:.1} %", 100.0 * read_s / t_log.elapsed().as_secs_f64()), "DVB-T2 ring");
                                 (read_s, t_log) = (0.0, std::time::Instant::now());
                             }
-                            if !reported && fe.dropped() {
+                            if !reported && (fe.dropped() || fe.t2_overflow()) {
                                 reported = true;
                                 dr2.fetch_add(1, Ordering::Relaxed);
-                                tracing::warn!("DVB-T2: the FPGA recorder dropped samples");
+                                tracing::warn!("DVB-T2: the FPGA recorder dropped samples (or the front end words)");
                             }
-                            if !buf.is_empty() && btx.try_send(buf).is_err() {
-                                dr2.fetch_add(1, Ordering::Relaxed);
+                            let mut buf = buf;
+                            let empty = match &buf {
+                                Ok(b) => b.is_empty(),
+                                Err(w) => w.is_empty(),
+                            };
+                            if gap {
+                                // Words were dropped before these: say so.
+                                if let Err(w) = &mut buf {
+                                    w.insert(0, crate::dvbt2::fe::GAP);
+                                }
+                            }
+                            if !empty {
+                                gap = btx.try_send(buf).is_err();
+                                if gap {
+                                    dr2.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                     })
                     .expect("spawn datv-ring");
-                let Ok(fs) = frx_fs.recv() else {
+                let Ok((fs, t2_fe)) = frx_fs.recv() else {
                     return;
                 };
-                tracing::info!(fs, mode = %label_log(&mode), "DVB-T2 receive through the FPGA resampler");
+                tracing::info!(fs, t2_fe, mode = %label_log(&mode), "DVB-T2 receive through the FPGA resampler");
+                let mut ctl = Vec::new();
                 let mut d = crate::dvbt2::stream::Demod::new(mode.p, fs);
                 let (mut blocks, mut seen) = (Vec::new(), 0u64);
                 let (mut busy_s, mut t_log) = (0f64, std::time::Instant::now());
@@ -1212,7 +1272,15 @@ impl RxThread {
                         Ok(buf) => {
                             let t0 = std::time::Instant::now();
                             d.set_center(f64::from_bits(fc.load(Ordering::Relaxed)));
-                            d.push(&buf, &mut blocks);
+                            match buf {
+                                Ok(b) => d.push(&b, &mut blocks),
+                                Err(w) => {
+                                    d.push_words(&w, &mut blocks, &mut ctl);
+                                    for c in ctl.drain(..) {
+                                        let _ = ctx.send(c);
+                                    }
+                                }
+                            }
                             let mut busy = 0;
                             for b in blocks.drain(..) {
                                 if ftx.try_send(b).is_err() {
@@ -1221,7 +1289,7 @@ impl RxThread {
                             }
                             busy_s += t0.elapsed().as_secs_f64();
                             if t_log.elapsed() > std::time::Duration::from_secs(30) {
-                                tracing::info!(demod_cpu = format!("{:.1} %", 100.0 * busy_s / t_log.elapsed().as_secs_f64()), mer_db = d.stats.mer_db, freq_hz = d.stats.freq_hz, frames = d.stats.frames, "DVB-T2 demodulator");
+                                tracing::info!(demod_cpu = format!("{:.1} %", 100.0 * busy_s / t_log.elapsed().as_secs_f64()), mer_db = d.stats.mer_db, freq_hz = d.stats.freq_hz, frames = d.stats.frames, gaps = d.stats.gaps, p1_missed = d.stats.p1_missed, "DVB-T2 demodulator");
                                 (busy_s, t_log) = (0.0, std::time::Instant::now());
                             }
                             let mut s = sh.lock().unwrap();

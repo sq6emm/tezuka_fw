@@ -246,6 +246,10 @@ pub struct Trx {
     datv_mode: bool,
     /// DATV reception (DVB-S2 receiver thread), when switched on.
     datv_rx: Option<crate::dvbs2::rx::RxThread>,
+    /// The receiver the browser asked for (symbol rate, mode, pilots): it
+    /// pauses while this board sends DATV (the A9 cannot do both, a DVB-T2
+    /// receiver starves the modulator) and resumes afterwards.
+    datv_rx_req: Option<(f64, String, bool)>,
     datv_rx_stats: crate::dvbs2::rx::Stats,
     /// Automatic receive (symbol rate "0"): the blind scan while no
     /// receiver runs, what it found last, the receiver's last progress.
@@ -459,6 +463,7 @@ impl Trx {
             datv: None,
             datv_mode: false,
             datv_rx: None,
+            datv_rx_req: None,
             datv_rx_stats: Default::default(),
             datv_scan: None,
             datv_auto: false,
@@ -1055,6 +1060,7 @@ impl Trx {
         }
         self.datv_mode = false;
         self.datv_rx = None;
+        self.datv_rx_req = None;
         self.datv_scan = None;
         self.datv_auto = false;
         self.datv_rx_stats = Default::default();
@@ -1206,6 +1212,9 @@ impl Trx {
         self.rx_quiet_until = Some(Instant::now() + RX_RECOVER);
         if self.datv.take().is_some() {
             info!("DATV off");
+            if let Some((sr, rate, pilots)) = self.datv_rx_req.clone().filter(|_| self.datv_mode && self.datv_rx.is_none()) {
+                self.datv_rx_start(sr, &rate, pilots);
+            }
         }
         if self.tx_bw != self.cfg.radio.rf_bandwidth {
             // Back from DVB-T2's width.
@@ -2178,8 +2187,12 @@ impl Trx {
                 self.datv_rx = None;
                 self.datv_scan = None;
                 self.datv_rx_stats = Default::default();
-                if on {
-                    self.datv_rx_start(num("sr").unwrap_or(64_000.0), m["rate"].as_str().unwrap_or("1/2"), m["pilots"].as_bool().unwrap_or(true));
+                self.datv_rx_req = on.then(|| {
+                    (num("sr").unwrap_or(64_000.0), m["rate"].as_str().unwrap_or("1/2").to_string(), m["pilots"].as_bool().unwrap_or(true))
+                });
+                // Sending DATV: the receiver starts when that ends.
+                if let Some((sr, rate, pilots)) = self.datv_rx_req.clone().filter(|_| self.datv.is_none()) {
+                    self.datv_rx_start(sr, &rate, pilots);
                 }
             }
             "datv" => {
@@ -2190,6 +2203,11 @@ impl Trx {
                         let sr = num("sr").unwrap_or(64_000.0);
                         let rate = m["rate"].as_str().unwrap_or("1/2").to_string();
                         self.datv_start(client, sr, &rate, m["pilots"].as_bool().unwrap_or(true));
+                        if self.datv.is_some() && (self.datv_rx.is_some() || self.datv_scan.is_some()) {
+                            info!("DATV receive paused while sending");
+                            self.datv_rx = None;
+                            self.datv_scan = None;
+                        }
                     }
                 } else if matches!(self.tx_on, Some(TxSource::Datv(_))) {
                     self.unkey();

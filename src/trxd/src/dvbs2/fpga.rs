@@ -23,6 +23,13 @@
 //! and with bit 13 set the ddc_coeff writes (address 11:0) load its table
 //! instead of the DDC's.
 //!
+//! Its OFDM front end ([`crate::dvbt2::fe`], maia-hdl `t2ofdm.py`), in
+//! bitstreams that have it, at 0x40.. (t2_layout reads back): 0x40 control
+//! (0 enable, 1 scheduled, 2 load, 5:3 shift), 0x44 frame_len, 0x48 layout
+//! (7:0 symbols, 17:8 guard interval, 25:18 early), 0x4C track, 0x50 NCO
+//! step, 0x54 next frame start, 0x58 counter, 0x5C status (21:0 frames, 22
+//! overflow). With it on the ring carries its tagged words.
+//!
 //! Only a core that says it is the ring one (platform 0xD5) is touched, and
 //! only when the device tree reserves the ring: any other Maia core's
 //! recorder writes 128 MB of RAM Linux owns.
@@ -61,6 +68,16 @@ const REG_DDC_CONTROL: usize = 0x34;
 const REG_SYMSYNC: usize = 0x38;
 const REG_OMEGA: usize = 0x3C;
 const T2: u32 = 1 << 12;
+const REG_T2_CONTROL: usize = 0x40;
+const REG_T2_FRAME_LEN: usize = 0x44;
+const REG_T2_LAYOUT: usize = 0x48;
+const REG_T2_TRACK: usize = 0x4C;
+const REG_T2_FREQ: usize = 0x50;
+const REG_T2_NEXT_START: usize = 0x54;
+const REG_T2_STATUS: usize = 0x5C;
+const T2_ENABLE: u32 = 1;
+const T2_SCHEDULED: u32 = 1 << 1;
+const T2_LOAD: u32 = 1 << 2;
 const T2_COEFF: u32 = 1 << 13;
 
 struct Mapping {
@@ -127,6 +144,8 @@ pub struct FrontEnd {
     symbols: bool,
     /// ... with header candidate flags in bit 16 (bit 0 of im).
     flagged: bool,
+    /// DVB-T2 with the FPGA's OFDM front end: the ring holds its words.
+    t2_fe: bool,
 }
 
 impl FrontEnd {
@@ -197,13 +216,13 @@ impl FrontEnd {
         }
         // 16-bit mode (0), start: the ring fills from RING_START.
         regs.wr32(REG_REC_CONTROL, 1);
-        Ok(FrontEnd { _mem: mem, regs, ring, fs_out: design.fs_out(), rd: RING_START, center_hz, generation, symbols, flagged })
+        Ok(FrontEnd { _mem: mem, regs, ring, fs_out: design.fs_out(), rd: RING_START, center_hz, generation, symbols, flagged, t2_fe: false })
     }
 
     /// DVB-T2: the recorder takes the T2 resampler's samples at (about)
     /// `fs` (the exact rate the step gives is [`Self::fs_out`]). The DDC is
     /// left off; the signal is expected on the LO (T2 fills the channel).
-    pub fn start_t2(fs: f64) -> Result<FrontEnd, String> {
+    pub fn start_t2(fs: f64, p: &crate::dvbt2::Params) -> Result<FrontEnd, String> {
         use crate::dvbt2::resamp;
         if !std::path::Path::new(DT_RING).exists() {
             return Err("no DATV ring reserved in the device tree".into());
@@ -231,7 +250,24 @@ impl FrontEnd {
         let step = resamp::step(FS_IN, fs);
         regs.wr32(REG_OMEGA, step);
         regs.wr32(REG_SYMSYNC, 0); // resets the resampler
+        // The OFDM front end, if there (its layout reads back), off until
+        // the resampler runs, then sending every sample (searching).
+        use crate::dvbt2::fe::{EARLY, TRACK};
+        let layout = p.symbols() as u32 | (p.guard.samples() as u32) << 8 | EARLY << 18;
+        regs.wr32(REG_T2_CONTROL, 0);
+        regs.wr32(REG_T2_LAYOUT, layout);
+        let t2_fe = regs.rd32(REG_T2_LAYOUT) == layout
+            && std::env::var_os("TRXD_NO_T2FE").is_none()
+            && !std::path::Path::new("/tmp/t2-nofe").exists();
+        if t2_fe {
+            regs.wr32(REG_T2_FRAME_LEN, p.frame_samples() as u32);
+            regs.wr32(REG_T2_TRACK, TRACK);
+            regs.wr32(REG_T2_FREQ, 0);
+        }
         regs.wr32(REG_SYMSYNC, T2);
+        if t2_fe {
+            regs.wr32(REG_T2_CONTROL, T2_ENABLE);
+        }
         regs.wr32(REG_REC_CONTROL, 1);
         Ok(FrontEnd {
             _mem: mem,
@@ -243,7 +279,54 @@ impl FrontEnd {
             generation,
             symbols: false,
             flagged: false,
+            t2_fe,
         })
+    }
+
+    /// DVB-T2: the ring carries the OFDM front end's words ([`Self::read_words`]).
+    pub fn t2_fe(&self) -> bool {
+        self.t2_fe
+    }
+
+    /// DVB-T2 front end: do what the receiver asks.
+    pub fn t2_ctl(&self, c: crate::dvbt2::fe::Ctl) {
+        use crate::dvbt2::fe::Ctl;
+        match c {
+            Ctl::RawAll => self.regs.wr32(REG_T2_CONTROL, T2_ENABLE),
+            Ctl::Schedule { start, freq } => {
+                self.regs.wr32(REG_T2_FREQ, freq);
+                self.regs.wr32(REG_T2_NEXT_START, start as u32);
+                self.regs.wr32(REG_T2_CONTROL, T2_ENABLE | T2_SCHEDULED | T2_LOAD);
+            }
+            Ctl::Freq(f) => self.regs.wr32(REG_T2_FREQ, f),
+        }
+    }
+
+    /// DVB-T2 front end: its word FIFOs overflowed (words lost).
+    pub fn t2_overflow(&self) -> bool {
+        self.t2_fe && self.regs.rd32(REG_T2_STATUS) & (1 << 22) != 0
+    }
+
+    /// Everything the DMA has committed since the last call, as ring words.
+    pub fn read_words(&mut self, out: &mut Vec<u32>) {
+        let c = self.regs.rd32(REG_REC_COMMITTED);
+        if !(RING_START..RING_END).contains(&c) {
+            return;
+        }
+        let mut copy = |from: u32, to: u32| {
+            let (s, e) = ((from - RING_START) as usize, (to - RING_START) as usize);
+            let at = out.len();
+            out.resize(at + (e - s) / 4, 0);
+            // SAFETY: [s, e) is inside the mapping; `out` has room.
+            unsafe { std::ptr::copy_nonoverlapping(self.ring.ptr.add(s), out[at..].as_mut_ptr().cast::<u8>(), e - s) };
+        };
+        if c >= self.rd {
+            copy(self.rd, c);
+        } else {
+            copy(self.rd, RING_END);
+            copy(RING_START, c);
+        }
+        self.rd = c;
     }
 
     /// Output rate (2 samples per symbol; T2: the elementary rate).

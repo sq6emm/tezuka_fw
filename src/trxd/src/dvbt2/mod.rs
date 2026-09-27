@@ -15,6 +15,7 @@
 //!    interval -> P1
 //! ```
 
+pub mod fe;
 pub mod frame;
 pub mod l1;
 pub mod ofdm;

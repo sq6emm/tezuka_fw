@@ -123,6 +123,229 @@ mod tests {
         assert!((r.freq_hz - 2000.0).abs() < 50.0);
     }
 
+    /// Through the FPGA front end's model, closed loop: raw samples while
+    /// searching, then the schedule and NCO the receiver sets (applied
+    /// 10 ms late, as through the ring), FFTs of the model, P1 and
+    /// frequency tracked from the raw windows. 20 ppm sample clock, 2 kHz
+    /// + the LO's 25 kHz off, noise; every packet after acquisition.
+    #[test]
+    fn t2_through_the_front_end() {
+        use super::super::fe::{model::Model, Ctl};
+        let p = Params::amateur();
+        let mut m = Modulator::new(p);
+        let mut n = 0u32;
+        let mut next = || {
+            let mut pkt = [0u8; TS_LEN];
+            pkt[0] = 0x47;
+            pkt[1] = 0x01;
+            pkt[4..8].copy_from_slice(&n.to_be_bytes());
+            n += 1;
+            pkt
+        };
+        let mut x = Vec::new();
+        for _ in 0..8 {
+            m.frame(&mut next, &mut x);
+        }
+        let fs = 131e6 / 71.0;
+        let y = super::resample(&x[100_000..], fs, fs / (1.0 + 20e-6));
+        let mut seed = 7u64;
+        let mut g = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.05
+        };
+        let q = |v: f32| (v * 3000.0).round().clamp(-32768.0, 32767.0) as i16;
+        let samples: Vec<[i16; 2]> = y
+            .iter()
+            .enumerate()
+            .map(|(k, z)| {
+                let ph = std::f64::consts::TAU * 27_000.0 * k as f64 / fs;
+                let v = z * Complex32::new(ph.cos() as f32, ph.sin() as f32) + Complex32::new(g(), g());
+                [q(v.re), q(v.im)]
+            })
+            .collect();
+        let bins: Vec<usize> = (0..1705).map(|k| super::super::ofdm::Ofdm::new(p).bin(k)).collect();
+        let mut fe = Model::new(p.frame_samples() as u64, p.symbols() as u64, p.guard.samples() as u64, &bins);
+        let mut d = super::super::stream::Demod::new(p, fs);
+        d.set_center(25_000.0);
+        let mut fec = crate::dvbs2::rx::Fec::new(crate::dvbs2::FrameSpec::long(crate::dvbs2::fpga_tx::LongMode::Qpsk12));
+        let mut stats = crate::dvbs2::rx::Stats::default();
+        let (mut words, mut blocks, mut ctl, mut packets) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut late: Vec<(usize, Ctl)> = Vec::new();
+        let chunk = 9225; // 5 ms
+        for (i, c) in samples.chunks(chunk).enumerate() {
+            // Commands reach the front end two chunks (10 ms) later.
+            for (_, cmd) in late.iter().filter(|(at, _)| *at == i) {
+                fe.apply(*cmd);
+            }
+            words.clear();
+            fe.run(c, &mut words);
+            d.push_words(&words, &mut blocks, &mut ctl);
+            late.extend(ctl.drain(..).map(|cmd| (i + 2, cmd)));
+            for llr in blocks.drain(..) {
+                fec.frame(&llr, &mut stats, &mut packets);
+            }
+        }
+        eprintln!("frames {}, blocks {}, packets {}, MER {:.1} dB, freq {:.0} Hz, P1 missed {}, LDPC failures {}", d.stats.frames, d.stats.blocks, packets.len(), d.stats.mer_db, d.stats.freq_hz, d.stats.p1_missed, stats.ldpc_fail);
+        assert!(d.stats.frames >= 4, "{} frames", d.stats.frames);
+        assert_eq!(stats.ldpc_fail, 0);
+        assert!((d.stats.freq_hz - 2000.0).abs() < 30.0);
+        let data: Vec<_> = packets.iter().filter(|p| p[1] == 0x01).collect();
+        let f0 = u32::from_be_bytes(data[0][4..8].try_into().unwrap());
+        for (i, pkt) in data.iter().enumerate() {
+            assert_eq!(u32::from_be_bytes(pkt[4..8].try_into().unwrap()), f0 + i as u32, "packet {i}");
+        }
+    }
+
+    /// A board's front-end words (`touch /tmp/t2-words` on it) through the
+    /// receiver: `T2WORDS=<file> cargo test --release t2_words -- --ignored
+    /// --nocapture` (T2CENTER=<Hz>: the LO offset trxd told it).
+    #[test]
+    #[ignore]
+    fn t2_words() {
+        let raw = std::fs::read(std::env::var("T2WORDS").expect("T2WORDS=<u32 file>")).unwrap();
+        let words: Vec<u32> = raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let mut p = Params::amateur();
+        p.rotation = std::env::var_os("T2PLAIN").is_none();
+        let fs = 131e6 / 71.0;
+        let mut d = super::super::stream::Demod::new(p, fs);
+        d.set_center(std::env::var("T2CENTER").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0));
+        let mut fec = crate::dvbs2::rx::Fec::new(crate::dvbs2::FrameSpec::long(crate::dvbs2::fpga_tx::LongMode::Qpsk12));
+        let mut stats = crate::dvbs2::rx::Stats::default();
+        let (mut blocks, mut ctl, mut packets) = (Vec::new(), Vec::new(), Vec::new());
+        let mut mers = Vec::new();
+        for c in words.chunks(20_000) {
+            let f0 = d.stats.frames;
+            d.push_words(c, &mut blocks, &mut ctl);
+            if d.stats.frames != f0 {
+                mers.push((d.stats.mer_db * 10.0).round() / 10.0);
+            }
+            for cmd in ctl.drain(..) {
+                eprintln!("ctl {cmd:?}");
+            }
+            for llr in blocks.drain(..) {
+                fec.frame(&llr, &mut stats, &mut packets);
+            }
+        }
+        eprintln!("{} words: frames {}, blocks {}, packets {}, LDPC failures {}, freq {:.0} Hz, P1 missed {}, MER {:?}", words.len(), d.stats.frames, d.stats.blocks, packets.len(), stats.ldpc_fail, d.stats.freq_hz, d.stats.p1_missed, mers);
+        if std::env::var_os("T2DBG").is_none() {
+            return;
+        }
+        // Raw runs and FFTs, independent of the receiver.
+        use super::super::fe::{decode, Word};
+        let (mut runs, mut ffts): (Vec<(u64, Vec<Complex32>)>, Vec<(u8, u32, Vec<Complex32>)>) = (Vec::new(), Vec::new());
+        let mut next: Option<u64> = None;
+        for &w in &words {
+            match decode(w) {
+                Word::Gap => next = None,
+                Word::RawHeader(c) => {
+                    if next != Some(c as u64) {
+                        runs.push((c as u64, Vec::new()));
+                    }
+                    next = Some(c as u64);
+                }
+                Word::Raw(v) => {
+                    if let Some(r) = runs.last_mut() {
+                        r.1.push(Complex32::new(v[0] as f32, v[1] as f32) / 32768.0);
+                        next = next.map(|n| n + 1);
+                    }
+                }
+                Word::CarHeader { j, f22 } => ffts.push((j, f22, Vec::new())),
+                Word::Car(v) => {
+                    if let Some(f) = ffts.last_mut() {
+                        f.2.push(Complex32::new(v[0] as f32, v[1] as f32));
+                    }
+                }
+            }
+        }
+        let lens: Vec<usize> = runs.iter().map(|r| r.1.len()).take(12).collect();
+        eprintln!("{} raw runs (first lengths {:?}), {} FFTs (first {:?})", runs.len(), lens, ffts.len(), ffts.iter().take(12).map(|f| (f.0, f.1, f.2.len())).collect::<Vec<_>>());
+        let ofdm = super::super::ofdm::Ofdm::new(p);
+        let p1 = ofdm.p1();
+        if let Ok(path) = std::env::var("T2P1OUT") {
+            let b: Vec<u8> = p1.iter().flat_map(|z| [z.re.to_le_bytes(), z.im.to_le_bytes()]).flatten().collect();
+            std::fs::write(path, b).unwrap();
+        }
+        let e1: f32 = p1.iter().map(|z| z.norm_sqr()).sum();
+        for (c, r) in runs.iter().filter(|r| r.1.len() >= 2048 + 128).take(6) {
+            let r: Vec<Complex32> = r.iter().take(600_000).copied().collect();
+            let rc: Vec<Complex32> = r.iter().map(|z| z.conj()).collect();
+            for (name, x) in [("as is", &r), ("conj", &rc)] {
+                if let Some((s, f, q)) = super::super::stream::find_p1_in(x, p1, e1, 0, x.len() - 2048 + 1, fs) {
+                    eprintln!("P1 run at {c} len {} ({name}): best offset {s}, coarse {f:.0} Hz, q {q:.2}", x.len());
+                }
+            }
+        }
+        // Pilot coherence of the P2 symbols' FFTs: neighbouring pilots after
+        // removing the known values.
+        let bins: Vec<usize> = (0..1705).map(|k| ofdm.bin(k)).collect();
+        let order = super::super::fe::carrier_order(&bins);
+        for (j, f22, v) in ffts.iter().filter(|f| f.0 < 8 && f.2.len() == 1705).take(6) {
+            let mut c = vec![Complex32::default(); 1705];
+            for (pos, &k) in order.iter().enumerate() {
+                c[k] = v[pos];
+            }
+            let plan = ofdm.plan(*j as usize);
+            let z: Vec<Complex32> = plan.iter().enumerate().filter_map(|(k, pv)| pv.filter(|x| x.norm() > 0.0).map(|x| c[k] / x)).collect();
+            let num: Complex32 = z.windows(2).map(|w| w[1] * w[0].conj()).sum();
+            let den: f32 = z.windows(2).map(|w| w[1].norm() * w[0].norm()).sum();
+            let pw: f32 = c.iter().map(|x| x.norm_sqr()).sum::<f32>() / 1705.0;
+            eprintln!("FFT j {j} F {f22}: pilot coherence {:.2} (phase step {:.3} rad), mean power {pw:.0}", num.norm() / den, num.arg());
+        }
+    }
+
+    /// The front-end path's time per stage (run it on the board:
+    /// `trxd-test t2_fe_speed --ignored --nocapture`): words made by the
+    /// model first (closed loop), then only the receiver timed on them.
+    #[test]
+    #[ignore]
+    fn t2_fe_speed() {
+        use super::super::fe::model::Model;
+        let p = Params::amateur();
+        let mut m = Modulator::new(p);
+        let mut next = || [0x47u8; TS_LEN];
+        let mut x = Vec::new();
+        for _ in 0..7 {
+            m.frame(&mut next, &mut x);
+        }
+        let fs = 131e6 / 71.0;
+        let q = |v: f32| (v * 3000.0).round().clamp(-32768.0, 32767.0) as i16;
+        let samples: Vec<[i16; 2]> = x.iter().map(|z| [q(z.re), q(z.im)]).collect();
+        let bins: Vec<usize> = (0..1705).map(|k| super::super::ofdm::Ofdm::new(p).bin(k)).collect();
+        let mut fe = Model::new(p.frame_samples() as u64, p.symbols() as u64, p.guard.samples() as u64, &bins);
+        let mut d = super::super::stream::Demod::new(p, fs);
+        let (mut blocks, mut ctl) = (Vec::new(), Vec::new());
+        let mut chunks = Vec::new();
+        for c in samples.chunks(9225) {
+            let mut w = Vec::new();
+            fe.run(c, &mut w);
+            d.push_words(&w, &mut blocks, &mut ctl);
+            for cmd in ctl.drain(..) {
+                fe.apply(cmd);
+            }
+            chunks.push(w);
+        }
+        blocks.clear();
+        let mut d = super::super::stream::Demod::new(p, fs);
+        let t = std::time::Instant::now();
+        // Steady state: from the end of the first frame decoded.
+        let (mut t1, mut prof1, mut f1) = (None, [0.0; 6], 0u64);
+        for w in &chunks {
+            d.push_words(w, &mut blocks, &mut ctl);
+            if t1.is_none() && d.stats.frames >= 1 {
+                t1 = Some(std::time::Instant::now());
+                prof1 = d.prof;
+                f1 = d.stats.frames;
+            }
+        }
+        let el = t.elapsed().as_secs_f64();
+        let frames = (d.stats.frames - f1) as f64;
+        eprintln!("{} frames, {} blocks in {:.3} s; MER {:.1} dB; steady state {:.1} ms a frame", d.stats.frames, blocks.len(), el, d.stats.mer_db,
+            1e3 * t1.map_or(0.0, |t| t.elapsed().as_secs_f64()) / frames.max(1.0));
+        for ((n, v), v1) in super::super::stream::PROF_NAMES.iter().zip(d.prof).zip(prof1) {
+            eprintln!("  {n:>12}: {:.1} ms a frame", 1e3 * (v - v1) / frames.max(1.0));
+        }
+    }
+
     /// Demodulator time per stage for a frame (run it on the board:
     /// `trxd-test t2_demod_speed --ignored --nocapture`).
     #[test]

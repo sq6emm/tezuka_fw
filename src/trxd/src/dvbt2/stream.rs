@@ -35,6 +35,8 @@ const P1_LEN: usize = 2048;
 const TRACK: usize = 64;
 /// Known-P1 correlation (0..1) above which a P1 counts as found.
 const P1_OK: f32 = 0.2;
+/// ... when tracking (within +-4 samples of where it should be).
+const P1_TRACK_OK: f32 = 0.15;
 /// Equalized cells to 8 bits: unit amplitude = CELL_SCALE.
 const CELL_SCALE: f32 = 40.0;
 const CARRIERS: usize = 1705;
@@ -51,6 +53,8 @@ pub struct Stats {
     pub freq_hz: f32,
     /// FEC blocks handed on.
     pub blocks: u64,
+    /// Places the input had words missing (the ring reader was behind).
+    pub gaps: u64,
 }
 
 pub const PROF_NAMES: [&str; 6] = ["p1", "fft", "equalize", "deinterleave", "llr", "input"];
@@ -89,6 +93,11 @@ pub struct Demod {
     /// deinterleaver, the frame's layout and the cell deinterleaver in one.
     gather: Vec<Vec<u32>>,
     pre_gather: Vec<u32>,
+    /// The same the other way: for each flat cell, its place in `cells`
+    /// (FEC block * block cells + cell), or u32::MAX (L1, dummy cells).
+    scatter: Vec<u32>,
+    /// The frame's FEC block cells, in block order, 8-bit I/Q.
+    cells: Vec<[i8; 2]>,
     /// The frame's data cells, equalized, 8-bit I/Q.
     flat: Vec<[i8; 2]>,
     /// Samples from absolute index `base` on.
@@ -109,6 +118,10 @@ pub struct Demod {
     work: Vec<Complex32>,
     scratch: Vec<Complex32>,
     carriers: Vec<Complex32>,
+    /// With the FPGA's OFDM front end ([`Self::push_words`]).
+    fe: Option<Box<FeState>>,
+    /// Carrier index of each carrier word of an FPGA FFT.
+    order: Vec<usize>,
     pub stats: Stats,
     /// Some equalized data cells of the last frame, for the browser.
     pub constellation: Vec<[i8; 2]>,
@@ -141,6 +154,7 @@ impl Demod {
         let early = gi / 4;
         let scale = 1.0 / (FFT as f32 * ofdm.norm());
         let bins: Vec<usize> = (0..CARRIERS).map(|k| ofdm.bin(k)).collect();
+        let order = super::fe::carrier_order(&bins);
         // A window `early` samples before the symbol: carrier k turns by
         // exp(-j 2 pi (bin freq) early / N); undo it.
         let early_rot = bins
@@ -166,6 +180,13 @@ impl Demod {
         let cells = fi.unframe(&idx);
         let (pre_gather, _post, dcells) = fm.unmap(&cells);
         let gather = ci.deinterleave(&dcells, p.fec_blocks);
+        let mut scatter = vec![u32::MAX; at];
+        for (b, g) in gather.iter().enumerate() {
+            for (j, &i) in g.iter().enumerate() {
+                scatter[i as usize] = (b * g.len() + j) as u32;
+            }
+        }
+        let ncells = gather.iter().map(|g| g.len()).sum();
         let fft = FftPlanner::new().plan_fft_forward(FFT);
         let scratch = vec![Complex32::default(); fft.get_inplace_scratch_len()];
         Demod {
@@ -187,6 +208,8 @@ impl Demod {
             shift,
             gather,
             pre_gather,
+            scatter,
+            cells: vec![[0; 2]; ncells],
             buf: Vec::new(),
             base: 0,
             center_hz: 0.0,
@@ -199,6 +222,8 @@ impl Demod {
             work: vec![Complex32::default(); FFT],
             scratch,
             carriers: vec![Complex32::default(); N_P2 * CARRIERS],
+            fe: None,
+            order,
             stats: Stats::default(),
             constellation: Vec::new(),
             constellation_seq: 0,
@@ -377,6 +402,12 @@ impl Demod {
             self.fft_symbol(start, j, j);
         }
         self.prof[1] += t0.elapsed().as_secs_f64();
+        self.p2_channel();
+    }
+
+    /// The channel from the P2 symbols' carriers (in `carriers` slots
+    /// 0..8), then their cells.
+    fn p2_channel(&mut self) {
         let t0 = std::time::Instant::now();
         // Channel from the P2 pilots, linear between them, averaged. Each
         // carrier once: [k0, k1) per pair of neighbouring pilots, the last
@@ -450,15 +481,26 @@ impl Demod {
         }
         let a = if c.norm() > 0.0 { c.arg() } else { 0.0 };
         let (mut r, mut kk) = (Complex32::from_polar(CELL_SCALE, -a), 0usize);
-        let q = |v: f32| v.round().clamp(-127.0, 127.0) as i8;
-        let out = &mut self.flat[self.data_at[j]..self.data_at[j + 1]];
-        for (o, &k) in out.iter_mut().zip(&self.data[j]) {
+        let q = q8;
+        let (lo, hi) = (self.data_at[j], self.data_at[j + 1]);
+        let out = &mut self.flat[lo..hi];
+        let dest = &self.scatter[lo..hi];
+        let cells = &mut self.cells;
+        for ((o, &d), &k) in out.iter_mut().zip(dest).zip(&self.data[j]) {
             while kk < k {
                 r *= step;
                 kk += 1;
             }
             let v = cj[k] * hinv[k] * r;
-            *o = [q(v.re), q(v.im)];
+            let c = [q(v.re), q(v.im)];
+            // FEC block cells straight to their place (stores miss the
+            // caches more cheaply than a gather's loads); the rest (L1,
+            // dummy cells) in `flat`.
+            if d != u32::MAX {
+                cells[d as usize] = c;
+            } else {
+                *o = c;
+            }
         }
     }
 
@@ -469,12 +511,11 @@ impl Demod {
         let flat = &self.flat;
         let cell = |i: u32| {
             let v = flat[i as usize];
-            Complex32::new(v[0] as f32, v[1] as f32) / CELL_SCALE
+            Complex32::new(v[0] as f32, v[1] as f32) * (1.0 / CELL_SCALE)
         };
         // The browser's constellation: a data symbol's cells.
-        let off = self.data_at[N_P2 + 5];
-        let q = |v: f32| (v * 56.0 / CELL_SCALE).round().clamp(-127.0, 127.0) as i8;
-        self.constellation = flat[off..].iter().step_by(6).take(256).map(|z| [q(z[0] as f32), q(z[1] as f32)]).collect();
+        let q = |v: f32| q8(v * 56.0 / CELL_SCALE);
+        self.constellation = self.cells.iter().step_by(97).take(256).map(|z| [q(z[0] as f32), q(z[1] as f32)]).collect();
         self.constellation_seq += 1;
         let (mut sig, mut err) = (0f32, 0f32);
         for (&i, &r) in self.pre_gather.iter().zip(&self.pre_ref) {
@@ -482,6 +523,18 @@ impl Demod {
             err += (cell(i) - Complex32::new(r, 0.0)).norm_sqr();
         }
         self.stats.mer_db = 10.0 * (sig / err.max(1e-12)).log10();
+        if std::env::var_os("T2PRE").is_some() && self.stats.frames < 3 {
+            let v: Vec<String> = self.pre_gather.iter().zip(&self.pre_ref).take(12).map(|(&i, &r)| format!("{:+.2}{:+.2}j/{r:+}", cell(i).re, cell(i).im)).collect();
+            eprintln!("L1-pre cells: {}", v.join(" "));
+            let (mut sr, mut si) = (0f32, 0f32);
+            for (&i, &r) in self.pre_gather.iter().zip(&self.pre_ref) {
+                sr += cell(i).re * r;
+                si += cell(i).im * r;
+            }
+            eprintln!("  sum(cell * ref) / n = {:.3}{:+.3}j", sr / self.pre_ref.len() as f32, si / self.pre_ref.len() as f32);
+            let mean_abs: f32 = self.cells.iter().take(5000).map(|c| ((c[0] as f32).powi(2) + (c[1] as f32).powi(2)).sqrt()).sum::<f32>() / 5000.0 / CELL_SCALE;
+            eprintln!("  data cells mean |z| {mean_abs:.2}");
+        }
         self.stats.frames += 1;
         let sigma2 = (err / self.pre_gather.len() as f32).max(1e-6);
         // Rotated constellations: word j's I is in cell j, its Q in cell
@@ -490,59 +543,80 @@ impl Demod {
             Constellation::Qpsk => 29.0,
             Constellation::Qam16 => 16.8,
         };
-        let derot = Complex32::from_polar(1.0, -angle.to_radians());
         self.prof[3] += t0.elapsed().as_secs_f64();
-        for g in &self.gather {
-            let t0 = std::time::Instant::now();
-            let blk: Vec<Complex32> = g.iter().map(|&i| cell(i)).collect();
-            self.prof[3] += t0.elapsed().as_secs_f64();
-            let t0 = std::time::Instant::now();
-            let n = blk.len();
-            let z = |j: usize| if p.rotation { Complex32::new(blk[j].re, blk[(j + 1) % n].im) * derot } else { blk[j] };
-            let cell_llr: Vec<f32> = match p.constellation {
-                Constellation::Qpsk => {
-                    let s = 2.0 * std::f32::consts::FRAC_1_SQRT_2 * 2.0 / sigma2;
-                    (0..n)
-                        .flat_map(|j| {
-                            let z = z(j);
-                            [z.re * s, z.im * s]
-                        })
-                        .collect()
-                }
+        // Gather and LLRs in one pass, straight from the 8-bit cells (the
+        // A9 has no integer divide and no vectorized f32: no % or / here).
+        let t0 = std::time::Instant::now();
+        let (sn, cs) = (-angle.to_radians()).sin_cos();
+        let bits = p.constellation.bits();
+        let n = self.gather[0].len();
+        for blk in self.cells.chunks(n) {
+            let mut llr = vec![0f32; n * bits];
+            let (k, a) = match p.constellation {
+                Constellation::Qpsk => (2.0 * std::f32::consts::FRAC_1_SQRT_2 * 2.0 / sigma2 / CELL_SCALE, 0.0),
                 Constellation::Qam16 => {
-                    // Word bits 3, 2: signs of I, Q (0 positive); 1, 0: outer
-                    // (0) or inner level. Max-log, per axis.
                     let a = 1.0 / 10f32.sqrt();
-                    let s = 4.0 * a / sigma2;
-                    (0..n)
-                        .flat_map(|j| {
-                            let z = z(j);
-                            [z.re * s, z.im * s, (z.re.abs() - 2.0 * a) * s, (z.im.abs() - 2.0 * a) * s]
-                        })
-                        .collect()
+                    (4.0 * a / sigma2 / CELL_SCALE, 2.0 * a * CELL_SCALE)
                 }
             };
-            out.push(self.bi.deinterleave_llr(&cell_llr));
+            for j in 0..n {
+                let c = blk[j];
+                let (zr, zi) = if p.rotation {
+                    // word j: I from cell j, Q from cell j + 1; rotate back
+                    let d = blk[if j + 1 == n { 0 } else { j + 1 }];
+                    let (re, im) = (c[0] as f32, d[1] as f32);
+                    (re * cs - im * sn, re * sn + im * cs)
+                } else {
+                    (c[0] as f32, c[1] as f32)
+                };
+                match p.constellation {
+                    Constellation::Qpsk => {
+                        llr[2 * j] = zr * k;
+                        llr[2 * j + 1] = zi * k;
+                    }
+                    Constellation::Qam16 => {
+                        // Word bits 3, 2: signs of I, Q (0 positive); 1, 0:
+                        // outer (0) or inner level. Max-log, per axis.
+                        llr[4 * j] = zr * k;
+                        llr[4 * j + 1] = zi * k;
+                        llr[4 * j + 2] = (zr.abs() - a) * k;
+                        llr[4 * j + 3] = (zi.abs() - a) * k;
+                    }
+                }
+            }
+            out.push(match p.constellation {
+                Constellation::Qpsk => llr,
+                Constellation::Qam16 => self.bi.deinterleave_llr(&llr),
+            });
             self.stats.blocks += 1;
-            self.prof[4] += t0.elapsed().as_secs_f64();
         }
+        self.prof[4] += t0.elapsed().as_secs_f64();
     }
 
     /// The known P1 (at the nominal offset) within `r` samples of `at`
     /// (absolute): its start, the carrier's offset from the input's centre
     /// (coarse), the match.
     fn p1_near(&self, at: u64, r: usize) -> Option<(u64, f64, f32)> {
-        let a = self.at(at.max(self.base));
-        let (s, c, q) = find_p1_in(&self.buf, &self.p1c, self.p1_energy, a.saturating_sub(r), a + r + 1, self.fs)?;
-        Some((self.base + s as u64, c + self.center_hz, q))
+        self.p1_near_in(&self.buf, self.base, at, r)
+    }
+
+    /// [`Self::p1_near`] in samples `x` starting at counter `base`.
+    fn p1_near_in(&self, x: &[Complex32], base: u64, at: u64, r: usize) -> Option<(u64, f64, f32)> {
+        let a = (at.max(base) - base) as usize;
+        let (s, c, q) = find_p1_in(x, &self.p1c, self.p1_energy, a.saturating_sub(r), a + r + 1, self.fs)?;
+        Some((base + s as u64, c + self.center_hz, q))
     }
 
     /// Start of the best P1 by structure among `from..=to` (absolute; offset
     /// blind).
     fn structure_peak(&self, from: u64, to: u64) -> u64 {
-        let x = &self.buf;
-        let from = from.max(self.base);
-        let base = self.at(from);
+        self.structure_peak_in(&self.buf, self.base, from, to)
+    }
+
+    /// [`Self::structure_peak`] in samples `x` starting at counter `xbase`.
+    fn structure_peak_in(&self, x: &[Complex32], xbase: u64, from: u64, to: u64) -> u64 {
+        let from = from.max(xbase);
+        let base = (from - xbase) as usize;
         let n = (to - from) as usize + P1_LEN;
         // u[m] = x[m] conj(x[m + 1024]) e^(-j 2 pi m / 1024): C against the
         // A it copies; v[m] = x[m] conj(x[m - 482]) e^(..): B against A.
@@ -574,6 +648,329 @@ impl Demod {
         }
         from + best.0 as u64
     }
+}
+
+/// The receiver's side of the FPGA front end.
+struct FeState {
+    /// Searching: the front end sends every sample (into `buf`).
+    acquiring: bool,
+    /// Counter of the next raw sample; the newest counter seen.
+    raw_next: Option<u64>,
+    now: u64,
+    /// Raw runs (counter of the first sample, samples), oldest first.
+    runs: std::collections::VecDeque<(u64, Vec<Complex32>)>,
+    /// The FFT coming in: (symbol, frame start), carriers so far.
+    car: Option<(usize, u64)>,
+    car_pos: usize,
+    car_buf: Vec<Complex32>,
+    /// The frame being assembled: its start, the next symbol expected,
+    /// whether all came.
+    frame: Option<(u64, usize, bool)>,
+    /// Carrier offset (absolute, Hz), the one the NCO takes out.
+    f_est: f64,
+    nco_hz: f64,
+    misses: u32,
+    /// The next frame's P1, to be checked once its raw samples are in.
+    p1_check: Option<u64>,
+    /// Every sample raw asked for: carrier words still queued from before
+    /// are not a schedule to join, until a long raw run shows it took.
+    raw_all_asked: bool,
+    /// Samples in the raw run so far.
+    run_len: usize,
+}
+
+impl Demod {
+    /// Words from the FPGA's OFDM front end ([`super::fe`]) in; FEC blocks
+    /// out as from [`Self::push`]; `ctl` gets what the front end must do.
+    pub fn push_words(&mut self, words: &[u32], out: &mut Vec<Vec<f32>>, ctl: &mut Vec<super::fe::Ctl>) {
+        use super::fe::{decode, extend, Word};
+        let mut fe = self.fe.take().unwrap_or_else(|| {
+            Box::new(FeState {
+                acquiring: true,
+                raw_next: None,
+                now: 0,
+                runs: Default::default(),
+                car: None,
+                car_pos: 0,
+                car_buf: vec![Complex32::default(); CARRIERS],
+                frame: None,
+                f_est: 0.0,
+                nco_hz: 0.0,
+                misses: 0,
+                p1_check: None,
+                raw_all_asked: false,
+                run_len: 0,
+            })
+        });
+        let t_in = std::time::Instant::now();
+        let mut acq: Vec<Complex32> = Vec::new();
+        for &w in words {
+            match decode(w) {
+                Word::Gap => {
+                    // Words lost: nothing continues across it.
+                    fe.raw_next = None;
+                    fe.run_len = 0;
+                    fe.car = None;
+                    if let Some(f) = fe.frame.as_mut() {
+                        f.2 = false;
+                    }
+                    if fe.acquiring {
+                        self.buf.clear();
+                        acq.clear();
+                    }
+                    self.stats.gaps += 1;
+                }
+                Word::RawHeader(p) => {
+                    let c = extend(p, 30, fe.raw_next.unwrap_or(fe.now));
+                    if fe.raw_next != Some(c) {
+                        fe.run_len = 0;
+                    }
+                    if fe.acquiring {
+                        // A gap: start the search buffer again.
+                        if fe.raw_next != Some(c) {
+                            self.buf.clear();
+                            self.base = c;
+                            acq.clear();
+                        }
+                    } else if fe.raw_next != Some(c) || fe.runs.is_empty() {
+                        fe.runs.push_back((c, Vec::new()));
+                    }
+                    fe.raw_next = Some(c);
+                }
+                Word::Raw(v) => {
+                    let Some(c) = fe.raw_next else { continue };
+                    let z = Complex32::new(v[0] as f32, v[1] as f32) / 32768.0;
+                    if fe.acquiring {
+                        if self.buf.is_empty() && acq.is_empty() {
+                            self.base = c;
+                        }
+                        acq.push(z);
+                    } else if let Some(r) = fe.runs.back_mut() {
+                        r.1.push(z);
+                        // A long run (every sample raw: before the schedule
+                        // took): only its end can matter.
+                        if r.1.len() > 3 * self.p.frame_samples() {
+                            let cut = self.p.frame_samples();
+                            r.1.drain(..cut);
+                            r.0 += cut as u64;
+                        }
+                    }
+                    fe.raw_next = Some(c + 1);
+                    fe.now = c + 1;
+                    fe.run_len += 1;
+                    if fe.run_len > 3 * (P1_LEN + 512) {
+                        fe.raw_all_asked = false;
+                    }
+                }
+                Word::CarHeader { j, f22 } => {
+                    if fe.acquiring && fe.raw_next.is_some() && !fe.raw_all_asked {
+                        // The front end is already scheduled (the receiver
+                        // restarted, a recording): take its frames.
+                        fe.acquiring = false;
+                        fe.runs.clear();
+                        self.buf.clear();
+                        acq.clear();
+                        self.stats.locked = true;
+                    }
+                    fe.car = Some((j as usize, extend(f22, 22, fe.now)));
+                    fe.car_pos = 0;
+                }
+                Word::Car(v) => {
+                    if fe.car.is_none() || fe.car_pos >= CARRIERS {
+                        continue;
+                    }
+                    fe.car_buf[self.order[fe.car_pos]] = Complex32::new(v[0] as f32, v[1] as f32);
+                    fe.car_pos += 1;
+                    if fe.car_pos == CARRIERS {
+                        let (j, f) = fe.car.take().unwrap();
+                        if !fe.acquiring {
+                            self.fe_symbol(&mut fe, j, f, out, ctl);
+                        }
+                    }
+                }
+            }
+        }
+        self.prof[5] += t_in.elapsed().as_secs_f64();
+        if fe.acquiring {
+            self.buf.extend_from_slice(&acq);
+            self.fe_acquire(&mut fe, ctl);
+        } else if let Some(next) = fe.p1_check {
+            if fe.now >= next + (P1_LEN + 2 * super::fe::TRACK as usize) as u64 {
+                fe.p1_check = None;
+                self.fe_p1(&mut fe, next, ctl);
+            }
+        }
+        // Raw runs older than two frames go.
+        let keep = fe.now.saturating_sub(2 * self.p.frame_samples() as u64);
+        while fe.runs.len() > 1 && fe.runs.front().is_some_and(|r| r.0 + (r.1.len() as u64) < keep) {
+            fe.runs.pop_front();
+        }
+        self.fe = Some(fe);
+    }
+
+    /// Searching: P1 and the frequency in the raw samples, then a schedule
+    /// for the front end from a frame far enough ahead.
+    fn fe_acquire(&mut self, fe: &mut FeState, ctl: &mut Vec<super::fe::Ctl>) {
+        let frame = self.p.frame_samples() as u64;
+        let gi = self.p.guard.samples();
+        let need = frame + (P1_LEN + N_P2 * (FFT + gi) + 1024) as u64;
+        if (self.buf.len() as u64) < need {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let peak = self.structure_peak(self.base, self.base + frame);
+        let found = self.p1_near(peak, 32).filter(|f| f.2 >= P1_OK);
+        self.prof[0] += t0.elapsed().as_secs_f64();
+        let Some((s, coarse, _)) = found else {
+            self.stats.locked = false;
+            self.buf.drain(..frame as usize);
+            self.base += frame;
+            return;
+        };
+        let mut cp = Complex32::default();
+        for j in 0..N_P2 {
+            cp += self.gi_corr(s, j);
+        }
+        let f = self.resolve_freq(cp, coarse);
+        // A frame well beyond what is in (the ring and this search take
+        // their time; a start already past, the front end catches up with).
+        let end = self.base + self.buf.len() as u64;
+        let mut start = s;
+        while start < end + (self.fs * 0.3) as u64 {
+            start += frame;
+        }
+        ctl.push(super::fe::Ctl::Schedule { start, freq: super::fe::freq_word(f, self.fs) });
+        fe.acquiring = false;
+        fe.f_est = f;
+        fe.nco_hz = f;
+        fe.misses = 0;
+        fe.frame = None;
+        fe.p1_check = None;
+        fe.runs.clear();
+        fe.raw_next = None;
+        self.stats.locked = true;
+        self.stats.freq_hz = (f - self.center_hz) as f32;
+        self.buf.clear();
+    }
+
+    /// The carrier offset from a guard-interval correlation (modulo a
+    /// carrier spacing) and an estimate that picks the multiple.
+    fn resolve_freq(&self, cp: Complex32, near: f64) -> f64 {
+        let spacing = self.fs / FFT as f64;
+        let frac = cp.arg() as f64 / (std::f64::consts::TAU * FFT as f64) * self.fs;
+        frac + ((near - frac) / spacing).round() * spacing
+    }
+
+    /// `len` raw samples from counter `at`, if one run holds them.
+    fn fe_raw<'a>(fe: &'a FeState, at: u64, len: usize) -> Option<&'a [Complex32]> {
+        fe.runs.iter().rev().find_map(|(c, v)| {
+            (*c <= at && at + len as u64 <= c + v.len() as u64).then(|| &v[(at - c) as usize..(at - c) as usize + len])
+        })
+    }
+
+    /// One FFT from the front end: symbol `j` of the frame starting at `f`.
+    fn fe_symbol(&mut self, fe: &mut FeState, j: usize, f: u64, out: &mut Vec<Vec<f32>>, ctl: &mut Vec<super::fe::Ctl>) {
+        let nsym = self.p.symbols();
+        match fe.frame {
+            Some((ff, next, ok)) if ff == f => fe.frame = Some((f, j + 1, ok && j == next)),
+            _ => fe.frame = Some((f, j + 1, j == 0)),
+        }
+        let ok = fe.frame.unwrap().2;
+        if !ok {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let slot = if j < N_P2 { j } else { 0 };
+        let e = &self.early_rot;
+        for ((o, &v), &r) in self.carriers[slot * CARRIERS..(slot + 1) * CARRIERS].iter_mut().zip(&fe.car_buf).zip(e) {
+            *o = v * r;
+        }
+        self.prof[1] += t0.elapsed().as_secs_f64();
+        if j == N_P2 - 1 {
+            self.p2_channel();
+        } else if j >= N_P2 {
+            let t0 = std::time::Instant::now();
+            self.equalize(j, 0);
+            self.prof[2] += t0.elapsed().as_secs_f64();
+        }
+        if j == nsym - 1 {
+            self.finish(out);
+            self.fe_track(fe, f, ctl);
+        }
+    }
+
+    /// After a frame: its frequency from the guard intervals, the next
+    /// frame's P1 against where the front end put it.
+    fn fe_track(&mut self, fe: &mut FeState, f: u64, ctl: &mut Vec<super::fe::Ctl>) {
+        use super::fe::{freq_word, Ctl};
+        let gi = self.p.guard.samples();
+        let sl = FFT + gi;
+        let mut cp = Complex32::default();
+        for j in 0..self.p.symbols() {
+            let g = f + (P1_LEN + j * sl) as u64;
+            if let (Some(a), Some(b)) = (Self::fe_raw(fe, g, gi), Self::fe_raw(fe, g + FFT as u64, gi)) {
+                for (x, y) in a.iter().zip(b) {
+                    cp += x.conj() * y;
+                }
+            }
+        }
+        if cp.norm() > 0.0 {
+            let fnew = self.resolve_freq(cp, fe.f_est);
+            fe.f_est = fnew;
+            self.stats.freq_hz = (fnew - self.center_hz) as f32;
+            if (fnew - fe.nco_hz).abs() > 2.0 {
+                fe.nco_hz = fnew;
+                ctl.push(Ctl::Freq(freq_word(fnew, self.fs)));
+            }
+        }
+        fe.p1_check = Some(f + self.p.frame_samples() as u64);
+    }
+
+    /// The P1 of the frame the front end starts at `next`: where it really
+    /// is; the frame after moves to match.
+    fn fe_p1(&mut self, fe: &mut FeState, next: u64, ctl: &mut Vec<super::fe::Ctl>) {
+        use super::fe::{freq_word, Ctl, TRACK};
+        let frame = self.p.frame_samples() as u64;
+        let t0 = std::time::Instant::now();
+        let found = Self::fe_raw(fe, next - TRACK as u64, P1_LEN + 2 * TRACK as usize).and_then(|x| {
+            let base = next - TRACK as u64;
+            let peak = self.structure_peak_in(x, base, next - TRACK as u64, next + TRACK as u64 - 1);
+            let peak = peak.min(next + TRACK as u64 - 5).max(base + 4);
+            self.p1_near_in(x, base, peak, 4)
+        });
+        self.prof[0] += t0.elapsed().as_secs_f64();
+        // Where it should be, within a few samples: a lower bar than the
+        // search's (noise alone reaches about 0.1 here).
+        match found.filter(|v| v.2 >= P1_TRACK_OK) {
+            Some((s, _, _)) => {
+                fe.misses = 0;
+                // Off by more than a couple of samples: move the frame after
+                // it, while it is still ahead of the front end.
+                if s.abs_diff(next) > 2 && fe.now + ((self.fs * 0.03) as u64) < next + frame {
+                    ctl.push(Ctl::Schedule { start: s + frame, freq: freq_word(fe.nco_hz, self.fs) });
+                }
+            }
+            None => {
+                fe.misses += 1;
+                self.stats.p1_missed += 1;
+                if fe.misses >= 6 {
+                    ctl.push(Ctl::RawAll);
+                    fe.raw_all_asked = true;
+                    fe.acquiring = true;
+                    fe.frame = None;
+                    fe.raw_next = None;
+                    fe.p1_check = None;
+                    self.stats.locked = false;
+                    self.buf.clear();
+                }
+            }
+        }
+    }
+}
+
+/// Round to 8 bits (saturating) without libm's round().
+fn q8(v: f32) -> i8 {
+    (v + if v >= 0.0 { 0.5 } else { -0.5 }) as i8
 }
 
 /// The known P1 correlated at start positions `from..to` in 16 coherent
