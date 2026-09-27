@@ -146,6 +146,8 @@ struct Datv {
     /// the FPGA transmits (`fpga`).
     modulator: Option<crate::dvbs2::Modulator>,
     fpga: Option<crate::dvbs2::fpga_tx::Transmitter>,
+    /// DVB-T2 (its own thread; raw IQ through the FPGA interpolator).
+    t2: Option<crate::dvbt2::tx::T2Tx>,
     /// Encoder bytes not yet written (FPGA).
     pending: Vec<u8>,
     rate_label: String,
@@ -162,6 +164,8 @@ pub struct Trx {
     radio: Box<dyn RadioControl>,
     rate: f64,
     block: usize,
+    /// TX analog bandwidth now set (DVB-T2 needs more than the default).
+    tx_bw: u32,
 
     // Radio state
     vfo_a: f64,
@@ -378,6 +382,7 @@ impl Trx {
             radio,
             rate,
             block,
+            tx_bw: cfg.radio.rf_bandwidth,
             vfo_a: vfo,
             vfo_b: vfo,
             active: Vfo::A,
@@ -838,7 +843,7 @@ impl Trx {
     /// has room for that, and the signal stays inside the TX passband.
     fn datv_lo_offset(&self) -> Option<f64> {
         let d = self.datv.as_ref().filter(|_| matches!(self.tx_on, Some(TxSource::Datv(_))))?;
-        if d.fpga.is_some() {
+        if d.fpga.is_some() || d.t2.is_some() {
             // The FPGA's samples go to the DAC as they are: LO on the signal.
             return Some(0.0);
         }
@@ -857,6 +862,44 @@ impl Trx {
     fn datv_start(&mut self, client: u64, sr: f64, rate: &str, pilots: bool) {
         use crate::dvbs2::{Modulator, Params, Rate, ts::Mux, ts::Profile};
         use crate::dvbs2::fpga_tx::{LongMode, Transmitter};
+        if let Some(mode) = crate::dvbt2::tx::Mode::parse(rate) {
+            // DVB-T2: modulated here, resampled to the DAC rate in the FPGA.
+            let t2 = match crate::dvbt2::tx::T2Tx::start(mode, self.tx_sink.clone(), self.block * 4) {
+                Ok(t2) => t2,
+                Err(e) => {
+                    warn!("DATV: DVB-T2: {e}");
+                    self.datv_refuse(client, &e);
+                    return;
+                }
+            };
+            let ts_rate = mode.ts_rate();
+            let profile = Profile::for_rate(ts_rate);
+            let video_bps = profile.video_budget(ts_rate);
+            self.datv = Some(Datv {
+                sr: mode.bw_hz,
+                profile,
+                video_bps,
+                modulator: None,
+                fpga: None,
+                t2: Some(t2),
+                pending: Vec::new(),
+                rate_label: rate.into(),
+                pilots: true,
+                rolloff: 0.0,
+                ts_rate,
+                mux: Mux::new(ts_rate, &self.callsign()),
+                last_media: Instant::now(),
+                buf: Vec::new(),
+            });
+            self.key(TxSource::Datv(client));
+            if self.tx_on != Some(TxSource::Datv(client)) {
+                self.datv = None;
+                return;
+            }
+            self.retune(true);
+            info!(bw = mode.bw_hz, mode = rate, ts_rate = ts_rate.round(), video_bps = video_bps.round(), ?profile, "DATV on (DVB-T2)");
+            return;
+        }
         if let Some(mode) = LongMode::parse(rate) {
             // Long frames, pilots: the FPGA encoder and interpolator.
             if !(8_000.0..=1_200_000.0).contains(&sr) {
@@ -881,6 +924,7 @@ impl Trx {
                 video_bps,
                 modulator: None,
                 fpga: Some(fx),
+                t2: None,
                 pending: Vec::new(),
                 rate_label: mode.label().into(),
                 pilots: true,
@@ -920,6 +964,7 @@ impl Trx {
             video_bps,
             modulator: Some(Modulator::new(p, sps.round() as usize)),
             fpga: None,
+            t2: None,
             pending: Vec::new(),
             rate_label: rate.label().into(),
             pilots,
@@ -984,7 +1029,7 @@ impl Trx {
     fn datv_json(&self) -> serde_json::Value {
         match &self.datv {
             Some(d) => {
-                serde_json::json!({"sr": d.sr, "rate": d.rate_label, "pilots": d.pilots, "ts_rate": d.ts_rate.round(), "fpga": d.fpga.is_some(),
+                serde_json::json!({"sr": d.sr, "rate": d.rate_label, "pilots": d.pilots, "ts_rate": d.ts_rate.round(), "fpga": d.fpga.is_some() || d.t2.is_some(),
                     "video_bps": d.video_bps.round(), "audio_bps": d.profile.audio_bps, "fps": d.profile.fps,
                     "width": d.profile.width, "height": d.profile.height})
             }
@@ -1066,6 +1111,11 @@ impl Trx {
         self.rx_quiet_until = Some(Instant::now() + RX_RECOVER);
         if self.datv.take().is_some() {
             info!("DATV off");
+        }
+        if self.tx_bw != self.cfg.radio.rf_bandwidth {
+            // Back from DVB-T2's width.
+            let _ = self.radio.set_tx_bandwidth(self.cfg.radio.rf_bandwidth);
+            self.tx_bw = self.cfg.radio.rf_bandwidth;
         }
         self.keyer.abort();
         if let Some(w) = &self.web {
@@ -1572,6 +1622,17 @@ impl Trx {
                 }
             }
             Some(TxSource::Datv(client)) => {
+                // DVB-T2 is wider than the TX filter's default (1 MHz).
+                let want = self.datv.as_ref().and_then(|d| d.t2.as_ref()).filter(|_| std::env::var_os("TRXD_NO_TXBW").is_none()).map_or(self.cfg.radio.rf_bandwidth, |t| {
+                    self.cfg.radio.rf_bandwidth.max((t.mode.bw_hz * 1.3) as u32)
+                });
+                if want != self.tx_bw {
+                    match self.radio.set_tx_bandwidth(want) {
+                        Ok(()) => info!(hz = want, "TX bandwidth"),
+                        Err(e) => warn!("TX bandwidth: {e}"),
+                    }
+                    self.tx_bw = want;
+                }
                 let mut starved = self.datv.is_none();
                 if let Some(d) = &mut self.datv {
                     if let Some(w) = &self.web {
@@ -1586,7 +1647,11 @@ impl Trx {
                             w.send_json_to(client, &serde_json::json!({"type": "datv_key"}));
                         }
                     }
-                    if let Some(fx) = &mut d.fpga {
+                    if let Some(t2) = &d.t2 {
+                        // The T2 thread takes packets at the TS rate (paced
+                        // by the DAC) and writes the TX buffer itself.
+                        t2.feed(&mut d.mux);
+                    } else if let Some(fx) = &mut d.fpga {
                         // Encoder bytes as fast as the DMA takes them: the
                         // writer blocks on it, so a few blocks queued is all
                         // the pacing needed (the encoder runs at the symbol rate).
@@ -1702,7 +1767,7 @@ impl Trx {
         }
 
         // The FPGA transmits DATV from the encoder bytes queued above: no IQ.
-        if matches!(self.tx_on, Some(TxSource::Datv(_))) && self.datv.as_ref().is_some_and(|d| d.fpga.is_some()) {
+        if matches!(self.tx_on, Some(TxSource::Datv(_))) && self.datv.as_ref().is_some_and(|d| d.fpga.is_some() || d.t2.is_some()) {
             return;
         }
 

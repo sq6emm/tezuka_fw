@@ -39,6 +39,11 @@ pub trait RadioControl: Send {
     fn set_port(&mut self, _n: u8) -> Result<(), String> {
         Err("this radio has one port pair".into())
     }
+    /// TX analog filter bandwidth (RF, Hz): wider for DVB-T2 than the
+    /// configured default. No-op where it does not apply.
+    fn set_tx_bandwidth(&mut self, _hz: u32) -> Result<(), String> {
+        Ok(())
+    }
     /// A way to read the gain from another thread, if the backend has one.
     fn rx_gain_reader(&self) -> Option<Box<dyn FnMut() -> Option<f64> + Send>> {
         None

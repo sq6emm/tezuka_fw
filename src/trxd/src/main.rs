@@ -14,6 +14,7 @@ mod settings;
 mod temps;
 mod decode;
 mod dvbs2;
+mod dvbt2;
 mod keyer;
 mod maia;
 mod morse;
@@ -38,8 +39,36 @@ use tracing::{error, info};
 use config::{Backend, Config, Role};
 
 fn usage() -> ! {
-    eprintln!("usage: trxd [--config FILE] [--sim] [--check] | --pack-model IN.onnx OUT.bin | --bench-deepcw MODEL [N] | --dvbs2-mod IN.ts OUT.cf32 [RATE] [SPS] [pilots] | --datv-mux MEDIA OUT.ts SR [RATE] [pilots]");
+    eprintln!("usage: trxd [--config FILE] [--sim] [--check] | --pack-model IN.onnx OUT.bin | --bench-deepcw MODEL [N] | --dvbs2-mod IN.ts OUT.cf32 [RATE] [SPS] [pilots] | --datv-mux MEDIA OUT.ts SR [RATE] [pilots] | [--config FILE] --capture-iq OUT.cf32 FREQ_HZ SECONDS [BW_HZ] (stop trxd first)");
     std::process::exit(2);
+}
+
+/// Raw receive at the full converter rate (the FPGA decimator off, the RX
+/// filter opened to `bw`) into complex f32 LE: for checking wide signals
+/// such as DVB-T2 offline. trxd must not be running.
+fn capture_iq(cfg: &mut Config, out: &str, freq: f64, secs: f64, bw: u32) -> Result<(), String> {
+    use std::io::Write;
+    cfg.radio.fpga_decimation = false;
+    cfg.radio.rf_bandwidth = bw;
+    let mut radio = radio::open(&cfg.radio, freq)?;
+    let rate = radio.control.stream_rate();
+    let mut f = std::io::BufWriter::new(std::fs::File::create(out).map_err(|e| format!("{out}: {e}"))?);
+    let mut buf = vec![num_complex::Complex32::default(); cfg.radio.buffer_samples];
+    // Let the AGC and the stream settle.
+    for _ in 0..8 {
+        radio.rx.read(&mut buf)?;
+    }
+    let total = (secs * rate) as usize;
+    let mut n = 0;
+    while n < total {
+        radio.rx.read(&mut buf)?;
+        for z in &buf {
+            f.write_all(&z.re.to_le_bytes()).and_then(|_| f.write_all(&z.im.to_le_bytes())).map_err(|e| e.to_string())?;
+        }
+        n += buf.len();
+    }
+    info!(samples = n, rate, freq, "captured to {out}");
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -55,6 +84,7 @@ fn main() -> ExitCode {
     let mut path = PathBuf::from("/etc/trxd.toml");
     let mut sim = false;
     let mut check = false;
+    let mut capture: Option<(String, f64, f64, u32)> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -135,6 +165,12 @@ fn main() -> ExitCode {
                     }
                 };
             }
+            "--capture-iq" => {
+                let (Some(o), Some(f), Some(t)) = (args.next(), args.next(), args.next()) else { usage() };
+                let (Ok(f), Ok(t)) = (f.parse::<f64>(), t.parse::<f64>()) else { usage() };
+                let bw = args.next().and_then(|b| b.parse::<u32>().ok()).unwrap_or(2_400_000);
+                capture = Some((o, f, t, bw));
+            }
             "--version" | "-V" => {
                 println!("trxd {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
@@ -161,6 +197,15 @@ fn main() -> ExitCode {
     if check {
         println!("{cfg:#?}");
         return ExitCode::SUCCESS;
+    }
+    if let Some((out, freq, secs, bw)) = capture {
+        return match capture_iq(&mut cfg, &out, freq, secs, bw) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                error!("{e}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     let initial_lo = match cfg.role {

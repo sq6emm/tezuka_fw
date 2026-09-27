@@ -267,7 +267,7 @@ impl Framer {
 const BCH_PARITY: usize = 168;
 
 /// BB scrambler sequence (5.2.2): 1 + X^14 + X^15, loaded with 100101010000000.
-fn bb_scrambling(len: usize) -> Vec<u8> {
+pub(crate) fn bb_scrambling(len: usize) -> Vec<u8> {
     let mut st: u16 = 0x00A9;
     (0..len)
         .map(|_| {

@@ -24,6 +24,11 @@ const DATV_TX_PHYS: u64 = 0x43C2_0000;
 const AD9361_PHYS: u64 = 0x7902_0000;
 const DAC_GPIO_OUT: usize = 0x40BC;
 const DATV_BIT: u32 = 1 << 1;
+/// With DATV_BIT: DMA words go to the interpolator as samples (datv_raw.v),
+/// not to the DVB-S2 encoder (DVB-T2 from trxd).
+const RAW_BIT: u32 = 1 << 2;
+/// With RAW_BIT: 8-bit I/Q pairs, four a DMA word (half the traffic).
+const RAW8_BIT: u32 = 1 << 3;
 const ID_DTX1: u32 = 0x3158_5444;
 pub const FS_DAC: f64 = 3_072_000.0;
 const SPAN: usize = 16;
@@ -175,6 +180,40 @@ pub fn rrc_table(rolloff: f64) -> Vec<i32> {
     h.iter().map(|v| (v * scale).round() as i32).collect()
 }
 
+/// A low-pass (interpolating) pulse for the interpolator used as a
+/// resampler: sinc at the input rate's Nyquist, Kaiser(6) over the 16
+/// inputs (pass band flat to about 0.37 of the input rate, stop band from
+/// about 0.63, better than 60 dB down), unity gain.
+pub fn lowpass_table() -> Vec<i32> {
+    let p = 1usize << PHASES_LOG2;
+    let n = SPAN * p;
+    let bessel_i0 = |x: f64| {
+        let (mut s, mut t) = (1.0, 1.0);
+        for k in 1..40 {
+            t *= (x / 2.0) / k as f64;
+            s += t * t;
+        }
+        s
+    };
+    let beta = 6.0;
+    let h: Vec<f64> = (0..n)
+        .map(|i| {
+            let x = i as f64 / p as f64 - SPAN as f64 / 2.0;
+            let v = if x.abs() < 1e-12 { 1.0 } else { (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x) };
+            let r = 2.0 * i as f64 / (n - 1) as f64 - 1.0;
+            v * bessel_i0(beta * (1.0 - r * r).max(0.0).sqrt()) / bessel_i0(beta)
+        })
+        .collect();
+    // Unity gain at DC (the phase-0 taps sum to one: its centre tap is
+    // then the largest coefficient that fits). Scaling for the worst case
+    // instead, as for the RRC, cost 6 dB; the interpolator saturates the
+    // rare peaks that overflow.
+    let dc: f64 = (0..SPAN).map(|k| h[k * p]).sum();
+    let peak = h.iter().fold(0f64, |m, v| m.max(v.abs()));
+    let scale = (((1u64 << (COEFF_BITS - 1)) - 1) as f64 / dc).min(((1u64 << (COEFF_BITS - 1)) - 1) as f64 / peak);
+    h.iter().map(|v| (v * scale).round() as i32).collect()
+}
+
 /// The interpolator's phase step for symbol rate `sr`.
 pub fn step(sr: f64) -> u32 {
     (sr / FS_DAC * 4_294_967_296.0).round() as u32
@@ -213,6 +252,46 @@ impl Transmitter {
         out.push(0xB8);
         out.push(self.mode.config_byte());
         out.extend(self.framer.frame_bytes(self.mode.kbch() / 8, rolloff_code, next));
+    }
+}
+
+/// Raw IQ through the FPGA's interpolator (DVB-T2): the pulse is a
+/// low-pass, the step the input rate over the DAC's. trxd writes 16-bit I,
+/// Q pairs (two a 64-bit DMA word) or, with `eight`, 8-bit pairs (four a
+/// word; the IIO path tops out near 7 MB/s, below 2.3 MS/s of 16-bit IQ)
+/// into the TX buffer. Dropping it switches back to IQ.
+pub struct RawTransmitter {
+    _mem: File,
+    ad9361: Mapping,
+}
+
+impl RawTransmitter {
+    pub fn start(fs_in: f64, eight: bool) -> Result<RawTransmitter, String> {
+        if fs_in >= FS_DAC {
+            return Err(format!("{fs_in} S/s is not below the DAC rate"));
+        }
+        let mem = open_mem()?;
+        let regs = Mapping::new(&mem, 4096, DATV_TX_PHYS).map_err(|e| format!("map datv_tx: {e}"))?;
+        if regs.rd32(0xC) != ID_DTX1 {
+            return Err("this bitstream has no DATV transmitter".into());
+        }
+        let ad9361 = Mapping::new(&mem, 0x1_0000, AD9361_PHYS).map_err(|e| format!("map axi_ad9361: {e}"))?;
+        for (a, c) in lowpass_table().into_iter().enumerate() {
+            regs.wr32(0x4, a as u32);
+            regs.wr32(0x8, 1 | (((c as u32) & ((1 << COEFF_BITS) - 1)) << 1));
+        }
+        regs.wr32(0x0, step(fs_in));
+        let g = ad9361.rd32(DAC_GPIO_OUT);
+        let bits = DATV_BIT | RAW_BIT | if eight { RAW8_BIT } else { 0 };
+        ad9361.wr32(DAC_GPIO_OUT, (g & !RAW8_BIT) | bits);
+        Ok(RawTransmitter { _mem: mem, ad9361 })
+    }
+}
+
+impl Drop for RawTransmitter {
+    fn drop(&mut self) {
+        let g = self.ad9361.rd32(DAC_GPIO_OUT);
+        self.ad9361.wr32(DAC_GPIO_OUT, g & !(DATV_BIT | RAW_BIT | RAW8_BIT));
     }
 }
 

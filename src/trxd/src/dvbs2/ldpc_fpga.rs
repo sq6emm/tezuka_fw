@@ -57,12 +57,17 @@ pub fn encode(rate: LongRate, info: &[u8]) -> Vec<u8> {
     let (k, q) = (rate.k(), rate.q());
     let nk = N - k;
     let mut p = vec![0u8; nk];
+    // (a + m q) mod (N - K) by a running index: a + 359 q < 2 (N - K), so
+    // one subtraction wraps it (no division: slow on the A9).
     for (g, addrs) in rate.table().iter().enumerate() {
-        for m in 0..360 {
-            let b = info[g * 360 + m];
-            if b != 0 {
-                for &a in addrs.iter() {
-                    p[(a as usize + m * q) % nk] ^= 1;
+        let bits = &info[g * 360..g * 360 + 360];
+        for &a in addrs.iter() {
+            let mut x = a as usize;
+            for &b in bits {
+                p[x] ^= b;
+                x += q;
+                if x >= nk {
+                    x -= nk;
                 }
             }
         }
