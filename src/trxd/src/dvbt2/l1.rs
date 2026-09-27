@@ -131,11 +131,11 @@ fn ldpc16k(info: &[u8], table: &[&[u16]], q: usize) -> Vec<u8> {
 }
 
 fn bpsk(b: u8) -> Cell {
-    BPSK0 + b
+    BPSK0 + b as Cell
 }
 
 fn qpsk(b0: u8, b1: u8) -> Cell {
-    L1_QPSK + ((b0 << 1) | b1)
+    L1_QPSK + ((b0 << 1) | b1) as Cell
 }
 
 /// L1-post length: (N_post bits, N_punc).

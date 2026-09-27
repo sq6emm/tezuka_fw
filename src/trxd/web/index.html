@@ -326,7 +326,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
         </select>
         <select id="datv-fec" title="QPSK code rate: lower is more robust, carries less">
           <option value="1/4">QPSK 1/4</option><option value="1/3">QPSK 1/3</option>
-          <option value="1/2" selected>QPSK 1/2</option><option value="2/3">QPSK 2/3</option><option value="3/4">QPSK 3/4</option><option value="L-QPSK-1/2">QPSK 1/2 long (FPGA)</option><option value="L-QPSK-3/4">QPSK 3/4 long (FPGA)</option><option value="L-8PSK-3/4">8PSK 3/4 long (FPGA)</option><option value="T2-1.7-QPSK-1/2">DVB-T2 1.7 MHz QPSK 1/2</option><option value="T2-1.7-QPSK-3/4">DVB-T2 1.7 MHz QPSK 3/4</option><option value="T2-2.0-QPSK-1/2">DVB-T2 2.0 MHz QPSK 1/2</option><option value="T2-1.35-QPSK-1/2">DVB-T2 1.35 MHz QPSK 1/2</option>
+          <option value="1/2" selected>QPSK 1/2</option><option value="2/3">QPSK 2/3</option><option value="3/4">QPSK 3/4</option><option value="L-QPSK-1/2">QPSK 1/2 long (FPGA)</option><option value="L-QPSK-3/4">QPSK 3/4 long (FPGA)</option><option value="L-8PSK-3/4">8PSK 3/4 long (FPGA)</option><option value="T2-1.7-QPSK-1/2">DVB-T2 1.7 MHz QPSK 1/2</option><option value="T2-1.7-QPSK-3/4">DVB-T2 1.7 MHz QPSK 3/4</option><option value="T2-2.0-QPSK-1/2">DVB-T2 2.0 MHz QPSK 1/2</option><option value="T2-1.35-QPSK-1/2">DVB-T2 1.35 MHz QPSK 1/2</option><option value="T2-1.7-16QAM-1/2">DVB-T2 1.7 MHz 16QAM 1/2</option><option value="T2-1.7-16QAM-3/4">DVB-T2 1.7 MHz 16QAM 3/4</option><option value="T2-2.0-16QAM-1/2">DVB-T2 2.0 MHz 16QAM 1/2</option>
         </select>
         <label class="note"><input type="checkbox" id="datv-pilots" checked> pilots</label>
       </div>
@@ -1425,10 +1425,13 @@ const DATV = (() => {
   let cfg = null, forceKey = false, frames = 0, sent = 0, aSamples = 0, aT0 = 0, micIn = 0, micOut = 0, micErr = "";
   // Long frames (FPGA TX): [TS bits per frame, PLFRAME symbols with pilots].
   const LONG = { "L-QPSK-1/2": [32128, 33282], "L-QPSK-3/4": [48328, 33282], "L-8PSK-3/4": [48328, 22194] };
-  // DVB-T2 (2K, GI 1/8, PP2, 190 data symbols, 9 FEC blocks a frame of
-  // 458240 elementary samples): [elementary sample rate, TS bits per frame].
+  // DVB-T2 (2K, GI 1/8, PP2, 190 data symbols, 9 QPSK or 18 16QAM FEC
+  // blocks a frame of 458240 elementary samples): [elementary sample rate,
+  // TS bits per frame].
   const T2 = { "T2-1.7-QPSK-1/2": [131e6 / 71, 289152], "T2-1.7-QPSK-3/4": [131e6 / 71, 434952],
-               "T2-2.0-QPSK-1/2": [16e6 / 7, 289152], "T2-1.35-QPSK-1/2": [1.35e6 * 8 / 7, 289152] };
+               "T2-2.0-QPSK-1/2": [16e6 / 7, 289152], "T2-1.35-QPSK-1/2": [1.35e6 * 8 / 7, 289152],
+               "T2-1.7-16QAM-1/2": [131e6 / 71, 578304], "T2-1.7-16QAM-3/4": [131e6 / 71, 869904],
+               "T2-2.0-16QAM-1/2": [16e6 / 7, 578304] };
   const tsRate = (sr, fec, pilots) => T2[fec] ? T2[fec][0] * T2[fec][1] / 458240
     : LONG[fec] ? sr * LONG[fec][0] / LONG[fec][1] : sr * PAYLOAD[fec] / (pilots ? 8370 : 8190);
   const occupied = (sr, fec) => T2[fec] ? T2[fec][0] * 1705 / 2048 : sr * 1.35;

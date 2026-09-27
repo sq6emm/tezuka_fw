@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
 
-use super::{Modulator, Params};
+use super::{Cell, FecStage, OfdmStage, Params};
 use crate::dvbs2::TS_LEN;
 use crate::dvbs2::ts::Mux;
 use crate::stream::TxBlock;
@@ -23,7 +23,7 @@ const OS4: usize = 4;
 /// what counts over the air).
 const SCALE: f32 = 48.0;
 
-/// A T2 mode as the UI names it: "T2-<MHz>-QPSK-<rate>".
+/// A T2 mode as the UI names it: "T2-<MHz>-<QPSK|16QAM>-<rate>".
 #[derive(Clone, Copy, Debug)]
 pub struct Mode {
     pub bw_hz: f64,
@@ -42,9 +42,11 @@ impl Mode {
             "1.35" => 1_350_000.0,
             _ => return None,
         };
-        if it.next()? != "QPSK" {
-            return None;
-        }
+        let constellation = match it.next()? {
+            "QPSK" => super::Constellation::Qpsk,
+            "16QAM" => super::Constellation::Qam16,
+            _ => return None,
+        };
         let rate = match it.next()? {
             "1/2" => crate::dvbs2::ldpc_fpga::LongRate::R1_2,
             "3/4" => crate::dvbs2::ldpc_fpga::LongRate::R3_4,
@@ -52,11 +54,12 @@ impl Mode {
         };
         let mut p = Params::amateur();
         p.rate = rate;
+        p.constellation = constellation;
+        // 190 data symbols hold 9 QPSK FEC blocks (32400 cells) or 18 16QAM.
+        p.fec_blocks = 9 * constellation.bits() / 2;
         // Rotated QPSK (29 degrees, Q a cell later): free robustness against
         // fading, as T2 intends; receivers read it from L1-post.
         p.rotation = true;
-        // Same frame (P2 + 190 data symbols) and 9 FEC blocks: a QPSK FEC
-        // block is 32400 cells at any rate.
         Some(Mode { bw_hz, p })
     }
 
@@ -103,9 +106,17 @@ impl T2Tx {
             .name("dvbt2-write".into())
             .spawn(move || write(frx, sink, block, st2))
             .map_err(|e| e.to_string())?;
+        // The FEC half (codewords to frame cells) on a thread of its own,
+        // one frame ahead of the OFDM half: the two A9 cores in parallel.
+        let (ctx, crx) = crossbeam_channel::bounded::<Vec<Cell>>(1);
+        let st3 = stop.clone();
+        std::thread::Builder::new()
+            .name("dvbt2-fec".into())
+            .spawn(move || fec(p, rx, ctx, st3))
+            .map_err(|e| e.to_string())?;
         let thread = std::thread::Builder::new()
             .name("dvbt2-tx".into())
-            .spawn(move || run(p, rx, ftx, st))
+            .spawn(move || run(p, crx, ftx, st))
             .map_err(|e| e.to_string())?;
         Ok(T2Tx { mode, packets: tx, stop, thread: Some(thread), _fpga: fpga })
     }
@@ -160,11 +171,10 @@ fn write(frames: Receiver<Vec<u8>>, sink: Sender<TxBlock>, block: usize, stop: A
     }
 }
 
-fn run(p: Params, packets: Receiver<[u8; TS_LEN]>, frames_out: Sender<Vec<u8>>, stop: Arc<AtomicBool>) {
+/// TS packets to frame cells (FEC, interleaving, frame builder).
+fn fec(p: Params, packets: Receiver<[u8; TS_LEN]>, cells_out: Sender<Vec<Cell>>, stop: Arc<AtomicBool>) {
     crate::stream::thread_nice(-5);
-    let mut m = Modulator::oversampled(p, OS4);
-    let mut iq = Vec::with_capacity(m.frame_samples());
-    let mut bytes: Vec<u8> = Vec::with_capacity(2 * m.frame_samples());
+    let mut f = FecStage::new(p);
     let null = {
         let mut n = [0u8; TS_LEN];
         n[0] = 0x47;
@@ -173,14 +183,44 @@ fn run(p: Params, packets: Receiver<[u8; TS_LEN]>, frames_out: Sender<Vec<u8>>, 
         n[3] = 0x10;
         n
     };
+    let (mut frames, mut nulls, mut fec_s) = (0u64, 0u64, 0f64);
+    while !stop.load(Ordering::Relaxed) {
+        let t0 = std::time::Instant::now();
+        // A packet late from the mux (engine busy) becomes a null packet:
+        // the frame must go out on time.
+        let mut next = || {
+            packets.recv_timeout(std::time::Duration::from_millis(20)).unwrap_or_else(|_| {
+                nulls += 1;
+                null
+            })
+        };
+        let cells = f.frame(&mut next);
+        fec_s += t0.elapsed().as_secs_f64();
+        frames += 1;
+        if frames % 40 == 0 {
+            tracing::info!(frames, nulls, fec_ms = (fec_s / 40.0 * 1e3).round(), "DVB-T2 FEC");
+            fec_s = 0.0;
+        }
+        if cells_out.send(cells).is_err() {
+            return;
+        }
+    }
+}
+
+/// Frame cells to 8-bit I/Q bytes (OFDM, conversion) for the writer.
+fn run(p: Params, cells_in: Receiver<Vec<Cell>>, frames_out: Sender<Vec<u8>>, stop: Arc<AtomicBool>) {
+    crate::stream::thread_nice(-5);
+    let o = OfdmStage::new(p, OS4);
+    let mut iq = Vec::with_capacity(o.frame_samples());
     // TRXD_T2_TONE=1: a tone 200 kHz above the LO instead (checks the raw
     // FPGA path on an analyser).
     let tone = std::env::var_os("TRXD_T2_TONE").is_some();
-    let fs = m.frame_samples() as f64; // per frame; only the ratio matters below
-    let _ = fs;
-    let (mut frames, mut nulls, mut gen_s, mut conv_s, mut send_s) = (0u64, 0u64, 0f64, 0f64, 0f64);
+    let (mut frames, mut ofdm_s, mut conv_s) = (0u64, 0f64, 0f64);
     let mut ph = 0f64;
-    while !stop.load(Ordering::Relaxed) {
+    for cells in cells_in.iter() {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         iq.clear();
         let t0 = std::time::Instant::now();
         if tone {
@@ -188,43 +228,31 @@ fn run(p: Params, packets: Receiver<[u8; TS_LEN]>, frames_out: Sender<Vec<u8>>, 
             let w = std::f64::consts::TAU * 200e3 / (131e6 / 71.0 * OS4 as f64 / 4.0);
             let step = num_complex::Complex32::new(w.cos() as f32, w.sin() as f32);
             let mut z = num_complex::Complex32::from_polar(1.0, ph as f32);
-            for _ in 0..m.frame_samples() {
+            for _ in 0..o.frame_samples() {
                 iq.push(z);
                 z *= step;
             }
             ph = z.arg() as f64;
         } else {
-            // A packet late from the mux (engine busy) becomes a null
-            // packet: the frame must go out on time.
-            let mut next = || {
-                packets.recv_timeout(std::time::Duration::from_millis(20)).unwrap_or_else(|_| {
-                    nulls += 1;
-                    null
-                })
-            };
-            m.frame(&mut next, &mut iq);
+            o.frame(&cells, &mut iq);
         }
-        gen_s += t0.elapsed().as_secs_f64();
-        frames += 1;
-        if frames % 20 == 0 {
-            let ms = |s: f64| (s / 20.0 * 1e3).round();
-            tracing::info!(frames, nulls, gen_ms = ms(gen_s), conv_ms = ms(conv_s), send_ms = ms(send_s), tone, "DVB-T2 TX");
-            (gen_s, conv_s, send_s) = (0.0, 0.0, 0.0);
-        }
+        ofdm_s += t0.elapsed().as_secs_f64();
         let t1 = std::time::Instant::now();
-        let at = 0;
-        bytes.resize(2 * iq.len(), 0);
-        for (b, z) in bytes[at..].chunks_exact_mut(2).zip(&iq) {
-            // `as` saturates: no clamp needed below 127 either side.
+        let mut bytes = vec![0u8; 2 * iq.len()];
+        for (b, z) in bytes.chunks_exact_mut(2).zip(&iq) {
             b[0] = ((z.re * SCALE) as i32).clamp(-127, 127) as i8 as u8;
             b[1] = ((z.im * SCALE) as i32).clamp(-127, 127) as i8 as u8;
         }
         conv_s += t1.elapsed().as_secs_f64();
-        let t2 = std::time::Instant::now();
+        frames += 1;
+        if frames % 40 == 0 {
+            let ms = |s: f64| (s / 40.0 * 1e3).round();
+            tracing::info!(frames, ofdm_ms = ms(ofdm_s), conv_ms = ms(conv_s), tone, "DVB-T2 OFDM");
+            (ofdm_s, conv_s) = (0.0, 0.0);
+        }
         // To the writer (blocks while two frames wait: that is the pacing).
-        if frames_out.send(std::mem::take(&mut bytes)).is_err() || stop.load(Ordering::Relaxed) {
+        if frames_out.send(bytes).is_err() {
             return;
         }
-        send_s += t2.elapsed().as_secs_f64();
     }
 }

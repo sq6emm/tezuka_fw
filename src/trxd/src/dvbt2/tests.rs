@@ -33,6 +33,12 @@ fn t2_matches_gr_dtv() {
     }
     // T2ROT=1: a reference made with ROTATION_ON.
     p.rotation = std::env::var_os("T2ROT").is_some();
+    // T2CONST=16: made with MOD_16QAM (and 18 FEC blocks).
+    if std::env::var("T2CONST").is_ok_and(|v| v == "16") {
+        p.constellation = Constellation::Qam16;
+        p.fec_blocks = 18;
+    }
+    let bi = BitInterleaver::new(&p);
     let mut m = Modulator::new(p);
     let ldpc_ref = std::fs::read(format!("{dir}/ldpc.bin")).unwrap();
     let cells_ref = read_c32(&format!("{dir}/modulator.bin"));
@@ -57,7 +63,7 @@ fn t2_matches_gr_dtv() {
             let cw = m.codeword(&mut next);
             let bad = cw.iter().zip(&ldpc_ref[k * 64_800..(k + 1) * 64_800]).filter(|(a, b)| a != b).count();
             assert_eq!(bad, 0, "frame {f} block {b}: LDPC codeword differs in {bad} bits");
-            let cells = cell_codes(&cw);
+            let cells = codes(&p, &bi.words(&cw));
             let e = max_err(&cx(&cells), &cells_ref[k * n..(k + 1) * n]);
             assert!(e < 1e-6, "frame {f} block {b}: cells differ by {e}");
             blocks.push(cells);
@@ -138,8 +144,13 @@ fn oversampling_keeps_the_waveform() {
 #[test]
 #[ignore]
 fn t2_speed() {
-    let p = Params::amateur();
-    let mut m = Modulator::oversampled(p, 5);
+    let mut p = Params::amateur();
+    // T2CONST=16: 16QAM, 18 FEC blocks.
+    if std::env::var("T2CONST").is_ok_and(|v| v == "16") {
+        p.constellation = Constellation::Qam16;
+        p.fec_blocks = 18;
+    }
+    let mut m = Modulator::oversampled(p, 4);
     let mut next = || {
         let mut pkt = [0u8; TS_LEN];
         pkt[0] = 0x47;
@@ -152,7 +163,7 @@ fn t2_speed() {
         m.frame(&mut next, &mut out);
     }
     let dt = t0.elapsed().as_secs_f64() / 8.0;
-    eprintln!("{:.1} ms a T2 frame x1.25 ({:.0} ms of signal)", dt * 1e3, p.frame_samples() as f64 / (131e6 / 71.0) * 1e3);
+    eprintln!("{:.1} ms a T2 frame ({:?}, {:.0} ms of signal)", dt * 1e3, p.constellation, p.frame_samples() as f64 / (131e6 / 71.0) * 1e3);
 }
 
 #[test]

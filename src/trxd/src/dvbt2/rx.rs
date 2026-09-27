@@ -13,7 +13,7 @@ use rustfft::FftPlanner;
 
 use super::frame::{FrameMapper, FreqInterleaver};
 use super::ofdm::Ofdm;
-use super::{CellInterleaver, Params, FFT, N_P2};
+use super::{BitInterleaver, CellInterleaver, Constellation, Params, FFT, N_P2};
 use crate::dvbs2::TS_LEN;
 
 pub struct Report {
@@ -70,6 +70,7 @@ pub fn receive(p: Params, x: &[Complex32], fs: f64) -> Report {
     let fm = FrameMapper::new(p);
     let fi = FreqInterleaver::new(&p);
     let ci = CellInterleaver::new(&p);
+    let bi = BitInterleaver::new(&p);
     let mut fec = crate::dvbs2::rx::Fec::new(crate::dvbs2::FrameSpec::long(match p.rate {
         crate::dvbs2::ldpc_fpga::LongRate::R1_2 => crate::dvbs2::fpga_tx::LongMode::Qpsk12,
         crate::dvbs2::ldpc_fpga::LongRate::R3_4 => crate::dvbs2::fpga_tx::LongMode::Qpsk34,
@@ -122,7 +123,7 @@ pub fn receive(p: Params, x: &[Complex32], fs: f64) -> Report {
         let w = -std::f64::consts::TAU * f_off / fs;
         // Each symbol: FFT (a few samples early into the guard interval,
         // the common phase takes the shift), carriers 0..1705.
-        let early = gi / 4;
+        let early = if std::env::var_os("T2EARLY0").is_some() { 0 } else { gi / 4 };
         let mut carriers: Vec<Vec<Complex32>> = Vec::with_capacity(nsym);
         for j in 0..nsym {
             let s = start + 2048 + j * sym_len + gi - early;
@@ -151,12 +152,19 @@ pub fn receive(p: Params, x: &[Complex32], fs: f64) -> Report {
         for j in 0..N_P2 {
             let pil: Vec<(usize, Complex32)> =
                 plans[j].iter().enumerate().filter_map(|(k, v)| v.filter(|z| z.norm() > 0.0).map(|z| (k, carriers[j][k] / z))).collect();
+            // Each carrier once: [k0, k1) per pair of neighbouring pilots,
+            // the last pilot itself at the end (visiting both ends of every
+            // pair counted the pilot carriers twice: data cells on them came
+            // out at half amplitude, harmless to QPSK, fatal to 16QAM).
             for w2 in pil.windows(2) {
                 let ((k0, h0), (k1, h1)) = (w2[0], w2[1]);
-                for k in k0..=k1 {
+                for k in k0..k1 {
                     let a = (k - k0) as f32 / (k1 - k0) as f32;
                     h[k] += (h0 * (1.0 - a) + h1 * a) / N_P2 as f32;
                 }
+            }
+            if let Some(&(kl, hl)) = pil.last() {
+                h[kl] += hl / N_P2 as f32;
             }
         }
         // Equalize; each symbol's common phase from its pilots.
@@ -171,6 +179,22 @@ pub fn receive(p: Params, x: &[Complex32], fs: f64) -> Report {
             let rot = if c.norm() > 0.0 { c.conj() / c.norm() } else { Complex32::new(1.0, 0.0) };
             syms.push(plans[j].iter().enumerate().filter(|(_, v)| v.is_none()).map(|(k, _)| carriers[j][k] / h[k] * rot).collect());
         }
+        if std::env::var_os("T2DEBUG").is_some() && report.frames == 0 && p.constellation == Constellation::Qam16 {
+            let a = 1.0 / 10f32.sqrt();
+            let q = |x: f32| {
+                let l = [-3.0 * a, -a, a, 3.0 * a];
+                *l.iter().min_by(|u, v| (x - **u).abs().partial_cmp(&(x - **v).abs()).unwrap()).unwrap()
+            };
+            let mut line = String::new();
+            for (j, sy) in syms.iter().enumerate() {
+                let e: f32 = sy.iter().map(|z| (z - Complex32::new(q(z.re), q(z.im))).norm_sqr()).sum::<f32>() / sy.len() as f32;
+                let pw: f32 = sy.iter().map(|z| z.norm_sqr()).sum::<f32>() / sy.len() as f32;
+                if j < 10 || j % 20 == 0 || j + 2 >= syms.len() {
+                    line += &format!(" {j}:{:.1}", 10.0 * (pw / e.max(1e-9)).log10());
+                }
+            }
+            eprintln!("DD MER per symbol:{line}");
+        }
         let cells = fi.unframe(&syms);
         let (pre, _post, data) = fm.unmap(&cells);
         let (mut sig, mut err) = (0f32, 0f32);
@@ -182,18 +206,54 @@ pub fn receive(p: Params, x: &[Complex32], fs: f64) -> Report {
         let blocks = ci.deinterleave(&data, p.fec_blocks);
         // QPSK LLRs (positive = 0), noise from the L1-pre error.
         let sigma2 = (err / pre.len() as f32).max(1e-6);
-        // Rotated QPSK: word j's I is in cell j, its Q in cell j + 1
-        // (cyclically in the block); rotate back 29 degrees.
-        let derot = Complex32::from_polar(1.0, -(29f32).to_radians());
+        // Rotated constellations: word j's I is in cell j, its Q in cell
+        // j + 1 (cyclically in the block); rotate back.
+        let angle: f32 = match p.constellation {
+            Constellation::Qpsk => 29.0,
+            Constellation::Qam16 => 16.8,
+        };
+        let derot = Complex32::from_polar(1.0, -angle.to_radians());
+        if std::env::var_os("T2DEBUG").is_some() {
+            let b = &blocks[0];
+            let pw = b.iter().map(|z| z.norm_sqr()).sum::<f32>() / b.len() as f32;
+            let mre = b.iter().map(|z| z.re.abs()).sum::<f32>() / b.len() as f32;
+            eprintln!("block 0: mean power {pw:.3}, mean |re| {mre:.3}, first cells {:?}", &b[..4]);
+        }
         for blk in &blocks {
             let n = blk.len();
-            let llr: Vec<f32> = (0..n)
-                .flat_map(|j| {
-                    let z = if p.rotation { Complex32::new(blk[j].re, blk[(j + 1) % n].im) * derot } else { blk[j] };
-                    let s = 2.0 * std::f32::consts::FRAC_1_SQRT_2 * 2.0 / sigma2;
-                    [z.re * s, z.im * s]
-                })
-                .collect();
+            let z = |j: usize| if p.rotation { Complex32::new(blk[j].re, blk[(j + 1) % n].im) * derot } else { blk[j] };
+            let cell_llr: Vec<f32> = match p.constellation {
+                Constellation::Qpsk => (0..n)
+                    .flat_map(|j| {
+                        let s = 2.0 * std::f32::consts::FRAC_1_SQRT_2 * 2.0 / sigma2;
+                        let z = z(j);
+                        [z.re * s, z.im * s]
+                    })
+                    .collect(),
+                Constellation::Qam16 => (0..n)
+                    .flat_map(|j| {
+                        // Word bits 3, 2: signs of I, Q (0 positive); 1, 0:
+                        // outer (0) or inner level. Max-log, per axis.
+                        let a = 1.0 / 10f32.sqrt();
+                        let s = 4.0 * a / sigma2;
+                        let z = z(j);
+                        [z.re * s, z.im * s, (z.re.abs() - 2.0 * a) * s, (z.im.abs() - 2.0 * a) * s]
+                    })
+                    .collect(),
+            };
+            let llr = bi.deinterleave_llr(&cell_llr);
+            if let Some(path) = std::env::var_os("T2DUMPC") {
+                if report.frames == 0 && std::ptr::eq(blk, &blocks[0]) {
+                    let b: Vec<u8> = blk.iter().flat_map(|z| [z.re.to_le_bytes(), z.im.to_le_bytes()]).flatten().collect();
+                    std::fs::write(path, b).unwrap();
+                }
+            }
+            if let Some(path) = std::env::var_os("T2DUMP") {
+                if report.frames == 0 && std::ptr::eq(blk, &blocks[0]) {
+                    let b: Vec<u8> = llr.iter().map(|&l| (l < 0.0) as u8).collect();
+                    std::fs::write(path, b).unwrap();
+                }
+            }
             fec.frame(&llr, &mut stats, &mut report.packets);
         }
         report.frames += 1;
@@ -215,11 +275,22 @@ mod tests {
         for rotation in [false, true] {
             let mut p = Params::amateur();
             p.rotation = rotation;
-            loopback(p);
+            loopback(p, 15.0);
         }
     }
 
-    fn loopback(p: Params) {
+    #[test]
+    fn t2_loopback_16qam() {
+        for rotation in [false, true] {
+            let mut p = Params::amateur();
+            p.constellation = super::super::Constellation::Qam16;
+            p.fec_blocks = 18;
+            p.rotation = rotation;
+            loopback(p, 22.0);
+        }
+    }
+
+    fn loopback(p: Params, snr_db: f32) {
         let mut m = Modulator::new(p);
         let mut n = 0u32;
         let mut next = || {
@@ -238,7 +309,10 @@ mod tests {
             m.frame(&mut next, &mut x);
         }
         let fs = 131e6 / 71.0;
-        let (off, snr_db) = (3000.0, 15.0f32);
+        // T2CLEAN=1: no offset, no noise (what is left is the receiver's).
+        let clean = std::env::var_os("T2CLEAN").is_some();
+        let off = if clean { 0.0 } else { 3000.0 };
+        let snr_db = if clean { 200.0 } else { snr_db };
         let sigma = (10f32.powf(-snr_db / 10.0) / 2.0).sqrt();
         let mut seed = 5u64;
         let mut g = || {
@@ -254,9 +328,35 @@ mod tests {
         }
         let r = receive(p, &x, fs);
         eprintln!("frames {}, packets {}, MER {:?}, freq {:.0} Hz, LDPC failures {}", r.frames, r.packets.len(), r.mer_db, r.freq_hz, r.ldpc_fail);
+        if let Some(path) = std::env::var_os("T2DUMP") {
+            // The first FEC block's hard decisions against what was sent.
+            let mut m2 = Modulator::new(p);
+            let mut n2 = 0u32;
+            let mut next2 = || {
+                let mut pkt = [0u8; TS_LEN];
+                pkt[0] = 0x47;
+                pkt[1] = 0x01;
+                pkt[4..8].copy_from_slice(&n2.to_be_bytes());
+                for (i, b) in pkt[8..].iter_mut().enumerate() {
+                    *b = (n2 as usize * 7 + i) as u8;
+                }
+                n2 += 1;
+                pkt
+            };
+            let cw = m2.codeword(&mut next2);
+            if let Some(pc) = std::env::var_os("T2DUMPC") {
+                let tx = super::super::map_cells(&p, &cw);
+                let rx: Vec<Complex32> = std::fs::read(pc).unwrap().chunks_exact(8).map(|c| Complex32::new(f32::from_le_bytes(c[..4].try_into().unwrap()), f32::from_le_bytes(c[4..].try_into().unwrap()))).collect();
+                let bad: Vec<usize> = (0..tx.len()).filter(|&i| (tx[i] - rx[i]).norm() > 1e-3).collect();
+                eprintln!("block 0 cells: {} of {} differ; first {:?}; tx {:?} rx {:?}", bad.len(), tx.len(), &bad[..bad.len().min(6)], bad.first().map(|&i| tx[i]), bad.first().map(|&i| rx[i]));
+            }
+            let got = std::fs::read(path).unwrap();
+            let bad: Vec<usize> = (0..cw.len()).filter(|&i| got[i] != cw[i]).collect();
+            eprintln!("block 0: {} of {} bits wrong; first {:?}; info part {}, parity part {}", bad.len(), cw.len(), &bad[..bad.len().min(8)], bad.iter().filter(|&&i| i < 32400).count(), bad.iter().filter(|&&i| i >= 32400).count());
+        }
         assert!(r.frames >= 2 && r.ldpc_fail == 0, "{} frames, {} failures", r.frames, r.ldpc_fail);
         let data: Vec<_> = r.packets.iter().filter(|p| p[1] == 0x01).collect();
-        assert!(data.len() > 300, "{} packets", data.len());
+        assert!(data.len() > 150 * p.fec_blocks / 9, "{} packets", data.len());
         let f0 = u32::from_be_bytes(data[0][4..8].try_into().unwrap());
         for (i, pkt) in data.iter().enumerate() {
             assert_eq!(u32::from_be_bytes(pkt[4..8].try_into().unwrap()), f0 + i as u32, "packet {i}");
@@ -443,4 +543,34 @@ fn t2_through_the_fpga_resampler() {
     let r = receive(p, &y, fs);
     eprintln!("frames {}, packets {}, MER {:?}, LDPC failures {}", r.frames, r.packets.len(), r.mer_db, r.ldpc_fail);
     assert!(r.frames >= 2 && r.ldpc_fail == 0 && r.mer_db.iter().all(|&m| m > 20.0));
+}
+
+#[test]
+#[ignore]
+fn t2_16qam_debug() {
+    use super::{codes, Constellation, Modulator, Palette};
+    let mut p = Params::amateur();
+    p.constellation = Constellation::Qam16;
+    p.fec_blocks = 18;
+    let mut m = Modulator::new(p);
+    let mut next = || [0x47u8; TS_LEN];
+    let cw = m.codeword(&mut next);
+    let bi = BitInterleaver::new(&p);
+    let words = bi.words(&cw);
+    let pal = Palette::new(&p);
+    let cells: Vec<Complex32> = codes(&p, &words).iter().map(|&c| pal.get(c)).collect();
+    // demap noise-free cells the receiver's way
+    let a = 1.0 / 10f32.sqrt();
+    let cell_llr: Vec<f32> = cells.iter().flat_map(|z| [z.re, z.im, z.re.abs() - 2.0 * a, z.im.abs() - 2.0 * a]).collect();
+    // hard word bits vs words
+    let mut bad_words = 0;
+    for (j, w) in words.iter().enumerate() {
+        let hb: u8 = (0..4).fold(0, |acc, i| (acc << 1) | (cell_llr[4 * j + i] < 0.0) as u8);
+        if hb != *w {
+            bad_words += 1;
+        }
+    }
+    let llr = bi.deinterleave_llr(&cell_llr);
+    let bad_bits = llr.iter().zip(&cw).filter(|(l, b)| ((**l < 0.0) as u8) != **b).count();
+    eprintln!("words wrong {bad_words} of {}, codeword bits wrong {bad_bits} of {}", words.len(), cw.len());
 }

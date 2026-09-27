@@ -32,7 +32,7 @@ impl FrameMapper {
                 if b != 0 {
                     sr |= 0x4000;
                 }
-                BPSK0 + b as u8
+                BPSK0 + b as Cell
             })
             .collect();
         let post = (0..p.t2_frames).map(|i| l1::post(&p, i)).collect();
