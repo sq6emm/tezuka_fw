@@ -31,6 +31,8 @@ fn t2_matches_gr_dtv() {
     if std::env::var("T2RATE").is_ok_and(|v| v == "34") {
         p.rate = crate::dvbs2::ldpc_fpga::LongRate::R3_4;
     }
+    // T2ROT=1: a reference made with ROTATION_ON.
+    p.rotation = std::env::var_os("T2ROT").is_some();
     let mut m = Modulator::new(p);
     let ldpc_ref = std::fs::read(format!("{dir}/ldpc.bin")).unwrap();
     let cells_ref = read_c32(&format!("{dir}/modulator.bin"));

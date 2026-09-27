@@ -52,6 +52,9 @@ impl Mode {
         };
         let mut p = Params::amateur();
         p.rate = rate;
+        // Rotated QPSK (29 degrees, Q a cell later): free robustness against
+        // fading, as T2 intends; receivers read it from L1-post.
+        p.rotation = true;
         // Same frame (P2 + 190 data symbols) and 9 FEC blocks: a QPSK FEC
         // block is 32400 cells at any rate.
         Some(Mode { bw_hz, p })

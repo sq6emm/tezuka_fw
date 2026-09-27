@@ -182,10 +182,14 @@ pub fn receive(p: Params, x: &[Complex32], fs: f64) -> Report {
         let blocks = ci.deinterleave(&data, p.fec_blocks);
         // QPSK LLRs (positive = 0), noise from the L1-pre error.
         let sigma2 = (err / pre.len() as f32).max(1e-6);
+        // Rotated QPSK: word j's I is in cell j, its Q in cell j + 1
+        // (cyclically in the block); rotate back 29 degrees.
+        let derot = Complex32::from_polar(1.0, -(29f32).to_radians());
         for blk in &blocks {
-            let llr: Vec<f32> = blk
-                .iter()
-                .flat_map(|z| {
+            let n = blk.len();
+            let llr: Vec<f32> = (0..n)
+                .flat_map(|j| {
+                    let z = if p.rotation { Complex32::new(blk[j].re, blk[(j + 1) % n].im) * derot } else { blk[j] };
                     let s = 2.0 * std::f32::consts::FRAC_1_SQRT_2 * 2.0 / sigma2;
                     [z.re * s, z.im * s]
                 })
@@ -204,10 +208,18 @@ mod tests {
     use super::super::Modulator;
     use super::*;
 
-    /// Modulator -> offset, noise -> receiver: every packet back in order.
+    /// Modulator -> offset, noise -> receiver: every packet back in order
+    /// (plain and rotated QPSK).
     #[test]
     fn t2_loopback() {
-        let p = Params::amateur();
+        for rotation in [false, true] {
+            let mut p = Params::amateur();
+            p.rotation = rotation;
+            loopback(p);
+        }
+    }
+
+    fn loopback(p: Params) {
         let mut m = Modulator::new(p);
         let mut n = 0u32;
         let mut next = || {
@@ -315,7 +327,9 @@ fn t2_capture() {
     if std::env::var_os("T2CONJ").is_some() {
         y.iter_mut().for_each(|z| *z = z.conj());
     }
-    let p = Params::amateur();
+    let mut p = Params::amateur();
+    // T2ROT=1: the transmitter rotated its constellation (trxd's default).
+    p.rotation = std::env::var_os("T2ROT").is_some();
     let r = receive(p, &y, fs);
     let mut pids = std::collections::BTreeMap::new();
     let mut cc_err = 0;

@@ -9,7 +9,7 @@ DVB-T2 option's profile, received by the Ryde, the Knucker and the Lynx
 | Channel | 1.7 MHz (standard, 131/71 MS/s), or 2.0 / 1.35 MHz (sample rate 8/7 x bandwidth) |
 | OFDM | 2K, normal carriers, guard 1/8, pilot pattern PP2, SISO |
 | Frame | P1, 8 P2 symbols, 190 data symbols (about 248 ms at 1.7 MHz), 2 frames a super-frame |
-| PLP | one, TS, normal FEC frames (64800), QPSK 1/2 or 3/4, no rotation, one TI block, 9 FEC blocks a frame |
+| PLP | one, TS, normal FEC frames (64800), QPSK 1/2 or 3/4, rotated constellation (29 degrees), one TI block, 9 FEC blocks a frame |
 | L1 | L1-pre BPSK, L1-post QPSK 1/2 (16K LDPC), version 1.1.1 |
 | TS rate | 1.164 Mbit/s (1/2), 1.751 Mbit/s (3/4) at 1.7 MHz |
 
@@ -35,8 +35,8 @@ browser H.264/Opus -> dvbs2::ts::Mux (TS at the T2 rate)
 - The modulator is a port of GNU Radio gr-dtv's DVB-T2 blocks, checked
   against them stage by stage (`dvbt2::tests::t2_matches_gr_dtv`, reference
   script `datv-ref/t2/ref/t2ref.py` in the gr-dtv Docker image `datv-t2:1`):
-  every LDPC codeword and cell bit-exact, output within 8e-7, for QPSK 1/2
-  and 3/4.
+  every LDPC codeword and cell bit-exact, output within 1e-6, for QPSK 1/2
+  and 3/4, plain and rotated.
 - Cells travel as one-byte codes through the interleavers and the frame
   builder (complex cells made the A9 wait on memory more than on the IFFTs).
 - Generation and writing overlap (two frames queued between the threads):
@@ -65,12 +65,15 @@ browser H.264/Opus -> dvbs2::ts::Mux (TS at the T2 rate)
   MER 4-5 dB: the indoor path was this weak (the analyser sees the channel
   at -60 dBm in 30 kHz; the S2 signal at 250 kS/s is about 10 dB stronger
   in total, OFDM's peaks need the headroom).
+- Rotated (the default since): 3 s recording, 11 frames, 1533 TS packets
+  (PAT, SDT, PMT, video, audio), 72 of 99 FEC blocks at L1 MER about 5 dB
+  (the test receiver's channel estimate uses the P2 pilots only).
 - Analyser: flat 1.54 MHz block, sharp edges.
 
 ## Not done
 
 - A T2 receiver in trxd (the offline one is for this profile only and not
   real time; the 3.072 MS/s stream would need the FPGA's help).
-- 16QAM/64QAM (bit interleaver and demux), rotated constellations on air
-  (the code has rotation, unchecked OTA), other FFT sizes, PAPR reduction.
+- 16QAM/64QAM (bit interleaver and demux), other FFT sizes, PAPR
+  reduction.
 - A check with an independent T2 receiver (TV HAT / Ryde).
