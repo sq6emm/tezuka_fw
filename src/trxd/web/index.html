@@ -47,6 +47,8 @@ button { font: inherit; color: inherit; }
 header { display: flex; align-items: center; gap: 12px; padding: 2px 6px; color: var(--dim); font-size: 12px; }
 header .brand { color: var(--text); font-weight: 700; letter-spacing: .14em; }
 header .by { margin-left: -8px; }
+#login .based { margin-top: -8px; }
+#login .based a, header .based a { color: inherit; }
 #login h1 small { font-size: 12px; color: var(--dim); letter-spacing: .04em; font-weight: 600; }
 header .grow { flex: 1; }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--dim); margin-right: 4px; vertical-align: middle; }
@@ -166,6 +168,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
 }
 @media (max-width: 720px) {
   #lcd { grid-template-columns: 1fr; }
+  header .based { display: none; }
   #deck { grid-template-columns: 1fr; }
   #app { grid-template-rows: auto auto auto minmax(260px, 1fr) auto; overflow: auto; height: auto; min-height: 100%; }
 }
@@ -176,6 +179,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
 <div id="login" class="hidden">
   <form method="post" action="/login">
     <h1>SQTRX <small>by SQ6EMM/Claude</small></h1>
+    <div class="note based">(based on <a href="https://github.com/F5OEO/tezuka_fw" target="_blank" rel="noopener">tezuka_fw</a>/<a href="https://github.com/F5OEO/maia-sdr" target="_blank" rel="noopener">maia-sdr</a> by F5OEO)</div>
     <input type="password" name="password" placeholder="Password" autocomplete="current-password" autofocus required>
     <button type="submit">Log in</button>
     <div class="err hidden" id="loginerr">Wrong password.</div>
@@ -186,7 +190,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
 
 <div id="app" class="hidden">
   <header>
-    <span class="brand">SQTRX</span><span class="by">by SQ6EMM/Claude</span>
+    <span class="brand">SQTRX</span><span class="by">by SQ6EMM/Claude <span class="based">(based on <a href="https://github.com/F5OEO/tezuka_fw" target="_blank" rel="noopener">tezuka_fw</a>/<a href="https://github.com/F5OEO/maia-sdr" target="_blank" rel="noopener">maia-sdr</a> by F5OEO)</span></span>
     <span id="callsign"></span>
     <span class="grow"></span>
     <span title="WebSocket"><span class="dot" id="d-ws"></span>LINK</span>
