@@ -159,6 +159,7 @@ body:not(.cw-mode) .cw-only, body:not(.ssb-mode) .ssb-only, body:not(.data-mode)
 #datv-const { flex: none; width: 120px; height: 120px; background: #000; border-radius: var(--r); border: 1px solid var(--lcd-edge); }
 #datv-go.on { background: var(--tx); border-color: #ff8080; color: #fff; }
 #rc28menu { position: fixed; top: 34px; right: 10px; z-index: 10; width: min(360px, 94vw); box-shadow: 0 10px 30px rgba(0,0,0,.6); }
+.slider select.adev { grid-column: 2 / 4; min-width: 0; width: 100%; font-size: 12px; font-family: inherit; }
 select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd-edge); border-radius: var(--r); padding: 4px; }
 .note { color: var(--dim); font-size: 12px; }
 
@@ -359,6 +360,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <div class="row"><button class="k" id="audio" title="Receive audio in this browser: on / off">AUDIO</button>
         <button class="k" id="rfg-auto" title="Front-end (AD9361) gain: AUTO = the chip's own AGC, MAN = the RF gain slider">RF AUTO</button>
         <button class="k hidden" id="port" title="Which antenna sockets: RX1/TX1 or RX2/TX2. Switching re-initialises the AD936x (about a second, not while transmitting). SET can tie a band to a pair.">RX1·TX1</button></div>
+      <div class="slider" title="Where this browser plays the receive audio (remembered in this browser)">OUT<select id="aout" class="adev"><option value="">Default</option></select></div>
     </div>
 
     <div class="card wide">
@@ -371,6 +373,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       </div>
       <div class="slider">Drive<input type="range" id="drv" min="0" max="100" value="100"><b id="drv-v">100</b></div>
       <div class="slider">TX att<input type="range" id="att" min="0" max="89" value="20"><b id="att-v">20</b></div>
+      <div class="slider" title="Microphone for voice and DATV (remembered in this browser). Names show once the browser was allowed to use a microphone.">IN<select id="ain" class="adev"><option value="">Default</option></select></div>
       <div class="slider voice-only no-cw">MIC<input type="range" id="micg" min="0" max="200" value="100"><b id="micg-v">100%</b></div>
       <div class="slider voice-only ssb-only" title="Speech compressor + CESSB: SSB only, never applied in data, CW, AM or FM"><button class="k" id="comp" style="min-width:0;padding:2px 6px;font-size:11px">COMP</button><input type="range" id="compl" min="0" max="20" value="10"><b id="compl-v">10 dB</b></div>
       <div class="row voice-only cw-only">
@@ -1070,6 +1073,56 @@ async function audioStart() {
   gain = actx.createGain(); gain.gain.value = S.muted ? 0 : S.vol;
   rxNode.connect(gain).connect(actx.destination);
   $("audio").classList.add("on");
+  await audioOutApply();
+}
+// ---- audio devices: the choice per browser; "" = the system default.
+const audioDev = { in: store.get("audio_in", ""), out: store.get("audio_out", "") };
+let outEl = null;   // Firefox: the audio through an <audio> element (no AudioContext.setSinkId)
+async function audioOutApply() {
+  if (!actx) return;
+  const id = audioDev.out;
+  try {
+    if (actx.setSinkId) { await actx.setSinkId(id); return; }
+    if (!("setSinkId" in HTMLMediaElement.prototype)) return;
+    if (!outEl && id) {
+      const dest = actx.createMediaStreamDestination();
+      gain.disconnect(); gain.connect(dest);
+      outEl = new Audio(); outEl.srcObject = dest.stream; outEl.play().catch(() => {});
+    }
+    if (outEl) await outEl.setSinkId(id);
+  } catch (e) { alert("Audio output: " + e.message); }
+}
+function micConstraints(extra) {
+  const c = { ...extra };
+  if (audioDev.in) c.deviceId = { exact: audioDev.in };
+  return c;
+}
+// getUserMedia with the chosen microphone; one gone since falls back to the default.
+async function getMedia(c) {
+  try { return await navigator.mediaDevices.getUserMedia(c); }
+  catch (e) {
+    if (!(audioDev.in && (e.name === "OverconstrainedError" || e.name === "NotFoundError"))) throw e;
+    const a = { ...c.audio }; delete a.deviceId;
+    return await navigator.mediaDevices.getUserMedia({ ...c, audio: a });
+  }
+}
+async function audioDevices() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+  let devs = [];
+  try { devs = await navigator.mediaDevices.enumerateDevices(); } catch { return; }
+  const fill = (sel, kind, cur, name) => {
+    const list = devs.filter((d) => d.kind === kind && d.deviceId && d.deviceId !== "default" && d.deviceId !== "communications");
+    const opts = [`<option value="">Default</option>`].concat(list.map((d, i) =>
+      `<option value="${escapeHtml(d.deviceId)}">${escapeHtml(d.label || name + " " + (i + 1))}</option>`));
+    if (cur && !list.some((d) => d.deviceId === cur)) opts.push(`<option value="${escapeHtml(cur)}">(saved, not present)</option>`);
+    $(sel).innerHTML = opts.join(""); $(sel).value = cur;
+  };
+  fill("ain", "audioinput", audioDev.in, "Microphone");
+  fill("aout", "audiooutput", audioDev.out, "Output");
+  // No way to choose the output here (older Firefox, Safari): the system's.
+  const canOut = (window.AudioContext && "setSinkId" in AudioContext.prototype) || "setSinkId" in HTMLMediaElement.prototype;
+  $("aout").disabled = !canOut;
+  if (!canOut) $("aout").title = "This browser plays through the system's output only";
 }
 // AUDIO switches this browser's receive audio on and off (MUTE only silences it).
 async function audioToggle() {
@@ -1082,13 +1135,28 @@ function audioIn(u8) {
   for (let i = 0; i < u8.length; i++) f[i] = MU[u8[i]];
   rxNode.port.postMessage(f, [f.buffer]);
 }
+const MIC_VOICE = { echoCancellation: false, noiseSuppression: false, autoGainControl: true, channelCount: 1 };
+let micSrc = null;
+// Another microphone chosen while one runs: swap the source under the capture node.
+async function micSwitch() {
+  if (!micNode) return;
+  let st;
+  try { st = await getMedia({ audio: micConstraints(MIC_VOICE) }); }
+  catch (e) { alert("Microphone: " + e.message); return; }
+  if (micSrc) micSrc.disconnect();
+  micStream.getTracks().forEach((t) => t.stop());
+  micStream = st;
+  micSrc = actx.createMediaStreamSource(st); micSrc.connect(micNode);
+}
 async function micStart() {
   await audioStart();
   if (micNode) return true;
   try {
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true, channelCount: 1 } });
+    micStream = await getMedia({ audio: micConstraints(MIC_VOICE) });
   } catch (e) { alert("Microphone: " + e.message); return false; }
-  const src = actx.createMediaStreamSource(micStream);
+  audioDevices();
+  micSrc = actx.createMediaStreamSource(micStream);
+  const src = micSrc;
   micNode = new AudioWorkletNode(actx, "mic-capture");
   micNode.port.onmessage = (e) => {
     if (!S.st || !S.st.ptt || S.st.tx_source !== "web") return;
@@ -1256,6 +1324,10 @@ function buildStatic() {
   $("ptt").addEventListener("pointerleave", () => { if (!S.pttLatched && S.st && S.st.ptt) pttUp(false); });
   $("tune").onclick = () => send({ cmd: "tune", on: !(S.st && S.st.tune) });
   $("mic").onclick = () => micStart();
+  $("ain").onchange = () => { audioDev.in = $("ain").value; store.set("audio_in", audioDev.in); micSwitch(); };
+  $("aout").onchange = () => { audioDev.out = $("aout").value; store.set("audio_out", audioDev.out); audioOutApply(); };
+  audioDevices();
+  if (navigator.mediaDevices) navigator.mediaDevices.addEventListener("devicechange", audioDevices);
   window.addEventListener("keydown", (e) => {
     if (e.target.tagName === "INPUT") return;
     if (e.code === "Space" && !e.repeat) { e.preventDefault(); pttDown(false); }
@@ -1476,9 +1548,10 @@ const DATV = (() => {
     if (!supported()) { alert("DATV needs WebCodecs: Chrome, Edge or Firefox 130 and later."); return; }
     starting = true; render();
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
+      stream = await getMedia({
         video: { width: { ideal: 320 }, height: { ideal: 240 }, frameRate: { ideal: 15 } },
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+        audio: micConstraints({ channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }) });
+      audioDevices();
     } catch (e) { starting = false; render(); alert("Camera/microphone: " + e.message); return; }
     const v = $("datv-preview"); v.srcObject = stream; v.play().catch(() => {});
     refusal = null;

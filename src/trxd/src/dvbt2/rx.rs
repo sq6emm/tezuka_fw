@@ -275,6 +275,24 @@ mod tests {
                 }
             }
         }
+        // The software receiver on the longest raw run (`/tmp/t2-rawall`):
+        // the same signal without the front end's FFTs.
+        if let Some((c0, big)) = runs.iter().max_by_key(|r| r.1.len()).filter(|r| r.1.len() > 1_500_000) {
+            let r = receive(p, big, fs);
+            eprintln!("software receiver on the raw run at {c0} ({} samples): frames {}, packets {}, LDPC failures {}, freq {:.0} Hz, MER {:?}", big.len(), r.frames, r.packets.len(), r.ldpc_fail, r.freq_hz, r.mer_db);
+        }
+        // P1s along the longest raw run, a frame's worth at a time.
+        if let Some((c0, big)) = runs.iter().max_by_key(|r| r.1.len()) {
+            let fl = p.frame_samples();
+            let mut at = 0;
+            while at + fl + 4096 <= big.len() {
+                let x = &big[at..at + fl + 4096];
+                if let Some((s, f, q)) = super::super::stream::find_p1_in(x, p1, e1, 0, x.len() - 2048 + 1, fs) {
+                    eprintln!("long run P1 at {} (+{s} in chunk), coarse {f:.0} Hz, q {q:.2}", *c0 + (at + s) as u64);
+                }
+                at += fl;
+            }
+        }
         // With every sample raw too (`/tmp/t2-rawall` on the board): each FFT
         // against a software FFT of the same window, by carrier magnitude,
         // at a few window shifts and in two orders.
@@ -346,11 +364,15 @@ mod tests {
             };
             let near0 = runs.first().map_or(0, |r| r.0);
             let mut shown = 0;
+            let mut summary: Vec<(u8, u64, f32)> = Vec::new();
             let skip: usize = std::env::var("T2SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
             let mut near = near0 + 1_000_000;
-            for (j, f22, v) in ffts.iter().filter(|f| f.2.len() == 1705).skip(skip) {
+            for (idx, (j, f22, v)) in ffts.iter().filter(|f| f.2.len() == 1705).enumerate() {
                 let fr = super::super::fe::extend(*f22, 22, near);
                 near = fr;
+                if idx < skip {
+                    continue;
+                }
                 let g = fr + 2048 + *j as u64 * 2304;
                 // T2PERM: 1 = carrier words swapped in pairs, 2 = reversed
                 let perm: u32 = std::env::var("T2PERM").ok().and_then(|x| x.parse().ok()).unwrap_or(0);
@@ -372,6 +394,9 @@ mod tests {
                         let num: Complex32 = a.iter().zip(r).map(|(x, y)| x * y.conj()).sum();
                         let den = (a.iter().map(|x| x.norm_sqr()).sum::<f32>() * r.iter().map(|x| x.norm_sqr()).sum::<f32>()).sqrt();
                         out += &format!(" [{lo}+{len}]: {:.3}", num.norm() / den.max(1e-20));
+                        if lo == 1856 {
+                            summary.push((*j, fr, num.norm() / den.max(1e-20)));
+                        }
                     } else {
                         out += &format!(" [{lo}+{len}]: no raw");
                     }
@@ -422,11 +447,26 @@ mod tests {
                     }
                 }
                 out += &format!(" | misframed? window {} tail at lag {}: {:.3}", bestm.1, bestm.2, bestm.0);
-                eprintln!("FFT j {j} F {fr} vs raw:{out}");
+                if std::env::var_os("T2SUMMARY").is_none() {
+                    eprintln!("FFT j {j} F {fr} vs raw:{out}");
+                }
                 shown += 1;
-                if shown >= 6 {
+                let lim: usize = std::env::var("T2NFFT").ok().and_then(|x| x.parse().ok()).unwrap_or(6);
+                if shown >= lim {
                     break;
                 }
+            }
+            if !summary.is_empty() {
+                let good = summary.iter().filter(|x| x.2 > 0.8).count();
+                let frames: std::collections::BTreeMap<u64, (usize, usize)> = summary.iter().fold(Default::default(), |mut m, x| {
+                    let e = m.entry(x.1).or_insert((0, 0));
+                    e.1 += 1;
+                    if x.2 > 0.8 {
+                        e.0 += 1;
+                    }
+                    m
+                });
+                eprintln!("FFT vs raw summary: {good} of {} good; per frame (good/all): {:?}", summary.len(), frames);
             }
         }
         // Continual pilots (the same carriers in every data symbol): their

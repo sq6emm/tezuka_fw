@@ -187,9 +187,18 @@ fn fec(p: Params, packets: Receiver<[u8; TS_LEN]>, cells_out: Sender<Vec<Cell>>,
     while !stop.load(Ordering::Relaxed) {
         let t0 = std::time::Instant::now();
         // A packet late from the mux (engine busy) becomes a null packet:
-        // the frame must go out on time.
+        // the frame must go out on time. At most 20 ms of waiting a frame (a
+        // wait a packet stalled whole frames and ran the DAC dry, which
+        // moves the frames on air and loses receivers).
+        let mut budget = std::time::Duration::from_millis(20);
         let mut next = || {
-            packets.recv_timeout(std::time::Duration::from_millis(20)).unwrap_or_else(|_| {
+            if let Ok(p) = packets.try_recv() {
+                return p;
+            }
+            let t = std::time::Instant::now();
+            let got = packets.recv_timeout(budget);
+            budget = budget.saturating_sub(t.elapsed());
+            got.unwrap_or_else(|_| {
                 nulls += 1;
                 null
             })

@@ -179,8 +179,13 @@ pub mod model {
                     if let Some(p) = self.pending.take() {
                         self.f = p;
                         self.running = true;
-                        self.skip = false;
+                        // a start already past: the rest of that frame left out
+                        self.skip = self.counter > p;
                     }
+                }
+                if !(self.scheduled && self.running) {
+                    // no schedule: the FFT restarts (as the FPGA's does)
+                    self.win.clear();
                 }
                 let ph = self.phase as f64 / 4_294_967_296.0 * std::f64::consts::TAU;
                 let y = Complex32::new(v[0] as f32, v[1] as f32) * Complex32::new(ph.cos() as f32, ph.sin() as f32);
