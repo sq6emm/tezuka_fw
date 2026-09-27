@@ -278,3 +278,30 @@ On the boards (both flashed, firmware v0.3.21-25-g7d23 plus these; Libre 2
 -> Libre 1 over the air, 250 kS/s QPSK 1/2 long, 60 s): 422/422 frames,
 534 pictures, Libre 1 demodulator 18 % of a core and FEC 12 % (51 % and 13 %
 with TRXD_NO_SYMSYNC=1 on the same link, same MER of about 15 dB).
+
+## Standard symbol rates and automatic receive (2026-09-27)
+
+The DATV panel offers the amateur standard rates only, 33, 66, 125, 250,
+333 and 500 kS/s (BATC / QO-100 practice; 256k and the other whole
+fractions of 3.072 MS/s are gone), and the long-frame modes QPSK 1/2,
+QPSK 3/4 and 8PSK 3/4, always with pilots (no tick: the FPGA sends them,
+the receiver needs them). Both directions go through the FPGA at every
+rate: 500 kS/s receive uses FIR1 at /2 as the matched filter (3.07 samples
+per symbol) with FIR2 and FIR3 bypassed.
+
+"Auto (receive)" as the symbol rate: a blind scan like a tuner's
+(`dvbs2/scan.rs`). The FPGA front end is set to each standard rate in turn
+(the last one found first; about two long frames at each, 0.4 s at least,
+2.2 s at 33 kS/s); every header the FPGA flags has its PLS decoded
+(`dvbs2/pls.rs`: all 112 MODCOD/type headers matched coherently over 90
+symbols at every carrier offset through a 256-point FFT; 0 dB Es/N0 with
+2 % of the symbol rate offset still decodes, noise scores under 0.45, a
+header over 0.6). Two matching decodes (or one over 0.8) start the
+receiver for that rate and mode; 5 s (or 2.5 long frames) without a good
+frame and it scans again. Other MODCODs are named in the status ("not
+receivable here").
+
+Over the air (Libre 2 -> Libre 1, Libre 1 on Auto): 33, 66, 125, 250, 333
+and 500 kS/s, QPSK 1/2, QPSK 3/4 and 8PSK 3/4 all found and locked, about
+10-20 s after the transmitter started (a scan cycle is about 5 s); a
+change from 250 kS/s QPSK 1/2 to 125 kS/s QPSK 3/4 followed by itself.

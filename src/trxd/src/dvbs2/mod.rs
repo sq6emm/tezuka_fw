@@ -18,6 +18,8 @@ pub mod fpga_tx;
 pub mod bch;
 pub mod fpga_ldpc;
 pub mod hdrdet;
+pub mod pls;
+pub mod scan;
 pub mod ldpc_fpga;
 pub mod symsync;
 mod tables;
@@ -399,7 +401,7 @@ fn plheader(modcod: u8, pilots: bool) -> Vec<Complex32> {
 }
 
 /// PLHEADER for either frame size (TYPE bit 1: short).
-fn plheader_typed(modcod: u8, pilots: bool, short: bool) -> Vec<Complex32> {
+pub(crate) fn plheader_typed(modcod: u8, pilots: bool, short: bool) -> Vec<Complex32> {
     const SOF: u32 = 0x18D_2E82;
     const PLS_SCRAMBLE: u64 = 0x719D_83C9_5342_2DFA;
     const G: [u32; 6] = [0x5555_5555, 0x3333_3333, 0x0F0F_0F0F, 0x00FF_00FF, 0x0000_FFFF, 0xFFFF_FFFF];

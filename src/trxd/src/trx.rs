@@ -247,6 +247,13 @@ pub struct Trx {
     /// DATV reception (DVB-S2 receiver thread), when switched on.
     datv_rx: Option<crate::dvbs2::rx::RxThread>,
     datv_rx_stats: crate::dvbs2::rx::Stats,
+    /// Automatic receive (symbol rate "0"): the blind scan while no
+    /// receiver runs, what it found last, the receiver's last progress.
+    datv_scan: Option<crate::dvbs2::scan::Scanner>,
+    datv_auto: bool,
+    datv_auto_sr: Option<f64>,
+    datv_auto_note: String,
+    datv_auto_good: (u64, Instant),
     datv_rx_log: Instant,
     duc: Duc,
     tx_nco: Nco,
@@ -453,6 +460,11 @@ impl Trx {
             datv_mode: false,
             datv_rx: None,
             datv_rx_stats: Default::default(),
+            datv_scan: None,
+            datv_auto: false,
+            datv_auto_sr: None,
+            datv_auto_note: String::new(),
+            datv_auto_good: (0, Instant::now()),
             datv_rx_log: Instant::now(),
             duc: Duc::new(CH_RATE, rate),
             tx_nco: Nco::new(0.0, rate),
@@ -860,6 +872,10 @@ impl Trx {
 
     /// Start DATV for `client`: validate, build the modulator and mux, key.
     fn datv_start(&mut self, client: u64, sr: f64, rate: &str, pilots: bool) {
+        if sr == 0.0 && !rate.starts_with("T2-") {
+            self.datv_refuse(client, "choose a symbol rate to send (Auto is for receiving)");
+            return;
+        }
         use crate::dvbs2::{Modulator, Params, Rate, ts::Mux, ts::Profile};
         use crate::dvbs2::fpga_tx::{LongMode, Transmitter};
         if let Some(mode) = crate::dvbt2::tx::Mode::parse(rate) {
@@ -988,7 +1004,16 @@ impl Trx {
     fn datv_rx_start(&mut self, sr: f64, rate: &str, pilots: bool) {
         use crate::dvbs2::{FrameSpec, Params, Rate, ddc, fpga, fpga_tx::LongMode};
         self.datv_rx = None;
+        self.datv_scan = None;
         self.datv_rx_stats = Default::default();
+        // Symbol rate 0: find rate and mode by themselves (blind scan).
+        self.datv_auto = sr == 0.0;
+        if self.datv_auto {
+            self.datv_auto_note = "scanning".into();
+            self.datv_scan = Some(crate::dvbs2::scan::Scanner::start(self.rx_eff() - self.center, self.datv_auto_sr));
+            info!("DATV receive: automatic (scanning the standard symbol rates)");
+            return;
+        }
         let sps = self.rate / sr;
         let software = DATV_RATES.contains(&sr) && (sps - sps.round()).abs() < 1e-9;
         let ddc = fpga::available() && ddc::symbol_rate_ok(fpga::FS_IN, sr);
@@ -1019,11 +1044,70 @@ impl Trx {
         }
         self.datv_mode = false;
         self.datv_rx = None;
+        self.datv_scan = None;
+        self.datv_auto = false;
         self.datv_rx_stats = Default::default();
         if matches!(self.tx_on, Some(TxSource::Datv(_))) {
             self.unkey();
         }
         info!("DATV mode off");
+    }
+
+    /// Automatic receive: a scan that found something starts the receiver
+    /// for it; a receiver that decodes nothing for a while goes back to
+    /// scanning (the other station may have changed its mode).
+    fn datv_auto_step(&mut self) {
+        use crate::dvbs2::scan::State;
+        if !self.datv_auto {
+            return;
+        }
+        if let Some(sc) = &self.datv_scan {
+            match sc.state() {
+                State::Scanning(sr) => self.datv_auto_note = format!("scanning {:.0} kS/s", sr / 1e3),
+                State::Failed(e) => {
+                    warn!("DATV scan: {e}");
+                    self.datv_auto_note = format!("cannot scan: {e}");
+                    self.datv_scan = None;
+                    self.datv_auto = false;
+                }
+                State::Found { sr, pls, offset_hz } => {
+                    self.datv_scan = None;
+                    self.datv_auto_sr = Some(sr);
+                    match pls.long_mode() {
+                        Some(mode) => {
+                            let label = format!("{} @ {:.0} kS/s (auto)", mode.label(), sr / 1e3);
+                            info!(sr, mode = mode.label(), offset_hz = offset_hz.round(), "DATV receive: automatic, receiving");
+                            self.datv_auto_note = format!("found {} at {:.0} kS/s", pls.describe(), sr / 1e3);
+                            let center = self.rx_eff() - self.center;
+                            self.datv_rx = Some(crate::dvbs2::rx::RxThread::start_spec(crate::dvbs2::FrameSpec::long(mode), label, self.rate, sr, center));
+                            self.datv_rx_stats = Default::default();
+                            self.datv_auto_good = (0, Instant::now());
+                        }
+                        None => {
+                            // Something DVB-S2 this receiver cannot decode:
+                            // say what, look again later.
+                            self.datv_auto_note = format!("{} at {:.0} kS/s: not receivable here (QPSK 1/2, 3/4, 8PSK 3/4 long with pilots are)", pls.describe(), sr / 1e3);
+                            self.datv_auto_good = (0, Instant::now());
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        // Receiving (or showing an unsupported mode): back to scanning once
+        // no frame has decoded for 5 s (or two of the rate's frames).
+        let good = self.datv_rx_stats.frames.saturating_sub(self.datv_rx_stats.frames_bad);
+        if good > self.datv_auto_good.0 {
+            self.datv_auto_good = (good, Instant::now());
+        }
+        let patience = Duration::from_secs_f64((2.5 * 33_282.0 / self.datv_auto_sr.unwrap_or(250e3)).max(5.0));
+        if self.datv_auto_good.1.elapsed() > patience {
+            info!("DATV receive: automatic, signal lost; scanning again");
+            self.datv_rx = None;
+            self.datv_rx_stats = Default::default();
+            self.datv_auto_note = "scanning".into();
+            self.datv_scan = Some(crate::dvbs2::scan::Scanner::start(self.rx_eff() - self.center, self.datv_auto_sr));
+        }
     }
 
     fn datv_json(&self) -> serde_json::Value {
@@ -1394,6 +1478,9 @@ impl Trx {
 
         if let Some(r) = &self.datv_rx {
             r.feed(iq, self.rx_eff() - self.center);
+        }
+        if let Some(sc) = &self.datv_scan {
+            sc.set_center(self.rx_eff() - self.center);
         }
         self.lap(0, &mut mark);
         // The channel.
@@ -1918,7 +2005,11 @@ impl Trx {
             "ports": self.settings.ports,
             "datv": self.datv_json(),
             "datv_mode": self.datv_mode,
-            "datv_rx": self.datv_rx.as_ref().map(|r| serde_json::json!({"sr": r.sr, "rate": r.label, "pilots": r.spec.pilots, "fpga": r.uses_fpga()})),
+            "datv_rx": match (&self.datv_rx, self.datv_auto) {
+                (Some(r), auto) => Some(serde_json::json!({"sr": r.sr, "rate": r.label, "pilots": r.spec.pilots, "fpga": r.uses_fpga(), "auto": auto})),
+                (None, true) => Some(serde_json::json!({"sr": 0, "rate": "auto", "pilots": true, "fpga": true, "auto": true})),
+                (None, false) => None,
+            },
             "xvtr": self.xvtr.as_ref().map(|t| t.name.clone()),
             "xvtrs": self.settings.transverters,
             "cal_band": self.cal_band(),
@@ -1947,6 +2038,7 @@ impl Trx {
         for c in cmds {
             self.apply_web(c.client, &c.msg);
         }
+        self.datv_auto_step();
         let Some(w) = &self.web else { return };
         if let Some(r) = &self.datv_rx {
             let (stats, msgs) = r.take();
@@ -1997,7 +2089,7 @@ impl Trx {
             let dbm = self.settings.dbm(&self.cal_band(), self.reading_db);
             let datv = self.datv.as_ref().map(|d| serde_json::json!({"backlog": (d.mux.backlog_s() * 10.0).round() / 10.0, "dropped": d.mux.dropped_frames}));
             let s = &self.datv_rx_stats;
-            let datv_rx = self.datv_rx.as_ref().map(|_| serde_json::json!({"locked": s.locked, "esn0": (s.esn0_db * 10.0).round() / 10.0,
+            let datv_rx = (self.datv_rx.is_some() || self.datv_auto).then(|| serde_json::json!({"auto": self.datv_auto.then(|| self.datv_auto_note.clone()), "rx": self.datv_rx.is_some(), "locked": s.locked, "esn0": (s.esn0_db * 10.0).round() / 10.0,
                 "mer": (s.data_esn0_db * 10.0).round() / 10.0,
                 "freq": s.freq_hz.round(), "frames": s.frames, "bad": s.frames_bad, "packets": s.packets,
                 "dropped": s.blocks_dropped, "skipped": s.frames_skipped, "busy": s.frames_fec_busy,
@@ -2073,6 +2165,7 @@ impl Trx {
             }
             "datv_rx" => {
                 self.datv_rx = None;
+                self.datv_scan = None;
                 self.datv_rx_stats = Default::default();
                 if on {
                     self.datv_rx_start(num("sr").unwrap_or(64_000.0), m["rate"].as_str().unwrap_or("1/2"), m["pilots"].as_bool().unwrap_or(true));

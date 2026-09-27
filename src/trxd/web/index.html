@@ -320,15 +320,14 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       </div>
       <div class="slider voice-only">SQL<input type="range" id="sql" min="0" max="100" value="0"><b id="sql-v">OFF</b></div>
       <div class="row datv-only">
-        <select id="datv-sr" title="Symbol rate: lower is narrower and more sensitive">
-          <option value="32000">32 kS/s</option><option value="48000">48 kS/s</option>
-          <option value="64000" selected>64 kS/s</option><option value="96000">96 kS/s</option><option value="128000">128 kS/s</option><option value="192000">192 kS/s</option><option value="250000">250 kS/s (FPGA)</option><option value="256000">256 kS/s (FPGA)</option><option value="333000">333 kS/s (FPGA)</option><option value="500000">500 kS/s (FPGA TX)</option>
+        <select id="datv-sr" title="Symbol rate (amateur standard rates): lower is narrower and more sensitive">
+          <option value="0">Auto (receive)</option><option value="33000">33 kS/s</option><option value="66000">66 kS/s</option><option value="125000">125 kS/s</option>
+          <option value="250000" selected>250 kS/s</option><option value="333000">333 kS/s</option><option value="500000">500 kS/s</option>
         </select>
-        <select id="datv-fec" title="QPSK code rate: lower is more robust, carries less">
-          <option value="1/4">QPSK 1/4</option><option value="1/3">QPSK 1/3</option>
-          <option value="1/2" selected>QPSK 1/2</option><option value="2/3">QPSK 2/3</option><option value="3/4">QPSK 3/4</option><option value="L-QPSK-1/2">QPSK 1/2 long (FPGA)</option><option value="L-QPSK-3/4">QPSK 3/4 long (FPGA)</option><option value="L-8PSK-3/4">8PSK 3/4 long (FPGA)</option><option value="T2-1.7-QPSK-1/2">DVB-T2 1.7 MHz QPSK 1/2</option><option value="T2-1.7-QPSK-3/4">DVB-T2 1.7 MHz QPSK 3/4</option><option value="T2-2.0-QPSK-1/2">DVB-T2 2.0 MHz QPSK 1/2</option><option value="T2-1.35-QPSK-1/2">DVB-T2 1.35 MHz QPSK 1/2</option><option value="T2-1.7-16QAM-1/2">DVB-T2 1.7 MHz 16QAM 1/2</option><option value="T2-1.7-16QAM-3/4">DVB-T2 1.7 MHz 16QAM 3/4</option><option value="T2-2.0-16QAM-1/2">DVB-T2 2.0 MHz 16QAM 1/2</option>
+        <select id="datv-fec" title="DVB-S2 (long frames, pilots) or DVB-T2 mode: lower rates are more robust, carry less">
+          <optgroup label="DVB-S2"><option value="L-QPSK-1/2" selected>QPSK 1/2</option><option value="L-QPSK-3/4">QPSK 3/4</option><option value="L-8PSK-3/4">8PSK 3/4</option></optgroup>
+          <optgroup label="DVB-T2 (bandwidth in the mode)"><option value="T2-1.7-QPSK-1/2">1.7 MHz QPSK 1/2</option><option value="T2-1.7-QPSK-3/4">1.7 MHz QPSK 3/4</option><option value="T2-1.7-16QAM-1/2">1.7 MHz 16QAM 1/2</option><option value="T2-1.7-16QAM-3/4">1.7 MHz 16QAM 3/4</option><option value="T2-2.0-QPSK-1/2">2.0 MHz QPSK 1/2</option><option value="T2-2.0-16QAM-1/2">2.0 MHz 16QAM 1/2</option><option value="T2-1.35-QPSK-1/2">1.35 MHz QPSK 1/2</option></optgroup>
         </select>
-        <label class="note"><input type="checkbox" id="datv-pilots" checked> pilots</label>
       </div>
       <div class="note datv-only" id="datv-info">—</div>
       <div class="note datv-only">Both stations use the same settings. The picture adapts to the rate (160x120 at 2 fps
@@ -1435,7 +1434,9 @@ const DATV = (() => {
   const tsRate = (sr, fec, pilots) => T2[fec] ? T2[fec][0] * T2[fec][1] / 458240
     : LONG[fec] ? sr * LONG[fec][0] / LONG[fec][1] : sr * PAYLOAD[fec] / (pilots ? 8370 : 8190);
   const occupied = (sr, fec) => T2[fec] ? T2[fec][0] * 1705 / 2048 : sr * 1.35;
-  const settings = () => ({ sr: +$("datv-sr").value, rate: $("datv-fec").value, pilots: $("datv-pilots").checked });
+  // Long frames always carry pilots (the FPGA transmitter sends them, the
+  // receiver expects them).
+  const settings = () => ({ sr: +$("datv-sr").value, rate: $("datv-fec").value, pilots: true });
   function info() {
     const { sr, rate, pilots } = settings(), f = S.st ? curFreq() : 0;
     $("datv-info").textContent = `TS ${(tsRate(sr, rate, pilots) / 1000).toFixed(1)} kbit/s · ${(occupied(sr, rate) / 1000).toFixed(0)} kHz wide` +
@@ -1451,15 +1452,9 @@ const DATV = (() => {
     send({ cmd: "datv_mode", on: true, ...settings() });
     audioStart().catch(() => {});   // a click: the browser allows audio now
   }
-  // Symbol rates only the FPGA transmitter reaches (not whole at 384 kS/s):
-  // there only the long-frame modes, which go through it.
-  const FPGA_ONLY_SR = [250000, 256000, 333000, 500000];
+  // DVB-T2 carries its bandwidth in the mode: the symbol rate does not apply.
   function limitModes() {
-    const fpgaOnly = FPGA_ONLY_SR.includes(+$("datv-sr").value);
-    // DVB-T2 ignores the symbol rate (its bandwidth is in the mode).
-    const fpgaMode = v => v.startsWith("L-") || v.startsWith("T2-");
-    for (const o of $("datv-fec").options) o.disabled = fpgaOnly && !fpgaMode(o.value);
-    if (fpgaOnly && !fpgaMode($("datv-fec").value)) $("datv-fec").value = "L-QPSK-1/2";
+    $("datv-sr").disabled = on || starting || $("datv-fec").value.startsWith("T2-");
   }
   let refusal = null;
   function settingsChanged() {
@@ -1616,13 +1611,14 @@ const DATV = (() => {
   function render() {
     const b = $("datv-go");
     b.textContent = on ? "STOP" : starting ? "STARTING…" : "START"; b.classList.toggle("on", on);
-    for (const id of ["datv-sr", "datv-fec", "datv-pilots"]) $(id).disabled = on || starting;
+    for (const id of ["datv-sr", "datv-fec"]) $(id).disabled = on || starting;
+    limitModes();
     if (!on) $("datv-stat").textContent = "";
   }
   return {
     init() {
       $("datv-go").onclick = () => (on ? stop(true) : start());
-      for (const id of ["datv-sr", "datv-fec", "datv-pilots"]) $(id).onchange = settingsChanged;
+      for (const id of ["datv-sr", "datv-fec"]) $(id).onchange = settingsChanged;
       limitModes();
       window.addEventListener("pagehide", () => { if (on) stop(true); });
       info();
@@ -1641,7 +1637,8 @@ const DATV = (() => {
     get receiving() { return rxOn; },
     keyframe() { forceKey = true; },
     meter(d, r) {
-      if (rxOn && r) $("datv-rxstat").innerHTML = `<b>${r.locked ? "LOCK" : "searching"}</b><br>MER ${r.mer.toFixed(1)} dB · Es/N0 ${r.esn0.toFixed(1)} dB<br>carrier ${r.freq >= 0 ? "+" : ""}${r.freq} Hz<br>frames ${r.frames - r.bad}/${r.frames} · shown ${rxFrames}<br>dropped: IQ ${r.dropped}, frames ${r.busy}<br>CPU: demod ${r.demod_pct} %, FEC ${r.fec_pct} %${S.st && S.st.datv_rx && S.st.datv_rx.fpga ? " · front end: FPGA" : ""}`;
+      if (rxOn && r && r.auto && !r.rx) { $("datv-rxstat").innerHTML = `<b>AUTO</b> ${r.auto}`; }
+      else if (rxOn && r) $("datv-rxstat").innerHTML = (r.auto ? `auto: ${r.auto}<br>` : "") + `<b>${r.locked ? "LOCK" : "searching"}</b><br>MER ${r.mer.toFixed(1)} dB · Es/N0 ${r.esn0.toFixed(1)} dB<br>carrier ${r.freq >= 0 ? "+" : ""}${r.freq} Hz<br>frames ${r.frames - r.bad}/${r.frames} · shown ${rxFrames}<br>dropped: IQ ${r.dropped}, frames ${r.busy}<br>CPU: demod ${r.demod_pct} %, FEC ${r.fec_pct} %${S.st && S.st.datv_rx && S.st.datv_rx.fpga ? " · front end: FPGA" : ""}`;
       if (!on || !cfg) return;
       $("datv-stat").textContent = `${cfg.width}x${cfg.height} ${cfg.fps} fps · video ${(cfg.video_bps / 1000).toFixed(0)}k · audio ${(cfg.audio_bps / 1000).toFixed(0)}k` +
         (d ? ` · queue ${d.backlog.toFixed(1)} s · dropped ${d.dropped}` : "") + ` · sent ${(sent / 1024).toFixed(0)} KiB` +

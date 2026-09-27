@@ -57,12 +57,13 @@ pub struct Design {
     pub rs: f64,
     pub fir1: Stage,
     pub fir2: Option<Stage>,
-    pub fir3: Stage,
+    /// None: bypassed (fast rates, where FIR1 is the matched filter).
+    pub fir3: Option<Stage>,
 }
 
 impl Design {
     pub fn decimation(&self) -> usize {
-        self.fir1.decimation * self.fir2.as_ref().map_or(1, |s| s.decimation) * self.fir3.decimation
+        self.fir1.decimation * self.fir2.as_ref().map_or(1, |s| s.decimation) * self.fir3.as_ref().map_or(1, |s| s.decimation)
     }
     pub fn fs_out(&self) -> f64 {
         self.fs_in / self.decimation() as f64
@@ -71,9 +72,12 @@ impl Design {
 
 /// Symbol rates the DDC can take at `fs_in`: an even decimation D to 2 or
 /// more samples per symbol (below 2.7; fractional is fine, the receiver's
-/// timing loop interpolates), at least 2 in the first stage.
+/// timing loop interpolates), at least 2 in the first stage; above fs / 8
+/// (500 kS/s at 3.072 MS/s) FIR1 at /2 is the matched filter itself, FIR2
+/// and FIR3 bypassed (2 to 4 samples per symbol).
 pub fn symbol_rate_ok(fs_in: f64, rs: f64) -> bool {
-    rs > 0.0 && half_decimation(fs_in, rs) >= 2
+    // Or, faster (above fs / 8), FIR1 alone at /2 as the matched filter.
+    rs > 0.0 && (half_decimation(fs_in, rs) >= 2 || fs_in / (2.0 * rs) >= SPS_OUT as f64)
 }
 
 /// D / 2: FIR1 x FIR2's share (FIR3 decimates by 2).
@@ -117,6 +121,22 @@ pub fn design(fs_in: f64, rs: f64, rolloff: f32) -> Result<Design, String> {
         return Err(format!("{rs} S/s: too fast for the DDC at {fs_in} S/s"));
     }
     let rem = half_decimation(fs_in, rs);
+    let edge = rs * (1.0 + rolloff as f64) / 2.0;
+    let budget = |fs: f64, d: usize, folded: bool, max_addr: usize| {
+        // Longest filter the clock and the coefficient RAM allow.
+        let ops = ((CLOCK_HZ / fs).floor() as usize).min(MAX_OPERATIONS).min(max_addr / d);
+        (if folded { 2 * ops } else { ops }) * d
+    };
+    if rem < 2 {
+        // FIR1 = the RRC at the input rate, /2; the rest bypassed.
+        let sps1 = fs_in / rs;
+        let span = ((budget(fs_in, 2, true, NUM_ADDR[0]) - 1) as f64 / sps1) as usize;
+        let h: Vec<f64> = super::rrc_taps_frac(sps1, rolloff, span).into_iter().map(|x| x as f64).collect();
+        let (fir1, _, _) = quantize((h, 2), None, (vec![1.0], 1));
+        let d = Design { fs_in, rs, fir1, fir2: None, fir3: None };
+        check(&d)?;
+        return Ok(d);
+    }
     // FIR1 (and FIR2 if the rest is large): the split with the larger factor first.
     let (d1, d2) = if rem <= 8 {
         (rem.max(2), 1)
@@ -127,12 +147,6 @@ pub fn design(fs_in: f64, rs: f64, rolloff: f32) -> Result<Design, String> {
     if d1 * d2 != rem || d1 < 2 {
         return Err(format!("no FIR split for decimation {rem}"));
     }
-    let edge = rs * (1.0 + rolloff as f64) / 2.0;
-    let budget = |fs: f64, d: usize, folded: bool, max_addr: usize| {
-        // Longest filter the clock and the coefficient RAM allow.
-        let ops = ((CLOCK_HZ / fs).floor() as usize).min(MAX_OPERATIONS).min(max_addr / d);
-        (if folded { 2 * ops } else { ops }) * d
-    };
     let mut fs = fs_in;
     let fir1 = {
         let fs_next = fs / d1 as f64;
@@ -152,7 +166,7 @@ pub fn design(fs_in: f64, rs: f64, rolloff: f32) -> Result<Design, String> {
     let span = RRC_SPAN.min(((budget(fs, 2, true, NUM_ADDR[2]) - 1) as f64 / sps3) as usize);
     let fir3: Vec<f64> = super::rrc_taps_frac(sps3, rolloff, span).into_iter().map(|x| x as f64).collect();
     let (fir1, fir2, fir3) = quantize(fir1, fir2, (fir3, 2));
-    let d = Design { fs_in, rs, fir1, fir2, fir3 };
+    let d = Design { fs_in, rs, fir1, fir2, fir3: Some(fir3) };
     check(&d)?;
     Ok(d)
 }
@@ -205,7 +219,7 @@ fn quantize(h1: (Vec<f64>, usize), h2: Option<(Vec<f64>, usize)>, h3: (Vec<f64>,
 /// The FPGA limits maia-httpd checks before writing a stage.
 fn check(d: &Design) -> Result<(), String> {
     let mut fs = d.fs_in;
-    for (i, st) in [Some(&d.fir1), d.fir2.as_ref(), Some(&d.fir3)].into_iter().enumerate() {
+    for (i, st) in [Some(&d.fir1), d.fir2.as_ref(), d.fir3.as_ref()].into_iter().enumerate() {
         let Some(st) = st else { continue };
         let folded = i != 1;
         let ops = operations(st.taps.len(), st.decimation, folded);
@@ -267,14 +281,17 @@ impl Design {
             Some(st) => stage_ram(st, 1, &mut coeffs),
             None => (1, 0, false),
         };
-        let (d3, o3, odd3) = stage_ram(&self.fir3, 2, &mut coeffs);
+        let (d3, o3, odd3) = match &self.fir3 {
+            Some(st) => stage_ram(st, 2, &mut coeffs),
+            None => (2, 0, false),
+        };
         Registers {
             coeffs,
             decimation: [d1, d2, d3],
             operations_minus_one: [o1, o2, o3],
             odd_operations: [odd1, odd3],
             bypass2: self.fir2.is_none(),
-            bypass3: false,
+            bypass3: self.fir3.is_none(),
         }
     }
 }
@@ -360,7 +377,9 @@ impl DdcModel {
         if let Some(st) = &d.fir2 {
             stages.push(FirModel::new(st, MACC_TRUNC[1], false));
         }
-        stages.push(FirModel::new(&d.fir3, MACC_TRUNC[2], true));
+        if let Some(st) = &d.fir3 {
+            stages.push(FirModel::new(st, MACC_TRUNC[2], true));
+        }
         DdcModel { cexp, freq: freq_word, phase: 0, stages }
     }
 
@@ -414,14 +433,14 @@ mod tests {
 
     #[test]
     fn designs_fit_the_fpga_for_every_offered_rate() {
-        for rs in [32e3, 48e3, 64e3, 96e3, 128e3, 192e3, 250e3, 256e3, 333e3, 384e3] {
+        for rs in [32e3, 33e3, 48e3, 64e3, 66e3, 96e3, 125e3, 128e3, 192e3, 250e3, 256e3, 333e3, 384e3, 500e3] {
             let d = design(FS, rs, 0.35).unwrap_or_else(|e| panic!("{rs}: {e}"));
             let sps = d.fs_out() / rs;
-            assert!((2.0..2.7).contains(&sps), "{rs}: {sps}");
+            assert!((2.0..4.0).contains(&sps), "{rs}: {sps}");
             let r = d.registers();
-            assert_eq!(r.coeffs.len(), if d.fir2.is_some() { 640 } else { 512 });
+            assert_eq!(r.coeffs.len(), 256 + d.fir2.as_ref().map_or(0, |_| 128) + d.fir3.as_ref().map_or(0, |_| 256), "{rs}");
         }
-        assert!(design(FS, 500e3, 0.35).is_err(), "500 kS/s would need FIR1 at 1");
+        assert!(design(FS, 1e6, 0.35).is_err(), "1 MS/s: under 2 samples a symbol");
     }
 
     /// Test vectors for maia-hdl (`test/test_datv_ddc.py`): the designs,
@@ -454,7 +473,7 @@ mod tests {
                 "decimation": r.decimation, "operations_minus_one": r.operations_minus_one,
                 "odd_operations": r.odd_operations, "bypass2": r.bypass2, "bypass3": r.bypass3,
                 "coeffs": r.coeffs, "input": input, "mixed": mixed, "output": output,
-                "taps": [&d.fir1.taps, &d.fir2.as_ref().map(|s| s.taps.clone()).unwrap_or_default(), &d.fir3.taps],
+                "taps": [&d.fir1.taps, &d.fir2.as_ref().map(|s| s.taps.clone()).unwrap_or_default(), &d.fir3.as_ref().map(|s| s.taps.clone()).unwrap_or_default()],
             }));
         }
         std::fs::write(path, serde_json::to_vec(&cases).unwrap()).unwrap();
@@ -780,6 +799,18 @@ mod tests {
         }
         if hdr {
             eprintln!("hdrdet: {nflags} flags in {nsyms} symbols ({:.3} %)", 100.0 * nflags as f64 / nsyms.max(1) as f64);
+        }
+    }
+
+    /// The amateur standard symbol rates through the DDC and the FPGA's
+    /// timing recovery and header detector (models), long frames QPSK 1/2.
+    #[test]
+    fn standard_rates_through_the_ddc() {
+        use super::super::fpga_tx::LongMode;
+        for rs in [33e3, 66e3, 125e3, 250e3, 333e3, 500e3] {
+            let (s, n) = long_link_ddc(rs, LongMode::Qpsk12, 5.0, 20, true);
+            eprintln!("{rs}: {n} packets, {} bad, freq {:.0}", s.frames_bad, s.freq_hz);
+            assert!(s.locked && n >= 10 * 21, "{rs}: {n} packets, {s:?}");
         }
     }
 }
