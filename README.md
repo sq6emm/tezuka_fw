@@ -123,6 +123,24 @@ mosquitto_pub -h <board> -t trxd/plutoskyr2/cmd/freq -m 144050000
 mosquitto_pub -h <board> -t trxd/plutoskyr2/cmd/cw -m "CQ CQ DE SQ6EMM K"
 ```
 
+## DATV quality
+
+Libre transmitting on 1255 MHz, as a Siglent SVA1032X analyser with a small
+antenna decodes it. DVB-S2 QPSK 1/2 at 250 kS/s (EVM 0.86 %, MER 41 dB) and
+8PSK 3/4 at 250 kS/s (EVM 1.19 %, MER 38.5 dB):
+
+<p>
+<img src=docs/images/siglent/dvbs2-qpsk-12-250k.png width=49%>
+<img src=docs/images/siglent/dvbs2-8psk-34-250k.png width=49%>
+</p>
+
+DVB-T2 1.7 MHz QPSK 1/2, spectrum only (the analyser has no OFDM
+demodulator):
+
+<img src=docs/images/siglent/dvbt2-qpsk-12-1m7.png width=49%>
+
+All rates and modes, with their figures: [docs/DATV-QUALITY.md](docs/DATV-QUALITY.md).
+
 ## Frequency reference
 
 Put a GPS 1PPS on **EXT_IO0** (PlutoSky R2, 3.3 V) and/or a 10 MHz OCXO on
