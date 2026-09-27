@@ -907,6 +907,9 @@ pub struct RxThread {
     /// Receiving through the FPGA DDC: the signal's offset from the LO
     /// (f64 bits) for the DDC's NCO; the stream IQ is not used.
     fpga_center: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// DVB-T2: the channel bandwidth (Hz), wider than the RX filter's
+    /// default.
+    pub t2_bw: Option<f64>,
 }
 
 /// The receiver's statistics and constellation out to the shared state.
@@ -1126,7 +1129,7 @@ impl RxThread {
                 let _ = ring.join();
             })
             .expect("spawn datv-rx");
-        RxThread { tx, shared, fec_stats, spec: p, label, sr, dropped, started: std::time::Instant::now(), fpga_center }
+        RxThread { tx, shared, fec_stats, spec: p, label, sr, dropped, started: std::time::Instant::now(), fpga_center, t2_bw: None }
     }
 
     /// DVB-T2 through the FPGA's T2 resampler: [`crate::dvbt2::stream::Demod`]
@@ -1315,7 +1318,7 @@ impl RxThread {
                 let _ = ring.join();
             })
             .expect("spawn datv-rx");
-        RxThread { tx, shared, fec_stats, spec, label, sr: 0.0, dropped, started: std::time::Instant::now(), fpga_center: Some(center) }
+        RxThread { tx, shared, fec_stats, spec, label, sr: 0.0, dropped, started: std::time::Instant::now(), fpga_center: Some(center), t2_bw: Some(mode.bw_hz) }
     }
 
     /// Receiving through the FPGA front end.
@@ -1328,6 +1331,18 @@ impl RxThread {
     pub fn feed(&self, iq: &[Complex32], center_hz: f64) {
         if let Some(c) = &self.fpga_center {
             c.store(center_hz.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            // Debug (DVB-T2, radio.fpga_decimation = false so this is the
+            // ADC stream the FPGA resampler gets too): `touch /tmp/t2-iq`
+            // appends it to /tmp/t2-iq.cf32, 40 MB at most.
+            if self.t2_bw.is_some() && std::path::Path::new("/tmp/t2-iq").exists() {
+                use std::io::Write;
+                if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/t2-iq.cf32") {
+                    if fh.metadata().map_or(0, |m| m.len()) < 40_000_000 {
+                        let b: Vec<u8> = iq.iter().flat_map(|z| [z.re.to_le_bytes(), z.im.to_le_bytes()]).flatten().collect();
+                        let _ = fh.write_all(&b);
+                    }
+                }
+            }
             return;
         }
         if self.tx.try_send((iq.to_vec(), center_hz)).is_err() {

@@ -44,6 +44,10 @@ pub trait RadioControl: Send {
     fn set_tx_bandwidth(&mut self, _hz: u32) -> Result<(), String> {
         Ok(())
     }
+    /// RX analog filter bandwidth (RF, Hz), likewise (DVB-T2 reception).
+    fn set_rx_bandwidth(&mut self, _hz: u32) -> Result<(), String> {
+        Ok(())
+    }
     /// A way to read the gain from another thread, if the backend has one.
     fn rx_gain_reader(&self) -> Option<Box<dyn FnMut() -> Option<f64> + Send>> {
         None

@@ -7,6 +7,7 @@
 //! `--sim` swaps the AD936x for the simulated radio (run it on a PC);
 //! `--check` parses the config, prints it, and exits.
 
+mod rscw;
 mod beacon;
 mod config;
 mod cwlive;

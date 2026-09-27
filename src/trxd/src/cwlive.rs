@@ -153,6 +153,10 @@ pub struct CwLive {
     /// Text committed since the last [`CwLive::take_committed`] (for MQTT).
     fresh: String,
     dirty: bool,
+    /// The rain-scatter decoder, when that is the engine ([`crate::rscw`]).
+    rs: Option<crate::rscw::RsStream>,
+    rate: f64,
+    band: (f32, f32),
 }
 
 /// What the panel shows next to the text.
@@ -181,16 +185,54 @@ impl CwLive {
             pending: String::new(),
             fresh: String::new(),
             dirty: false,
+            rs: None,
+            rate,
+            band: (300.0, 2700.0),
+        }
+    }
+
+    /// The rain-scatter decoder on or off (the timing decoder again when off).
+    pub fn set_rs(&mut self, on: bool) {
+        if on == self.rs.is_some() {
+            return;
+        }
+        if on {
+            self.set_neural(false);
+            let mut r = crate::rscw::RsStream::new(self.rate as f32);
+            r.set_band(self.band.0, self.band.1);
+            self.rs = Some(r);
+        } else {
+            self.rs = None;
+        }
+        self.pending.clear();
+        self.dirty = true;
+    }
+
+    /// "rs", "neural" or "timing".
+    pub fn engine(&self) -> &'static str {
+        if self.rs.is_some() {
+            "rs"
+        } else if self.deep.is_some() {
+            "neural"
+        } else {
+            "timing"
         }
     }
 
     /// The CW filter's audio passband: where the finder looks.
     pub fn set_band(&mut self, lo: f32, hi: f32) {
         self.finder.band = (lo.min(hi), lo.max(hi));
+        self.band = self.finder.band;
+        if let Some(r) = self.rs.as_mut() {
+            r.set_band(self.band.0, self.band.1);
+        }
     }
 
     /// Switch between DeepCW and the timing decoder; the text so far stays.
     pub fn set_neural(&mut self, on: bool) {
+        if on {
+            self.rs = None;
+        }
         if on == self.deep.is_some() {
             return;
         }
@@ -206,6 +248,14 @@ impl CwLive {
 
     /// Feed demodulated audio (not while transmitting: we would copy ourselves).
     pub fn process(&mut self, audio: &[f32]) {
+        if let Some(r) = self.rs.as_mut() {
+            r.process(audio);
+            let t = r.take();
+            if !t.is_empty() {
+                self.append(&t);
+            }
+            return;
+        }
         if let Some(tone) = self.finder.push(audio) {
             if !self.rx.locked() && (tone - self.rx.tone_hz()).abs() > FIND_AFC_HZ {
                 self.rx.set_pitch(tone);
@@ -286,6 +336,9 @@ impl CwLive {
     }
 
     pub fn readout(&self) -> Readout {
+        if let Some(r) = &self.rs {
+            return Readout { tone_hz: (self.band.0 + self.band.1) / 2.0, wpm: r.wpm(), snr_db: 0.0, locked: !r.text.is_empty() };
+        }
         Readout { tone_hz: self.rx.tone_hz(), wpm: self.rx.wpm(), snr_db: self.rx.snr_db(), locked: self.rx.locked() }
     }
 
@@ -326,6 +379,7 @@ enum Msg {
     Flush,
     Clear,
     Neural(bool),
+    Rs(bool),
     Band(f32, f32),
 }
 
@@ -338,6 +392,7 @@ struct Shared {
     committed: String,
     readout: Option<Readout>,
     neural: bool,
+    engine: &'static str,
 }
 
 /// [`CwLive`] on its own thread, off the sample path: the engine hands over
@@ -353,7 +408,9 @@ pub struct CwLiveThread {
 }
 
 impl CwLiveThread {
-    pub fn start(rate: f64, pitch_hz: f32, neural: bool) -> Self {
+    /// `engine`: "timing", "neural" (DeepCW) or "rs" (rain scatter).
+    pub fn start(rate: f64, pitch_hz: f32, engine: &str) -> Self {
+        let neural = engine == "neural";
         // 5 s of 10 ms blocks: a busy moment on the CPU must not cost audio.
         let (tx, rx) = bounded::<Msg>(512);
         let shared = Arc::new(Mutex::new(Shared::default()));
@@ -369,6 +426,9 @@ impl CwLiveThread {
                 run(CwLive::new(rate, pitch_hz, neural), rx, sh)
             })
             .expect("spawn cw-live");
+        if engine == "rs" {
+            let _ = tx.try_send(Msg::Rs(true));
+        }
         CwLiveThread { tx, shared, seen: 0, warned: false, band: None }
     }
 
@@ -397,6 +457,22 @@ impl CwLiveThread {
     }
     pub fn set_neural(&self, on: bool) {
         let _ = self.tx.try_send(Msg::Neural(on));
+    }
+    /// "rs" (rain scatter), "neural" (DeepCW) or anything else (timing).
+    pub fn set_engine(&self, engine: &str) {
+        match engine {
+            "rs" => {
+                let _ = self.tx.try_send(Msg::Rs(true));
+            }
+            e => {
+                let _ = self.tx.try_send(Msg::Rs(false));
+                let _ = self.tx.try_send(Msg::Neural(e == "neural"));
+            }
+        }
+    }
+    pub fn engine(&self) -> &'static str {
+        let e = self.shared.lock().unwrap().engine;
+        if e.is_empty() { "timing" } else { e }
     }
     /// The CW filter passband (audio Hz); sent on only when it changed.
     pub fn set_band(&mut self, lo: f32, hi: f32) {
@@ -442,6 +518,7 @@ fn run(mut c: CwLive, rx: Receiver<Msg>, shared: Arc<Mutex<Shared>>) {
             Ok(Msg::Flush) => c.flush(),
             Ok(Msg::Clear) => c.clear(),
             Ok(Msg::Neural(on)) => c.set_neural(on),
+            Ok(Msg::Rs(on)) => c.set_rs(on),
             Ok(Msg::Band(lo, hi)) => c.set_band(lo, hi),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
@@ -450,6 +527,7 @@ fn run(mut c: CwLive, rx: Receiver<Msg>, shared: Arc<Mutex<Shared>>) {
         let changed = c.poll();
         let mut s = shared.lock().unwrap();
         s.neural = c.neural();
+        s.engine = c.engine();
         if n % 8 == 0 {
             s.readout = Some(c.readout());
         }

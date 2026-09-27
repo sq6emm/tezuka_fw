@@ -382,6 +382,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <div class="slider voice-only cw-only">BK-IN<input type="range" id="hang" min="50" max="2000" step="50" value="400"><b id="hang-v">400 ms</b></div>
       <h3 class="voice-only cw-only">CW <span class="note">live copy in CW mode: click the signal to put it on the pitch</span>
         <span id="cw-read"></span> <button class="k" id="cw-clear" style="float:right;padding:0 8px;font-size:11px;min-width:0">CLEAR</button>
+        <button class="k" id="cw-rs" title="Rain-scatter decoder: collects a Doppler-spread CW signal anywhere in the CW filter (open the filter to 2-3 kHz). Off: the classic decoder on the pitch." style="float:right;padding:0 8px;font-size:11px;min-width:0;margin-right:4px">RS</button>
 </h3>
       <div id="cwbox" class="voice-only cw-only"><span id="cw-text"></span><span class="pend" id="cw-pend"></span></div>
       <h3 class="voice-only data-only">DECODES <span class="note">switch on what you need: each costs CPU on the board</span></h3>
@@ -720,6 +721,7 @@ function renderState() {
   document.querySelectorAll("#modes .k").forEach((b) => b.classList.toggle("on", b.dataset.mode === (st.datv_mode ? "DATV" : st.mode)));
   document.querySelectorAll("#agcs .k").forEach((b) => b.classList.toggle("on", b.dataset.agc === st.agc));
   $("split").classList.toggle("on", st.split);
+  $("cw-rs").classList.toggle("on", st.cw_engine === "rs");
   renderFilter(st);
   buildBands(st.xvtrs || []);
   const bnow = bandOf(curFreq(), st.xvtrs);
@@ -1269,6 +1271,7 @@ function buildStatic() {
   $("cwtext").addEventListener("keydown", (e) => { if (e.key === "Enter") sendCw(); });
   $("cwstop").onclick = () => send({ cmd: "cw_stop" });
   $("cw-clear").onclick = () => send({ cmd: "cw_clear" });
+  $("cw-rs").onclick = () => send({ cmd: "cw_engine", engine: S.st && S.st.cw_engine === "rs" ? "timing" : "rs" });
   const call = () => (S.st && S.st.call) || "";
   const MACROS = [["CQ", () => `CQ CQ DE ${call()} ${call()} K`], ["QRZ", () => "QRZ?"], ["TU", () => `TU 73 DE ${call()} SK`],
     ["599", () => "5NN 5NN"], ["AGN", () => "AGN?"]];

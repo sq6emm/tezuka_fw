@@ -275,6 +275,188 @@ mod tests {
                 }
             }
         }
+        // With every sample raw too (`/tmp/t2-rawall` on the board): each FFT
+        // against a software FFT of the same window, by carrier magnitude,
+        // at a few window shifts and in two orders.
+        if let Some((c0, big)) = runs.iter().max_by_key(|r| r.1.len()).filter(|r| r.1.len() > 3_000_000) {
+            let fs_ = fs;
+            let f_off: f64 = std::env::var("T2FOFF").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            let bins: Vec<usize> = (0..1705).map(|k| ofdm.bin(k)).collect();
+            let order = super::super::fe::carrier_order(&bins);
+            let mut planner = rustfft::FftPlanner::<f32>::new();
+            let fft = planner.plan_fft_forward(2048);
+            let mut done = 0;
+            for (j, f22, v) in ffts.iter().filter(|f| f.2.len() == 1705).skip(8) {
+                let fr = super::super::fe::extend(*f22, 22, *c0 + 1_000_000);
+                let start = fr + 2048 + *j as u64 * 2304 + 256 - 64;
+                if start < *c0 || start + 2100 > c0 + big.len() as u64 {
+                    continue;
+                }
+                let hw: Vec<f32> = {
+                    let mut c = vec![0f32; 1705];
+                    for (pos, &k) in order.iter().enumerate() {
+                        c[k] = v[pos].norm();
+                    }
+                    c
+                };
+                let mut best = (0f32, 0i64);
+                for sh in -40i64..=40 {
+                    let s0 = (start as i64 + sh - *c0 as i64) as usize;
+                    let mut w: Vec<Complex32> = (0..2048)
+                        .map(|n| {
+                            let ph = -std::f64::consts::TAU * f_off * n as f64 / fs_;
+                            big[s0 + n] * Complex32::new(ph.cos() as f32, ph.sin() as f32)
+                        })
+                        .collect();
+                    fft.process(&mut w);
+                    let sw: Vec<f32> = bins.iter().map(|&b| w[b].norm()).collect();
+                    let (ma, mb) = (hw.iter().sum::<f32>() / 1705.0, sw.iter().sum::<f32>() / 1705.0);
+                    let (mut num, mut da, mut db) = (0f32, 0f32, 0f32);
+                    for (a, b) in hw.iter().zip(&sw) {
+                        num += (a - ma) * (b - mb);
+                        da += (a - ma).powi(2);
+                        db += (b - mb).powi(2);
+                    }
+                    let rho = num / (da * db).sqrt().max(1e-20);
+                    if rho > best.0 {
+                        best = (rho, sh);
+                    }
+                }
+                eprintln!("FFT j {j} F {fr}: best magnitude correlation {:.3} at window shift {}", best.0, best.1);
+                if done == 0 {
+                    let seq: Vec<String> = ffts.iter().take(40).map(|f| format!("{}@{}", f.0, f.1)).collect();
+                    eprintln!("FFT sequence: {}", seq.join(" "));
+                }
+                done += 1;
+                if done >= 6 {
+                    break;
+                }
+            }
+        }
+        // Each FFT back to time (inverse FFT of its carriers) against the raw
+        // samples its window shares with the raw windows: [g+192, g+256)
+        // (guard interval) and [g+2048, g+2240) (the tail).
+        {
+            let bins: Vec<usize> = (0..1705).map(|k| ofdm.bin(k)).collect();
+            let order = super::super::fe::carrier_order(&bins);
+            let mut planner = rustfft::FftPlanner::<f32>::new();
+            let ifft = planner.plan_fft_inverse(2048);
+            let find = |at: u64, len: usize| -> Option<&[Complex32]> {
+                runs.iter().rev().find_map(|(c, v)| (*c <= at && at + len as u64 <= c + v.len() as u64).then(|| &v[(at - c) as usize..(at - c) as usize + len]))
+            };
+            let near0 = runs.first().map_or(0, |r| r.0);
+            let mut shown = 0;
+            let skip: usize = std::env::var("T2SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+            let mut near = near0 + 1_000_000;
+            for (j, f22, v) in ffts.iter().filter(|f| f.2.len() == 1705).skip(skip) {
+                let fr = super::super::fe::extend(*f22, 22, near);
+                near = fr;
+                let g = fr + 2048 + *j as u64 * 2304;
+                // T2PERM: 1 = carrier words swapped in pairs, 2 = reversed
+                let perm: u32 = std::env::var("T2PERM").ok().and_then(|x| x.parse().ok()).unwrap_or(0);
+                let vv: Vec<Complex32> = match perm {
+                    1 => (0..1705).map(|i| if i ^ 1 < 1705 { v[i ^ 1] } else { v[i] }).collect(),
+                    2 => v.iter().rev().copied().collect(),
+                    _ => v.clone(),
+                };
+                let mut w = vec![Complex32::default(); 2048];
+                for (pos, &k) in order.iter().enumerate() {
+                    w[bins[k]] = vv[pos];
+                }
+                ifft.process(&mut w);
+                // window sample n is raw sample g + 192 + n
+                let mut out = String::new();
+                for (lo, len) in [(0usize, 64usize), (1856, 192)] {
+                    if let Some(r) = find(g + 192 + lo as u64, len) {
+                        let a = &w[lo..lo + len];
+                        let num: Complex32 = a.iter().zip(r).map(|(x, y)| x * y.conj()).sum();
+                        let den = (a.iter().map(|x| x.norm_sqr()).sum::<f32>() * r.iter().map(|x| x.norm_sqr()).sum::<f32>()).sqrt();
+                        out += &format!(" [{lo}+{len}]: {:.3}", num.norm() / den.max(1e-20));
+                    } else {
+                        out += &format!(" [{lo}+{len}]: no raw");
+                    }
+                }
+                // the frequency that lines the tail up with the raw samples
+                if let Some(r) = find(g + 192 + 1856, 192) {
+                    let a = &w[1856..2048];
+                    let mut prod: Vec<Complex32> = a.iter().zip(r).map(|(x, y)| x * y.conj()).collect();
+                    prod.resize(8192, Complex32::default());
+                    let f8 = planner.plan_fft_forward(8192);
+                    f8.process(&mut prod);
+                    let (bi, bv) = prod.iter().enumerate().map(|(i, z)| (i, z.norm())).fold((0, 0f32), |m, (i, v)| if v > m.1 { (i, v) } else { m });
+                    let bf = if bi >= 4096 { bi as f64 - 8192.0 } else { bi as f64 } * fs / 8192.0;
+                    let den = (a.iter().map(|x| x.norm_sqr()).sum::<f32>() * r.iter().map(|x| x.norm_sqr()).sum::<f32>()).sqrt();
+                    out += &format!(" | best at {:.0} Hz: {:.3}", -bf, bv / den.max(1e-20));
+                }
+                // Is it another window's FFT (a wrong label)? Window d symbols on.
+                let mut best = (0f32, 0i64);
+                for d in -12i64..=12 {
+                    let gd = (g as i64 + d * 2304) as u64;
+                    if let Some(r) = find(gd + 192 + 1856, 192) {
+                        let a = &w[1856..2048];
+                        let num: Complex32 = a.iter().zip(r).map(|(x, y)| x * y.conj()).sum();
+                        let den = (a.iter().map(|x| x.norm_sqr()).sum::<f32>() * r.iter().map(|x| x.norm_sqr()).sum::<f32>()).sqrt();
+                        let c = num.norm() / den.max(1e-20);
+                        if c > best.0 {
+                            best = (c, d);
+                        }
+                    }
+                }
+                out += &format!(" | best window offset {} symbols: {:.3}", best.1, best.0);
+                // Misframed? The raw tail of a nearby window anywhere in the
+                // FFT's 2048 samples.
+                let mut bestm = (0f32, 0i64, 0usize);
+                for d in -3i64..=3 {
+                    let gd = (g as i64 + d * 2304) as u64;
+                    if let Some(r) = find(gd + 192 + 1856, 192) {
+                        let er: f32 = r.iter().map(|x| x.norm_sqr()).sum();
+                        for lag in 0..(2048 - 192) {
+                            let a = &w[lag..lag + 192];
+                            let num: Complex32 = a.iter().zip(r).map(|(x, y)| x * y.conj()).sum();
+                            let ea: f32 = a.iter().map(|x| x.norm_sqr()).sum();
+                            let c = num.norm() / (ea * er).sqrt().max(1e-20);
+                            if c > bestm.0 {
+                                bestm = (c, d, lag);
+                            }
+                        }
+                    }
+                }
+                out += &format!(" | misframed? window {} tail at lag {}: {:.3}", bestm.1, bestm.2, bestm.0);
+                eprintln!("FFT j {j} F {fr} vs raw:{out}");
+                shown += 1;
+                if shown >= 6 {
+                    break;
+                }
+            }
+        }
+        // Continual pilots (the same carriers in every data symbol): their
+        // coherence does not depend on which symbol the FFT is.
+        {
+            let bins: Vec<usize> = (0..1705).map(|k| ofdm.bin(k)).collect();
+            let order = super::super::fe::carrier_order(&bins);
+            let plans: Vec<Vec<Option<Complex32>>> = (8..p.symbols()).map(|j| ofdm.plan(j)).collect();
+            let cont: Vec<usize> = (0..1705).filter(|&k| plans.iter().all(|pl| pl[k].is_some_and(|z| z.norm() > 0.0))).collect();
+            let mut shown = 0;
+            for (j, _f22, v) in ffts.iter().filter(|f| f.2.len() == 1705 && f.0 >= 10).skip(20) {
+                let mut c = vec![Complex32::default(); 1705];
+                for (pos, &k) in order.iter().enumerate() {
+                    c[k] = v[pos];
+                }
+                let pl = &plans[0];
+                let z: Vec<Complex32> = cont.iter().map(|&k| c[k] / pl[k].unwrap()).collect();
+                // the pilot sign pattern depends on the symbol (pn[j]):
+                // compare magnitudes of neighbour products instead
+                let num: Complex32 = z.windows(2).map(|w| w[1] * w[0].conj()).map(|x| x * x).sum();
+                let den: f32 = z.windows(2).map(|w| (w[1] * w[0].conj()).norm_sqr()).sum();
+                let pw_p: f32 = z.iter().map(|x| x.norm_sqr()).sum::<f32>() / z.len() as f32;
+                let pw_all: f32 = c.iter().map(|x| x.norm_sqr()).sum::<f32>() / 1705.0;
+                eprintln!("FFT j {j}: {} continual pilots, squared-product coherence {:.2}, pilot/mean power {:.2}", cont.len(), num.norm() / den.max(1e-20), pw_p / pw_all);
+                shown += 1;
+                if shown >= 4 {
+                    break;
+                }
+            }
+        }
         // Pilot coherence of the P2 symbols' FFTs: neighbouring pilots after
         // removing the known values.
         let bins: Vec<usize> = (0..1705).map(|k| ofdm.bin(k)).collect();
@@ -502,9 +684,28 @@ pub fn resample(x: &[Complex32], fs_in: f64, fs_out: f64) -> Vec<Complex32> {
 fn t2_capture() {
     let path = std::env::var("T2CAP").expect("T2CAP=<cf32 at 3.072 MS/s>");
     let raw = std::fs::read(path).unwrap();
-    let x: Vec<Complex32> = raw.chunks_exact(8).map(|c| Complex32::new(f32::from_le_bytes(c[..4].try_into().unwrap()), f32::from_le_bytes(c[4..].try_into().unwrap()))).collect();
+    let mut x: Vec<Complex32> = raw.chunks_exact(8).map(|c| Complex32::new(f32::from_le_bytes(c[..4].try_into().unwrap()), f32::from_le_bytes(c[4..].try_into().unwrap()))).collect();
+    // T2SHIFT=<Hz>: the signal sits that far from the centre (moved to it).
+    if let Some(sh) = std::env::var("T2SHIFT").ok().and_then(|v| v.parse::<f64>().ok()) {
+        for (k, z) in x.iter_mut().enumerate() {
+            let ph = -std::f64::consts::TAU * sh * k as f64 / 3_072_000.0;
+            *z *= Complex32::new(ph.cos() as f32, ph.sin() as f32);
+        }
+    }
     let fs = 131e6 / 71.0;
-    let mut y = resample(&x, 3_072_000.0, fs);
+    // T2FPGA=<scale>: the FPGA's resampler model instead (12-bit ADC
+    // samples, full scale 1.0 * scale), its integer output.
+    let mut y = match std::env::var("T2FPGA").ok().and_then(|v| v.parse::<f32>().ok()) {
+        Some(scale) => {
+            let step = super::resamp::step(3_072_000.0, fs);
+            let mut rs = super::resamp::Resampler::new(super::resamp::t2_table(3_072_000.0, fs), step);
+            let adc = super::resamp::adc12(&x, scale);
+            let clip = adc.iter().filter(|v| v[0].abs() >= 2047 || v[1].abs() >= 2047).count();
+            eprintln!("12-bit ADC: {clip} clipped of {}", adc.len());
+            rs.process(&adc).iter().map(|v| Complex32::new(v[0] as f32 / 32768.0, v[1] as f32 / 32768.0)).collect()
+        }
+        None => resample(&x, 3_072_000.0, fs),
+    };
     // T2CONJ=1: the spectrum mirrored (I/Q the other way round somewhere).
     if std::env::var_os("T2CONJ").is_some() {
         y.iter_mut().for_each(|z| *z = z.conj());

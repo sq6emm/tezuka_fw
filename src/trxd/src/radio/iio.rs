@@ -126,6 +126,15 @@ impl RadioControl for IioControl {
         write_attr(&self.phy, "out_voltage_rf_bandwidth", &hz.to_string())
     }
 
+    fn set_rx_bandwidth(&mut self, hz: u32) -> Result<(), String> {
+        write_attr(&self.phy, "in_voltage_rf_bandwidth", &hz.to_string())?;
+        let got = read_attr(&self.phy, "in_voltage_rf_bandwidth").unwrap_or_default();
+        if got.trim() != hz.to_string() {
+            return Err(format!("asked {hz}, the driver has {}", got.trim()));
+        }
+        Ok(())
+    }
+
     /// The AD936x runs 1R1T; which of its two receivers and transmitters
     /// (RX1/TX1 or RX2/TX2 sockets) carries that one channel is a chip
     /// set-up choice. The driver takes it through debugfs and a full

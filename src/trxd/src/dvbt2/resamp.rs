@@ -178,6 +178,22 @@ mod tests {
         }
     }
 
+    /// An ADC recording (cf32, `T2RSIN`, full scale `T2RSSCALE`) through the
+    /// model, written as cf32 at the T2 rate (`T2RSOUT`, 1.0 = 32768).
+    #[test]
+    #[ignore]
+    fn t2resamp_file() {
+        let raw = std::fs::read(std::env::var("T2RSIN").unwrap()).unwrap();
+        let scale: f32 = std::env::var("T2RSSCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+        let x: Vec<Complex32> = raw.chunks_exact(8).map(|c| Complex32::new(f32::from_le_bytes(c[..4].try_into().unwrap()), f32::from_le_bytes(c[4..].try_into().unwrap()))).collect();
+        let adc = adc12(&x, scale);
+        eprintln!("ADC peak {}", adc.iter().map(|v| v[0].abs().max(v[1].abs())).max().unwrap());
+        let mut r = Resampler::new(t2_table(FS_IN, FS_T2), step(FS_IN, FS_T2));
+        let y = r.process(&adc);
+        let b: Vec<u8> = y.iter().flat_map(|v| [(v[0] as f32 / 32768.0).to_le_bytes(), (v[1] as f32 / 32768.0).to_le_bytes()]).flatten().collect();
+        std::fs::write(std::env::var("T2RSOUT").unwrap(), b).unwrap();
+    }
+
     /// Writes vectors for maia-hdl test_t2resamp.py.
     #[test]
     #[ignore]

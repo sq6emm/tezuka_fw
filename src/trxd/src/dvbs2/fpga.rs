@@ -28,7 +28,7 @@
 //! (0 enable, 1 scheduled, 2 load, 5:3 shift), 0x44 frame_len, 0x48 layout
 //! (7:0 symbols, 17:8 guard interval, 25:18 early), 0x4C track, 0x50 NCO
 //! step, 0x54 next frame start, 0x58 counter, 0x5C status (21:0 frames, 22
-//! overflow). With it on the ring carries its tagged words.
+//! word FIFO overflow, 23 resampler input FIFO overflow). With it on the ring carries its tagged words.
 //!
 //! Only a core that says it is the ring one (platform 0xD5) is touched, and
 //! only when the device tree reserves the ring: any other Maia core's
@@ -243,11 +243,20 @@ impl FrontEnd {
         }
         let ctl = regs.rd32(REG_DDC_CONTROL);
         regs.wr32(REG_DDC_CONTROL, ctl & !(1 << 24));
-        for (addr, &c) in resamp::t2_table(FS_IN, fs).iter().enumerate() {
+        // Debug: `touch /tmp/t2-passthrough`: the resampler passes the ADC
+        // samples through (one tap, step 1.0): the ring holds what the FPGA
+        // gets from the ADC, at 3.072 MS/s.
+        let passthrough = std::path::Path::new("/tmp/t2-passthrough").exists();
+        let table: Vec<i32> = if passthrough {
+            (0..resamp::SPAN * resamp::PHASES).map(|a| if a / resamp::PHASES == resamp::SPAN / 2 { 1 << 14 } else { 0 }).collect()
+        } else {
+            resamp::t2_table(FS_IN, fs)
+        };
+        for (addr, &c) in table.iter().enumerate() {
             regs.wr32(REG_COEFF_ADDR, addr as u32);
             regs.wr32(REG_COEFF, 1 | (((c as u32) & 0x3_FFFF) << 1));
         }
-        let step = resamp::step(FS_IN, fs);
+        let step = if passthrough { 1 << resamp::FRAC } else { resamp::step(FS_IN, fs) };
         regs.wr32(REG_OMEGA, step);
         regs.wr32(REG_SYMSYNC, 0); // resets the resampler
         // The OFDM front end, if there (its layout reads back), off until
@@ -291,12 +300,16 @@ impl FrontEnd {
     /// DVB-T2 front end: do what the receiver asks.
     pub fn t2_ctl(&self, c: crate::dvbt2::fe::Ctl) {
         use crate::dvbt2::fe::Ctl;
+        // Debug: `touch /tmp/t2-rawall`: every sample raw as well (the FFTs
+        // can be checked against them offline).
+        let dbg = if std::path::Path::new("/tmp/t2-rawall").exists() { 1 << 6 } else { 0 };
+        let en = T2_ENABLE | dbg;
         match c {
-            Ctl::RawAll => self.regs.wr32(REG_T2_CONTROL, T2_ENABLE),
+            Ctl::RawAll => self.regs.wr32(REG_T2_CONTROL, en),
             Ctl::Schedule { start, freq } => {
                 self.regs.wr32(REG_T2_FREQ, freq);
                 self.regs.wr32(REG_T2_NEXT_START, start as u32);
-                self.regs.wr32(REG_T2_CONTROL, T2_ENABLE | T2_SCHEDULED | T2_LOAD);
+                self.regs.wr32(REG_T2_CONTROL, en | T2_SCHEDULED | T2_LOAD);
             }
             Ctl::Freq(f) => self.regs.wr32(REG_T2_FREQ, f),
         }
@@ -304,7 +317,8 @@ impl FrontEnd {
 
     /// DVB-T2 front end: its word FIFOs overflowed (words lost).
     pub fn t2_overflow(&self) -> bool {
-        self.t2_fe && self.regs.rd32(REG_T2_STATUS) & (1 << 22) != 0
+        // 22: the front end's word FIFOs; 23: the resampler's input FIFO.
+        self.t2_fe && self.regs.rd32(REG_T2_STATUS) & (3 << 22) != 0
     }
 
     /// Everything the DMA has committed since the last call, as ring words.

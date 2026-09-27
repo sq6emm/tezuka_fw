@@ -166,6 +166,8 @@ pub struct Trx {
     block: usize,
     /// TX analog bandwidth now set (DVB-T2 needs more than the default).
     tx_bw: u32,
+    /// The RX filter's bandwidth now (wider while receiving DVB-T2).
+    rx_bw: u32,
 
     // Radio state
     vfo_a: f64,
@@ -394,6 +396,7 @@ impl Trx {
             rate,
             block,
             tx_bw: cfg.radio.rf_bandwidth,
+            rx_bw: cfg.radio.rf_bandwidth,
             vfo_a: vfo,
             vfo_b: vfo,
             active: Vfo::A,
@@ -454,7 +457,7 @@ impl Trx {
                 a
             },
             cw_audio: Vec::new(),
-            cwlive: CwLiveThread::start(12_000.0, CW_PITCH_HZ as f32, cfg.trx.cw_engine == "neural"),
+            cwlive: CwLiveThread::start(12_000.0, CW_PITCH_HZ as f32, &cfg.trx.cw_engine),
             s_dbfs: -120.0,
             tx_on: None,
             tx_since: None,
@@ -610,12 +613,18 @@ impl Trx {
             self.apply_offsets();
             return;
         }
-        let anchor = if datv.is_some() || (self.tx_on.is_some() && !fits(tx, self.center)) { tx } else { rx };
+        let anchor = if datv.is_some() && self.tx_on.is_none() {
+            rx
+        } else if datv.is_some() || (self.tx_on.is_some() && !fits(tx, self.center)) {
+            tx
+        } else {
+            rx
+        };
         let xvtr = self.settings.transverter(anchor).cloned();
         // The LO sits `lo_offset` below the signal on the air, which through an
         // inverting transverter is above it on the AD936x.
         let mut lo = match datv {
-            Some(off) => tx - off,
+            Some(off) => anchor - off,
             None => anchor - self.cfg.radio.lo_offset_hz * if xvtr.as_ref().is_some_and(|t| t.inverted) { -1.0 } else { 1.0 },
         };
         // With the web scope open, the DC spike goes beside the view: halfway
@@ -859,6 +868,12 @@ impl Trx {
     /// that the TX carrier leak sits just outside the signal where the stream
     /// has room for that, and the signal stays inside the TX passband.
     fn datv_lo_offset(&self) -> Option<f64> {
+        // Receiving DVB-T2 (and not sending): the LO on the signal too. The
+        // channel fills the FPGA resampler's passband; the usual offset
+        // (100 kHz here) put its outer carriers past it.
+        if self.tx_on.is_none() && self.datv_rx.as_ref().is_some_and(|r| r.t2_bw.is_some()) {
+            return Some(0.0);
+        }
         let d = self.datv.as_ref().filter(|_| matches!(self.tx_on, Some(TxSource::Datv(_))))?;
         if d.fpga.is_some() || d.t2.is_some() {
             // The FPGA's samples go to the DAC as they are: LO on the signal.
@@ -1020,6 +1035,8 @@ impl Trx {
             }
             info!(rate, "DVB-T2 receive on");
             self.datv_rx = Some(crate::dvbs2::rx::RxThread::start_t2(mode, rate.to_string(), self.rx_eff() - self.center));
+            // The LO onto the signal (datv_lo_offset).
+            self.retune(true);
             return;
         }
         // Symbol rate 0: find rate and mode by themselves (blind scan).
@@ -1061,6 +1078,7 @@ impl Trx {
         self.datv_mode = false;
         self.datv_rx = None;
         self.datv_rx_req = None;
+        self.retune(false);
         self.datv_scan = None;
         self.datv_auto = false;
         self.datv_rx_stats = Default::default();
@@ -1498,6 +1516,19 @@ impl Trx {
 
         if let Some(r) = &self.datv_rx {
             r.feed(iq, self.rx_eff() - self.center);
+        }
+        // DVB-T2 reception: the RX filter opens to 1.3 x the channel (its
+        // default, about 1 MHz, cut the outer carriers by up to 15 dB and
+        // left no P1 to find), and closes again after.
+        let want = self.datv_rx.as_ref().and_then(|r| r.t2_bw).filter(|_| std::env::var_os("TRXD_NO_RXBW").is_none()).map_or(self.cfg.radio.rf_bandwidth, |bw| {
+            self.cfg.radio.rf_bandwidth.max((bw * 1.3) as u32)
+        });
+        if want != self.rx_bw {
+            match self.radio.set_rx_bandwidth(want) {
+                Ok(()) => info!(hz = want, "RX bandwidth"),
+                Err(e) => warn!("RX bandwidth: {e}"),
+            }
+            self.rx_bw = want;
         }
         if let Some(sc) = &self.datv_scan {
             sc.set_center(self.rx_eff() - self.center);
@@ -1995,7 +2026,7 @@ impl Trx {
             "span": self.web_span,
             "span_max": if self.maia.is_some() { self.cfg.radio.adc_rate as f64 } else { self.rate },
             "allow_tx": self.cfg.trx.allow_tx,
-            "cw_engine": if self.cwlive.neural() { "neural" } else { "timing" },
+            "cw_engine": self.cwlive.engine(),
             "decoders": self.slots.iter().map(|(k, _)| match k {
                 DecoderKind::Q65 => "q65",
                 DecoderKind::Pi4 => "pi4",
@@ -2194,6 +2225,8 @@ impl Trx {
                 if let Some((sr, rate, pilots)) = self.datv_rx_req.clone().filter(|_| self.datv.is_none()) {
                     self.datv_rx_start(sr, &rate, pilots);
                 }
+                // The LO back beside the signal if no DVB-T2 receiver needs it on.
+                self.retune(false);
             }
             "datv" => {
                 if on {
@@ -2366,7 +2399,7 @@ impl Trx {
                 self.settings.smeter.remove(&band);
                 self.settings.save(&self.settings_dir);
             }
-            "cw_engine" => self.cwlive.set_neural(m["engine"].as_str() == Some("neural")),
+            "cw_engine" => self.cwlive.set_engine(m["engine"].as_str().unwrap_or("timing")),
             "decoder" => {
                 let kind = match m["kind"].as_str() {
                     Some("q65") => Some(DecoderKind::Q65),

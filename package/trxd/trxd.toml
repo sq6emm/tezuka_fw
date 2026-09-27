@@ -26,7 +26,7 @@ allow_tx = true
 max_tx_seconds = 180
 decoders = []           # started at boot: q65 | pi4 (web UI toggles them; CW always runs)
 q65_submode = "D"
-cw_engine = "timing"    # live CW box: timing (instant, light) | neural (DeepCW: too heavy for the A9 live)
+cw_engine = "timing"    # live CW box: timing (instant, light) | rs (rain scatter: a Doppler-spread signal across a wide CW filter) | neural (DeepCW: too heavy for the A9 live)
 
 
 [beacon]                # role = "beacon-tx"
