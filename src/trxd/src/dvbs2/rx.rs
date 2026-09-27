@@ -923,6 +923,74 @@ fn publish(r: &Receiver, sh: &std::sync::Mutex<RxShared>, seen: &mut u64) {
     }
 }
 
+/// The decoding thread: LLR vectors (64800) in, LDPC (the FPGA's when
+/// there), BCH, BBFRAME, TS, the demultiplexer's browser messages out.
+fn spawn_fec(
+    p: FrameSpec,
+    frx: crossbeam_channel::Receiver<Vec<f32>>,
+    fl: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    sh: std::sync::Arc<std::sync::Mutex<RxShared>>,
+    fs2: std::sync::Arc<std::sync::Mutex<Stats>>,
+) {
+    use std::sync::atomic::Ordering;
+    std::thread::Builder::new()
+        .name("datv-fec".into())
+        .spawn(move || {
+            // Ahead of the web server and scopes, behind the engine (-10).
+            crate::stream::thread_nice(-5);
+            let mut fec = Fec::new(p);
+            let mut dmx = super::ts::Demux::default();
+            let (mut ts, mut msgs) = (Vec::new(), Vec::new());
+            let mut st = Stats::default();
+            let mut dumped = 0usize;
+            for llr in frx.iter() {
+                if llr.is_empty() {
+                    fec.lost();
+                    continue;
+                }
+                // Near the threshold every frame runs long, and the ones
+                // that will fail run longest: with frames waiting, give
+                // each fewer iterations rather than drop the next ones
+                // unread. 20 costs nothing measurable at 1/2 (ldpc.rs
+                // iteration_budget), 12 a few frames at the very edge.
+                fec.dec.set_max_iter(match frx.len() {
+                    0..=1 => 50,
+                    2..=7 => 20,
+                    _ => 12,
+                });
+                // Debug on a board: `touch /tmp/datv-dump` appends each
+                // frame's LLRs (f32 LE, 16200 a frame) to
+                // /tmp/datv-llr.f32, up to DUMP_FRAMES; remove it to stop.
+                if dumped < DUMP_FRAMES && std::path::Path::new("/tmp/datv-dump").exists() {
+                    use std::io::Write;
+                    if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/datv-llr.f32") {
+                        let b: Vec<u8> = llr.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        let _ = fh.write_all(&b);
+                        dumped += 1;
+                    }
+                }
+                if fec.frame(&llr, &mut st, &mut ts) {
+                    fl.store(0, Ordering::Relaxed);
+                } else {
+                    fl.fetch_add(1, Ordering::Relaxed);
+                }
+                for pkt in ts.drain(..) {
+                    dmx.push(&pkt, &mut msgs);
+                }
+                *fs2.lock().unwrap() = st;
+                let mut s = sh.lock().unwrap();
+                s.msgs.extend(msgs.drain(..));
+                let excess = s.msgs.len().saturating_sub(300);
+                s.msgs.drain(..excess);
+            }
+        })
+        .expect("spawn datv-fec");
+}
+
+fn label_log(m: &crate::dvbt2::tx::Mode) -> String {
+    format!("{:.2} MHz {:?} {:?}", m.bw_hz / 1e6, m.p.constellation, m.p.rate)
+}
+
 impl RxThread {
     pub fn start(p: Params, fs: f64, sr: f64, center_hz: f64) -> Self {
         Self::start_spec(FrameSpec::short(p), p.rate.label().to_string(), fs, sr, center_hz)
@@ -940,59 +1008,7 @@ impl RxThread {
         let fails = Arc::new(AtomicU32::new(0));
         let shared = Arc::new(Mutex::new(RxShared::default()));
         let fec_stats = Arc::new(Mutex::new(Stats::default()));
-        let (sh, fs2, fl) = (shared.clone(), fec_stats.clone(), fails.clone());
-        std::thread::Builder::new()
-            .name("datv-fec".into())
-            .spawn(move || {
-                // Ahead of the web server and scopes, behind the engine (-10).
-                crate::stream::thread_nice(-5);
-                let mut fec = Fec::new(p);
-                let mut dmx = super::ts::Demux::default();
-                let (mut ts, mut msgs) = (Vec::new(), Vec::new());
-                let mut st = Stats::default();
-                let mut dumped = 0usize;
-                for llr in frx.iter() {
-                    if llr.is_empty() {
-                        fec.lost();
-                        continue;
-                    }
-                    // Near the threshold every frame runs long, and the ones
-                    // that will fail run longest: with frames waiting, give
-                    // each fewer iterations rather than drop the next ones
-                    // unread. 20 costs nothing measurable at 1/2 (ldpc.rs
-                    // iteration_budget), 12 a few frames at the very edge.
-                    fec.dec.set_max_iter(match frx.len() {
-                        0..=1 => 50,
-                        2..=7 => 20,
-                        _ => 12,
-                    });
-                    // Debug on a board: `touch /tmp/datv-dump` appends each
-                    // frame's LLRs (f32 LE, 16200 a frame) to
-                    // /tmp/datv-llr.f32, up to DUMP_FRAMES; remove it to stop.
-                    if dumped < DUMP_FRAMES && std::path::Path::new("/tmp/datv-dump").exists() {
-                        use std::io::Write;
-                        if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/datv-llr.f32") {
-                            let b: Vec<u8> = llr.iter().flat_map(|v| v.to_le_bytes()).collect();
-                            let _ = fh.write_all(&b);
-                            dumped += 1;
-                        }
-                    }
-                    if fec.frame(&llr, &mut st, &mut ts) {
-                        fl.store(0, Ordering::Relaxed);
-                    } else {
-                        fl.fetch_add(1, Ordering::Relaxed);
-                    }
-                    for pkt in ts.drain(..) {
-                        dmx.push(&pkt, &mut msgs);
-                    }
-                    *fs2.lock().unwrap() = st;
-                    let mut s = sh.lock().unwrap();
-                    s.msgs.extend(msgs.drain(..));
-                    let excess = s.msgs.len().saturating_sub(300);
-                    s.msgs.drain(..excess);
-                }
-            })
-            .expect("spawn datv-fec");
+        spawn_fec(p, frx, fails.clone(), shared.clone(), fec_stats.clone());
         let sh = shared.clone();
         let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
         // The FPGA front end when the bitstream has it and the rate suits it:
@@ -1111,6 +1127,127 @@ impl RxThread {
             })
             .expect("spawn datv-rx");
         RxThread { tx, shared, fec_stats, spec: p, label, sr, dropped, started: std::time::Instant::now(), fpga_center }
+    }
+
+    /// DVB-T2 through the FPGA's T2 resampler: [`crate::dvbt2::stream::Demod`]
+    /// on the ring's samples, its FEC blocks to the same decoding thread.
+    pub fn start_t2(mode: crate::dvbt2::tx::Mode, label: String, center_hz: f64) -> Self {
+        use std::sync::{Arc, Mutex, atomic::AtomicU32, atomic::Ordering};
+        use super::fpga_tx::LongMode;
+        let spec = FrameSpec::long(match mode.p.rate {
+            super::ldpc_fpga::LongRate::R1_2 => LongMode::Qpsk12,
+            super::ldpc_fpga::LongRate::R3_4 => LongMode::Qpsk34,
+        });
+        let (tx, rx) = crossbeam_channel::bounded::<(Vec<Complex32>, f64)>(1);
+        // Two frames of FEC blocks (18 a frame at 16QAM).
+        let (ftx, frx) = crossbeam_channel::bounded::<Vec<f32>>(40);
+        let fails = Arc::new(AtomicU32::new(0));
+        let shared = Arc::new(Mutex::new(RxShared::default()));
+        let fec_stats = Arc::new(Mutex::new(Stats::default()));
+        spawn_fec(spec, frx, fails, shared.clone(), fec_stats.clone());
+        let sh = shared.clone();
+        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let center = Arc::new(std::sync::atomic::AtomicU64::new(center_hz.to_bits()));
+        let (fc, dr) = (center.clone(), dropped.clone());
+        std::thread::Builder::new()
+            .name("datv-rx".into())
+            .spawn(move || {
+                crate::stream::thread_nice(-5);
+                let (btx, brx) = crossbeam_channel::bounded::<Vec<Complex32>>(800);
+                let (ftx_fs, frx_fs) = crossbeam_channel::bounded::<f64>(1);
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (st2, dr2) = (stop.clone(), dr.clone());
+                let fs_nominal = mode.fs();
+                let ring = std::thread::Builder::new()
+                    .name("datv-ring".into())
+                    .spawn(move || {
+                        crate::stream::thread_nice(-5);
+                        let mut fe = match super::fpga::FrontEnd::start_t2(fs_nominal) {
+                            Ok(fe) => fe,
+                            Err(e) => {
+                                tracing::warn!("DVB-T2: FPGA front end: {e}");
+                                return;
+                            }
+                        };
+                        let _ = ftx_fs.send(fe.fs_out());
+                        let mut reported = false;
+                        let (mut read_s, mut t_log) = (0f64, std::time::Instant::now());
+                        while !st2.load(Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            let t0 = std::time::Instant::now();
+                            let mut buf = Vec::new();
+                            fe.read(&mut buf);
+                            read_s += t0.elapsed().as_secs_f64();
+                            if t_log.elapsed() > std::time::Duration::from_secs(30) {
+                                tracing::info!(ring_read_cpu = format!("{:.1} %", 100.0 * read_s / t_log.elapsed().as_secs_f64()), "DVB-T2 ring");
+                                (read_s, t_log) = (0.0, std::time::Instant::now());
+                            }
+                            if !reported && fe.dropped() {
+                                reported = true;
+                                dr2.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!("DVB-T2: the FPGA recorder dropped samples");
+                            }
+                            if !buf.is_empty() && btx.try_send(buf).is_err() {
+                                dr2.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    })
+                    .expect("spawn datv-ring");
+                let Ok(fs) = frx_fs.recv() else {
+                    return;
+                };
+                tracing::info!(fs, mode = %label_log(&mode), "DVB-T2 receive through the FPGA resampler");
+                let mut d = crate::dvbt2::stream::Demod::new(mode.p, fs);
+                let (mut blocks, mut seen) = (Vec::new(), 0u64);
+                let (mut busy_s, mut t_log) = (0f64, std::time::Instant::now());
+                'run: loop {
+                    loop {
+                        match rx.try_recv() {
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => break 'run,
+                            Err(crossbeam_channel::TryRecvError::Empty) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                    match brx.recv_timeout(std::time::Duration::from_millis(20)) {
+                        Ok(buf) => {
+                            let t0 = std::time::Instant::now();
+                            d.set_center(f64::from_bits(fc.load(Ordering::Relaxed)));
+                            d.push(&buf, &mut blocks);
+                            let mut busy = 0;
+                            for b in blocks.drain(..) {
+                                if ftx.try_send(b).is_err() {
+                                    busy += 1;
+                                }
+                            }
+                            busy_s += t0.elapsed().as_secs_f64();
+                            if t_log.elapsed() > std::time::Duration::from_secs(30) {
+                                tracing::info!(demod_cpu = format!("{:.1} %", 100.0 * busy_s / t_log.elapsed().as_secs_f64()), mer_db = d.stats.mer_db, freq_hz = d.stats.freq_hz, frames = d.stats.frames, "DVB-T2 demodulator");
+                                (busy_s, t_log) = (0.0, std::time::Instant::now());
+                            }
+                            let mut s = sh.lock().unwrap();
+                            s.stats.frames = d.stats.blocks;
+                            s.stats.frames_fec_busy += busy;
+                            s.stats.locked = d.stats.locked;
+                            s.stats.esn0_db = d.stats.mer_db;
+                            s.stats.data_esn0_db = d.stats.mer_db;
+                            s.stats.freq_hz = d.stats.freq_hz;
+                            if d.constellation_seq != seen {
+                                seen = d.constellation_seq;
+                                let mut m = Vec::with_capacity(1 + 2 * d.constellation.len());
+                                m.push(8u8);
+                                m.extend(d.constellation.iter().flat_map(|p| [p[0] as u8, p[1] as u8]));
+                                s.msgs.push_back(m);
+                            }
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                stop.store(true, Ordering::Relaxed);
+                let _ = ring.join();
+            })
+            .expect("spawn datv-rx");
+        RxThread { tx, shared, fec_stats, spec, label, sr: 0.0, dropped, started: std::time::Instant::now(), fpga_center: Some(center) }
     }
 
     /// Receiving through the FPGA front end.

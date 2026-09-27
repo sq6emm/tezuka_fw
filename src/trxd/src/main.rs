@@ -171,6 +171,15 @@ fn main() -> ExitCode {
                 let bw = args.next().and_then(|b| b.parse::<u32>().ok()).unwrap_or(2_400_000);
                 capture = Some((o, f, t, bw));
             }
+            "--ring-bench" => {
+                return match dvbs2::fpga::ring_bench() {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        error!("{e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
             "--version" | "-V" => {
                 println!("trxd {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;

@@ -18,6 +18,8 @@
 pub mod frame;
 pub mod l1;
 pub mod ofdm;
+pub mod resamp;
+pub mod stream;
 pub mod tables;
 pub mod tx;
 #[cfg(test)]

@@ -1006,6 +1006,17 @@ impl Trx {
         self.datv_rx = None;
         self.datv_scan = None;
         self.datv_rx_stats = Default::default();
+        // DVB-T2 (the symbol rate does not apply).
+        if let Some(mode) = crate::dvbt2::tx::Mode::parse(rate) {
+            self.datv_auto = false;
+            if !fpga::available() {
+                warn!(rate, "DVB-T2 receive needs the FPGA front end");
+                return;
+            }
+            info!(rate, "DVB-T2 receive on");
+            self.datv_rx = Some(crate::dvbs2::rx::RxThread::start_t2(mode, rate.to_string(), self.rx_eff() - self.center));
+            return;
+        }
         // Symbol rate 0: find rate and mode by themselves (blind scan).
         self.datv_auto = sr == 0.0;
         if self.datv_auto {

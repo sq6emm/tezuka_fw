@@ -1,19 +1,11 @@
-//! A DVB-T2 receiver for this modulator's profile (2K, SISO, one PLP, the
-//! parameters known in advance): offline, to check transmissions end to
-//! end. Samples at the elementary rate in; TS packets out.
-//!
-//! P1 by correlation with the known waveform, fractional frequency from the
-//! guard intervals, FFT per symbol, the channel from the P2 pilots (every
-//! third carrier, averaged over the P2 symbols) with each symbol's common
-//! phase from its pilots, then the transmitter's permutations undone and
-//! the DVB-S2 decoder chain (same LDPC, BCH, BBFRAME) on the FEC blocks.
+//! A DVB-T2 receiver for this modulator's profile, offline: the streaming
+//! demodulator ([`super::stream::Demod`]) and the DVB-S2 decoder chain over
+//! a whole recording, to check transmissions end to end. Samples at the
+//! elementary rate in; TS packets out.
 
 use num_complex::Complex32;
-use rustfft::FftPlanner;
 
-use super::frame::{FrameMapper, FreqInterleaver};
-use super::ofdm::Ofdm;
-use super::{BitInterleaver, CellInterleaver, Constellation, Params, FFT, N_P2};
+use super::Params;
 use crate::dvbs2::TS_LEN;
 
 pub struct Report {
@@ -25,240 +17,28 @@ pub struct Report {
     pub ldpc_fail: u64,
 }
 
-/// Where the first frame starts (P1) and a coarse frequency: the known P1
-/// correlated in 16 coherent chunks of 128 samples (magnitudes summed: a
-/// few kHz of offset do not matter), the offset from the chunks' phase
-/// steps.
-fn find_p1(x: &[Complex32], p1: &[Complex32], frame: usize, fs: f64) -> Option<(usize, f64)> {
-    find_p1_in(x, p1, 0, frame + p1.len(), fs)
-}
-
-/// [`find_p1`] over start positions `from..to`.
-fn find_p1_in(x: &[Complex32], p1: &[Complex32], from: usize, to: usize, fs: f64) -> Option<(usize, f64)> {
-    const CH: usize = 128;
-    if x.len() < to + p1.len() {
-        return None;
-    }
-    let chunks = |t: usize| -> Vec<Complex32> {
-        (0..p1.len() / CH)
-            .map(|c| {
-                let mut acc = Complex32::default();
-                for i in c * CH..(c + 1) * CH {
-                    acc += x[t + i] * p1[i].conj();
-                }
-                acc
-            })
-            .collect()
-    };
-    let mut best = (from, 0f32);
-    for t in from..to {
-        let m: f32 = chunks(t).iter().map(|z| z.norm()).sum();
-        if m > best.1 {
-            best = (t, m);
-        }
-    }
-    let c = chunks(best.0);
-    let mut d = Complex32::default();
-    for w in c.windows(2) {
-        d += w[1] * w[0].conj();
-    }
-    Some((best.0, d.arg() as f64 / (std::f64::consts::TAU * CH as f64) * fs))
-}
-
 pub fn receive(p: Params, x: &[Complex32], fs: f64) -> Report {
-    let ofdm = Ofdm::new(p);
-    let fm = FrameMapper::new(p);
-    let fi = FreqInterleaver::new(&p);
-    let ci = CellInterleaver::new(&p);
-    let bi = BitInterleaver::new(&p);
+    let mut d = super::stream::Demod::new(p, fs);
     let mut fec = crate::dvbs2::rx::Fec::new(crate::dvbs2::FrameSpec::long(match p.rate {
         crate::dvbs2::ldpc_fpga::LongRate::R1_2 => crate::dvbs2::fpga_tx::LongMode::Qpsk12,
         crate::dvbs2::ldpc_fpga::LongRate::R3_4 => crate::dvbs2::fpga_tx::LongMode::Qpsk34,
     }));
     let mut stats = crate::dvbs2::rx::Stats::default();
-    let fft = FftPlanner::new().plan_fft_forward(FFT);
-    let gi = p.guard.samples();
-    let sym_len = FFT + gi;
-    let frame = p.frame_samples();
-    let nsym = p.symbols();
-    let plans: Vec<Vec<Option<Complex32>>> = (0..nsym).map(|j| ofdm.plan(j)).collect();
-    let pre_ref: Vec<f32> = fm.pre_cells().iter().map(|&c| if c == super::BPSK0 { 1.0 } else { -1.0 }).collect();
     let mut report = Report { frames: 0, packets: Vec::new(), mer_db: Vec::new(), freq_hz: 0.0, ldpc_fail: 0 };
-    let Some((mut start, coarse)) = find_p1(x, ofdm.p1(), frame, fs) else {
-        return report;
-    };
-    let scale = 1.0 / (FFT as f32 * ofdm.norm());
-    let mut coarse = coarse;
-    let mut first = true;
-    while start + frame <= x.len() {
-        // Each frame: P1 again near where it should be (a gap in the
-        // transmission, or the receiver's, moves it), the frequency from
-        // this frame's guard intervals (modulo a carrier spacing; P1's
-        // coarse estimate picks the multiple).
-        if !first {
-            let lo = start.saturating_sub(4096);
-            match find_p1_in(x, ofdm.p1(), lo, start + 4096, fs) {
-                Some((s, c)) => {
-                    start = s;
-                    coarse = c;
-                }
-                None => break,
-            }
-            if start + frame > x.len() {
-                break;
-            }
+    let mut blocks = Vec::new();
+    // In pieces, as from the ring: one MER per frame.
+    for chunk in x.chunks(20_000) {
+        let before = d.stats.frames;
+        d.push(chunk, &mut blocks);
+        if d.stats.frames != before {
+            report.mer_db.push(d.stats.mer_db);
         }
-        first = false;
-        let mut cp = Complex32::default();
-        for j in 0..nsym {
-            let s = start + 2048 + j * sym_len;
-            for n in 0..gi {
-                cp += x[s + n].conj() * x[s + n + FFT];
-            }
-        }
-        let spacing = fs / FFT as f64;
-        let frac = cp.arg() as f64 / (std::f64::consts::TAU * FFT as f64) * fs;
-        let f_off = frac + ((coarse - frac) / spacing).round() * spacing;
-        report.freq_hz = f_off as f32;
-        let w = -std::f64::consts::TAU * f_off / fs;
-        // Each symbol: FFT (a few samples early into the guard interval,
-        // the common phase takes the shift), carriers 0..1705.
-        let early = if std::env::var_os("T2EARLY0").is_some() { 0 } else { gi / 4 };
-        let mut carriers: Vec<Vec<Complex32>> = Vec::with_capacity(nsym);
-        for j in 0..nsym {
-            let s = start + 2048 + j * sym_len + gi - early;
-            let mut buf: Vec<Complex32> = (0..FFT)
-                .map(|n| {
-                    let t = (s + n) as f64 * w;
-                    x[s + n] * Complex32::new(t.cos() as f32, t.sin() as f32)
-                })
-                .collect();
-            fft.process(&mut buf);
-            // A window `early` samples before the symbol: carrier k turns
-            // by exp(-j 2 pi (bin freq) early / N); undo it.
-            carriers.push(
-                (0..1705)
-                    .map(|k| {
-                        let b = ofdm.bin(k);
-                        let f = if b >= FFT / 2 { b as f64 - FFT as f64 } else { b as f64 };
-                        let t = std::f64::consts::TAU * f * early as f64 / FFT as f64;
-                        buf[b] * scale * Complex32::new(t.cos() as f32, t.sin() as f32)
-                    })
-                    .collect(),
-            );
-        }
-        // Channel from the P2 pilots, linear between them, averaged.
-        let mut h = vec![Complex32::default(); 1705];
-        for j in 0..N_P2 {
-            let pil: Vec<(usize, Complex32)> =
-                plans[j].iter().enumerate().filter_map(|(k, v)| v.filter(|z| z.norm() > 0.0).map(|z| (k, carriers[j][k] / z))).collect();
-            // Each carrier once: [k0, k1) per pair of neighbouring pilots,
-            // the last pilot itself at the end (visiting both ends of every
-            // pair counted the pilot carriers twice: data cells on them came
-            // out at half amplitude, harmless to QPSK, fatal to 16QAM).
-            for w2 in pil.windows(2) {
-                let ((k0, h0), (k1, h1)) = (w2[0], w2[1]);
-                for k in k0..k1 {
-                    let a = (k - k0) as f32 / (k1 - k0) as f32;
-                    h[k] += (h0 * (1.0 - a) + h1 * a) / N_P2 as f32;
-                }
-            }
-            if let Some(&(kl, hl)) = pil.last() {
-                h[kl] += hl / N_P2 as f32;
-            }
-        }
-        // Equalize; each symbol's common phase from its pilots.
-        let mut syms: Vec<Vec<Complex32>> = Vec::with_capacity(nsym);
-        for j in 0..nsym {
-            let mut c = Complex32::default();
-            for (k, v) in plans[j].iter().enumerate() {
-                if let Some(z) = v.filter(|z| z.norm() > 0.0) {
-                    c += carriers[j][k] / h[k] * z.conj();
-                }
-            }
-            let rot = if c.norm() > 0.0 { c.conj() / c.norm() } else { Complex32::new(1.0, 0.0) };
-            syms.push(plans[j].iter().enumerate().filter(|(_, v)| v.is_none()).map(|(k, _)| carriers[j][k] / h[k] * rot).collect());
-        }
-        if std::env::var_os("T2DEBUG").is_some() && report.frames == 0 && p.constellation == Constellation::Qam16 {
-            let a = 1.0 / 10f32.sqrt();
-            let q = |x: f32| {
-                let l = [-3.0 * a, -a, a, 3.0 * a];
-                *l.iter().min_by(|u, v| (x - **u).abs().partial_cmp(&(x - **v).abs()).unwrap()).unwrap()
-            };
-            let mut line = String::new();
-            for (j, sy) in syms.iter().enumerate() {
-                let e: f32 = sy.iter().map(|z| (z - Complex32::new(q(z.re), q(z.im))).norm_sqr()).sum::<f32>() / sy.len() as f32;
-                let pw: f32 = sy.iter().map(|z| z.norm_sqr()).sum::<f32>() / sy.len() as f32;
-                if j < 10 || j % 20 == 0 || j + 2 >= syms.len() {
-                    line += &format!(" {j}:{:.1}", 10.0 * (pw / e.max(1e-9)).log10());
-                }
-            }
-            eprintln!("DD MER per symbol:{line}");
-        }
-        let cells = fi.unframe(&syms);
-        let (pre, _post, data) = fm.unmap(&cells);
-        let (mut sig, mut err) = (0f32, 0f32);
-        for (z, &r) in pre.iter().zip(&pre_ref) {
-            sig += r * r;
-            err += (z - Complex32::new(r, 0.0)).norm_sqr();
-        }
-        report.mer_db.push(10.0 * (sig / err.max(1e-12)).log10());
-        let blocks = ci.deinterleave(&data, p.fec_blocks);
-        // QPSK LLRs (positive = 0), noise from the L1-pre error.
-        let sigma2 = (err / pre.len() as f32).max(1e-6);
-        // Rotated constellations: word j's I is in cell j, its Q in cell
-        // j + 1 (cyclically in the block); rotate back.
-        let angle: f32 = match p.constellation {
-            Constellation::Qpsk => 29.0,
-            Constellation::Qam16 => 16.8,
-        };
-        let derot = Complex32::from_polar(1.0, -angle.to_radians());
-        if std::env::var_os("T2DEBUG").is_some() {
-            let b = &blocks[0];
-            let pw = b.iter().map(|z| z.norm_sqr()).sum::<f32>() / b.len() as f32;
-            let mre = b.iter().map(|z| z.re.abs()).sum::<f32>() / b.len() as f32;
-            eprintln!("block 0: mean power {pw:.3}, mean |re| {mre:.3}, first cells {:?}", &b[..4]);
-        }
-        for blk in &blocks {
-            let n = blk.len();
-            let z = |j: usize| if p.rotation { Complex32::new(blk[j].re, blk[(j + 1) % n].im) * derot } else { blk[j] };
-            let cell_llr: Vec<f32> = match p.constellation {
-                Constellation::Qpsk => (0..n)
-                    .flat_map(|j| {
-                        let s = 2.0 * std::f32::consts::FRAC_1_SQRT_2 * 2.0 / sigma2;
-                        let z = z(j);
-                        [z.re * s, z.im * s]
-                    })
-                    .collect(),
-                Constellation::Qam16 => (0..n)
-                    .flat_map(|j| {
-                        // Word bits 3, 2: signs of I, Q (0 positive); 1, 0:
-                        // outer (0) or inner level. Max-log, per axis.
-                        let a = 1.0 / 10f32.sqrt();
-                        let s = 4.0 * a / sigma2;
-                        let z = z(j);
-                        [z.re * s, z.im * s, (z.re.abs() - 2.0 * a) * s, (z.im.abs() - 2.0 * a) * s]
-                    })
-                    .collect(),
-            };
-            let llr = bi.deinterleave_llr(&cell_llr);
-            if let Some(path) = std::env::var_os("T2DUMPC") {
-                if report.frames == 0 && std::ptr::eq(blk, &blocks[0]) {
-                    let b: Vec<u8> = blk.iter().flat_map(|z| [z.re.to_le_bytes(), z.im.to_le_bytes()]).flatten().collect();
-                    std::fs::write(path, b).unwrap();
-                }
-            }
-            if let Some(path) = std::env::var_os("T2DUMP") {
-                if report.frames == 0 && std::ptr::eq(blk, &blocks[0]) {
-                    let b: Vec<u8> = llr.iter().map(|&l| (l < 0.0) as u8).collect();
-                    std::fs::write(path, b).unwrap();
-                }
-            }
+        for llr in blocks.drain(..) {
             fec.frame(&llr, &mut stats, &mut report.packets);
         }
-        report.frames += 1;
-        start += frame;
     }
+    report.frames = d.stats.frames as usize;
+    report.freq_hz = d.stats.freq_hz;
     report.ldpc_fail = stats.ldpc_fail;
     report
 }
@@ -287,6 +67,85 @@ mod tests {
             p.fec_blocks = 18;
             p.rotation = rotation;
             loopback(p, 22.0);
+        }
+    }
+
+    /// Joining mid-frame, a sample clock 20 ppm off (the timing drifts
+    /// about 9 samples a frame) and a carrier 2 kHz off: every frame after
+    /// the first P1 found, P1 tracked frame to frame.
+    #[test]
+    fn t2_drift() {
+        let p = Params::amateur();
+        let mut m = Modulator::new(p);
+        let mut n = 0u32;
+        let mut next = || {
+            let mut pkt = [0u8; TS_LEN];
+            pkt[0] = 0x47;
+            pkt[1] = 0x01;
+            pkt[4..8].copy_from_slice(&n.to_be_bytes());
+            n += 1;
+            pkt
+        };
+        let mut x = Vec::new();
+        for _ in 0..6 {
+            m.frame(&mut next, &mut x);
+        }
+        let fs = 131e6 / 71.0;
+        let y = super::resample(&x[150_000..], fs, fs / (1.0 + 20e-6));
+        let y: Vec<Complex32> = y
+            .iter()
+            .enumerate()
+            .map(|(k, z)| {
+                let ph = std::f64::consts::TAU * 2000.0 * k as f64 / fs;
+                z * Complex32::new(ph.cos() as f32, ph.sin() as f32)
+            })
+            .collect();
+        let r = receive(p, &y, fs);
+        eprintln!("frames {}, packets {}, MER {:?}, freq {:.0} Hz, LDPC failures {}", r.frames, r.packets.len(), r.mer_db, r.freq_hz, r.ldpc_fail);
+        // The same 25 kHz further off, told to the receiver (the LO's offset).
+        let y2: Vec<Complex32> = y
+            .iter()
+            .enumerate()
+            .map(|(k, z)| {
+                let ph = std::f64::consts::TAU * 25_000.0 * k as f64 / fs;
+                z * Complex32::new(ph.cos() as f32, ph.sin() as f32)
+            })
+            .collect();
+        let mut d = super::super::stream::Demod::new(p, fs);
+        d.set_center(25_000.0);
+        let mut blocks = Vec::new();
+        for c in y2.chunks(9000) {
+            d.push(c, &mut blocks);
+        }
+        eprintln!("with 25 kHz told: frames {}, freq {:.0} Hz, MER {:.1}", d.stats.frames, d.stats.freq_hz, d.stats.mer_db);
+        assert!(d.stats.frames >= 4 && d.stats.mer_db > 20.0);
+        assert!(r.frames >= 4 && r.ldpc_fail == 0 && r.mer_db.iter().all(|&m| m > 20.0));
+        assert!((r.freq_hz - 2000.0).abs() < 50.0);
+    }
+
+    /// Demodulator time per stage for a frame (run it on the board:
+    /// `trxd-test t2_demod_speed --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn t2_demod_speed() {
+        let p = Params::amateur();
+        let mut m = Modulator::new(p);
+        let mut next = || [0x47u8; TS_LEN];
+        let mut x = Vec::new();
+        for _ in 0..6 {
+            m.frame(&mut next, &mut x);
+        }
+        let fs = 131e6 / 71.0;
+        let mut d = super::super::stream::Demod::new(p, fs);
+        let mut blocks = Vec::new();
+        let t = std::time::Instant::now();
+        for c in x.chunks(9225) {
+            d.push(c, &mut blocks);
+        }
+        let frames = d.stats.frames as f64;
+        eprintln!("{} frames in {:.3} s ({:.1} ms a frame; real time is {:.0} ms)", frames, t.elapsed().as_secs_f64(), 1e3 * t.elapsed().as_secs_f64() / frames, 1e3 * p.frame_samples() as f64 / fs);
+        for (n, v) in super::super::stream::PROF_NAMES.iter().zip(d.prof) {
+            eprintln!("  {n:>12}: {:.1} ms a frame", 1e3 * v / frames);
         }
     }
 
@@ -451,49 +310,10 @@ fn t2_capture() {
     eprintln!("PIDs {pids:?}, continuity errors {cc_err}");
 }
 
-/// Timing and pilot coherence per symbol of a capture:
-/// `T2CAP=<file> cargo test --release t2_diag -- --ignored --nocapture`
-#[test]
-#[ignore]
-fn t2_diag() {
-    let path = std::env::var("T2CAP").expect("T2CAP");
-    let raw = std::fs::read(path).unwrap();
-    let x: Vec<Complex32> = raw.chunks_exact(8).map(|c| Complex32::new(f32::from_le_bytes(c[..4].try_into().unwrap()), f32::from_le_bytes(c[4..].try_into().unwrap()))).collect();
-    let fs = 131e6 / 71.0;
-    let y = resample(&x, 3_072_000.0, fs);
-    let p = Params::amateur();
-    let ofdm = Ofdm::new(p);
-    let frame = p.frame_samples();
-    let (start, coarse) = find_p1(&y, ofdm.p1(), frame, fs).unwrap();
-    let pw: f32 = y.iter().take(200_000).map(|z| z.norm_sqr()).sum::<f32>() / 200_000.0;
-    eprintln!("P1 at {start}, coarse {coarse:.0} Hz, mean power {pw:.3e}");
-    let fft = FftPlanner::new().plan_fft_forward(FFT);
-    let gi = p.guard.samples();
-    let w = -std::f64::consts::TAU * coarse / fs;
-    for f in 0..3 {
-        for j in [0usize, 1, 7, 8, 9, 50, 100, 150, 197] {
-            let s = start + f * frame + 2048 + j * (FFT + gi) + gi;
-            if s + FFT > y.len() {
-                break;
-            }
-            let mut buf: Vec<Complex32> = (0..FFT).map(|n| { let t = (s + n) as f64 * w; y[s + n] * Complex32::new(t.cos() as f32, t.sin() as f32) }).collect();
-            fft.process(&mut buf);
-            let plan = ofdm.plan(j);
-            let r: Vec<(usize, Complex32)> = plan.iter().enumerate().filter_map(|(k, v)| v.filter(|z| z.norm() > 0.0).map(|z| (k, buf[ofdm.bin(k)] / z))).collect();
-            // phase step between neighbouring pilots, per carrier
-            let mut d = Complex32::default();
-            for w2 in r.windows(2) {
-                d += w2[1].1 * w2[0].1.conj() / (w2[1].0 - w2[0].0) as f32;
-            }
-            let coh = r.iter().map(|x| x.1).sum::<Complex32>().norm() / r.iter().map(|x| x.1.norm()).sum::<f32>();
-            eprintln!("frame {f} sym {j:3}: timing {:+.2} samples, pilot coherence {coh:.2}, |pilots| {:.3e}", -d.arg() as f64 / (std::f64::consts::TAU / FFT as f64), r.iter().map(|x| x.1.norm()).sum::<f32>() / r.len() as f32);
-        }
-    }
-}
-
 /// The on-air sample path in simulation: the modulator at x1.25, the
 /// FPGA's resampler (its integer model and low-pass table) to 3.072 MS/s,
-/// then this receiver's resampler back and the receiver.
+/// then the 12-bit ADC, the FPGA's T2 receive resampler (its integer model)
+/// and the receiver.
 #[test]
 fn t2_through_the_fpga_resampler() {
     let p = Params::amateur();
@@ -538,9 +358,12 @@ fn t2_through_the_fpga_resampler() {
         }
         dac.push(Complex32::new(((sr >> 17).clamp(-32768, 32767)) as f32 / 32768.0, ((si >> 17).clamp(-32768, 32767)) as f32 / 32768.0));
     }
+    // Received: the 12-bit ADC and the FPGA's T2 resampler (integer model).
     let fs = 131e6 / 71.0;
-    let y = resample(&dac, 3_072_000.0, fs);
-    let r = receive(p, &y, fs);
+    let step = super::resamp::step(3_072_000.0, fs);
+    let mut rs = super::resamp::Resampler::new(super::resamp::t2_table(3_072_000.0, fs), step);
+    let y: Vec<Complex32> = rs.process(&super::resamp::adc12(&dac, 1.0)).iter().map(|v| Complex32::new(v[0] as f32 / 32768.0, v[1] as f32 / 32768.0)).collect();
+    let r = receive(p, &y, super::resamp::rate_out(3_072_000.0, step));
     eprintln!("frames {}, packets {}, MER {:?}, LDPC failures {}", r.frames, r.packets.len(), r.mer_db, r.ldpc_fail);
     assert!(r.frames >= 2 && r.ldpc_fail == 0 && r.mer_db.iter().all(|&m| m > 20.0));
 }
@@ -548,7 +371,7 @@ fn t2_through_the_fpga_resampler() {
 #[test]
 #[ignore]
 fn t2_16qam_debug() {
-    use super::{codes, Constellation, Modulator, Palette};
+    use super::{codes, BitInterleaver, Constellation, Modulator, Palette};
     let mut p = Params::amateur();
     p.constellation = Constellation::Qam16;
     p.fec_blocks = 18;
