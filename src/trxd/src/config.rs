@@ -191,6 +191,10 @@ pub struct TrxConfig {
     pub cw_engine: String,
     /// CW keyer speed for `KY`/`send_morse` from rigctl.
     pub cw_wpm: u8,
+    /// DVB-T2 transmit level against the default (RMS -9 dBFS, peaks over
+    /// 2.65 sigma clipped), dB: +3 is about 3 dB more on air with more of
+    /// the peaks clipped (clipping noise near -17 dB then).
+    pub t2_drive_db: f32,
 }
 
 impl Default for TrxConfig {
@@ -210,6 +214,7 @@ impl Default for TrxConfig {
             cw_squelch_db: 6,
             cw_engine: "timing".into(),
             cw_wpm: 20,
+            t2_drive_db: 0.0,
         }
     }
 }

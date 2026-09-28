@@ -226,6 +226,14 @@ mod tests {
                 fec.frame(&llr, &mut stats, &mut packets);
             }
         }
+        if let Some(se) = &d.sym_err {
+            let v: Vec<String> = se.chunks(16).enumerate().filter(|(_, c)| c.iter().any(|x| x.1 > 0.0)).map(|(i, c)| {
+                let (e, n) = c.iter().fold((0.0, 0.0), |a, x| (a.0 + x.0, a.1 + x.1));
+                format!("{}-{}: {:.1} dB", i * 16, i * 16 + 15, -10.0 * (e / n).log10())
+            }).collect();
+            eprintln!("pilot MER by symbol index: {}", v.join(", "));
+        }
+        eprintln!("BCH: fixed {} bits, failed on {} converged frames", stats.bch_fixed, stats.bch_fail);
         eprintln!("{} words: frames {}, blocks {}, packets {}, LDPC failures {}, freq {:.0} Hz, P1 missed {}, MER {:?}", words.len(), d.stats.frames, d.stats.blocks, packets.len(), stats.ldpc_fail, d.stats.freq_hz, d.stats.p1_missed, mers);
         if std::env::var_os("T2DBG").is_none() {
             return;

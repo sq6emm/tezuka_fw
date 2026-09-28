@@ -93,3 +93,14 @@ U-Boot is never written, so these always remain:
 * USB DFU: `dfu_sf` in U-Boot, as with tezuka (`boot.dfu`, `pluto.dfu`).
 * JTAG: `flash/jtag/` in the build zip.
 * An SD card with `sdimg/` on it, if the board's boot switch allows SD.
+
+## Known issue: a warm reboot into a fresh slot can hang (Libre 1)
+
+Twice (2026-09-27 and -28) LibreSDR 1 did not come back from the reboot
+after fw-update wrote slot A; slot B the same night rebooted fine, and a
+power cycle always booted the new slot normally (it then confirmed itself).
+Libre 2 never showed it. Unverified lead: the S25FL256 (32 MB) left by
+Linux in a state the BootROM cannot read after a warm reset (4-byte
+addressing or its bank register); if so, `broken-flash-reset;` on the flash
+node makes Linux restore it at shutdown. To be checked with the debug
+port's UART attached before changing anything in the boot path.

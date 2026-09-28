@@ -154,7 +154,7 @@ pub struct CwLive {
     fresh: String,
     dirty: bool,
     /// The rain-scatter decoder, when that is the engine ([`crate::rscw`]).
-    rs: Option<crate::rscw::RsStream>,
+    rs: Option<crate::rscw::RsNnStream>,
     rate: f64,
     band: (f32, f32),
 }
@@ -198,7 +198,7 @@ impl CwLive {
         }
         if on {
             self.set_neural(false);
-            let mut r = crate::rscw::RsStream::new(self.rate as f32);
+            let mut r = crate::rscw::RsNnStream::new(self.rate as f32);
             r.set_band(self.band.0, self.band.1);
             self.rs = Some(r);
         } else {

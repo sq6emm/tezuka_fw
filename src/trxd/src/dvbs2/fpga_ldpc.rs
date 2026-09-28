@@ -18,6 +18,9 @@ use super::ldpc_fpga::{FpgaDecoder, LongRate, N, quantize_llr};
 const PHYS: u64 = 0x43C4_0000;
 const ID_LDP1: u32 = 0x3150_444C;
 const MAX_ITER: u32 = 50;
+/// Time in the FPGA decoder's stages (ns): LLRs in, waiting, decisions out.
+pub static PROF_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Channel LLR -> the decoder's 6-bit input (as the model was tuned).
 const LLR_SCALE: f32 = 2.0;
 
@@ -72,6 +75,18 @@ impl Window {
         // SAFETY: see open().
         unsafe { std::ptr::read_volatile(self.ptr.add(off / 4)) }
     }
+    /// Aligned words to the window from `off` in one copy.
+    fn write_words(&self, off: usize, v: &[u32]) {
+        assert!(off % 4 == 0 && off + 4 * v.len() <= 0x1_0000);
+        // SAFETY: see open(); both sides word-aligned, inside the window.
+        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), self.ptr.add(off / 4), v.len()) }
+    }
+    /// Aligned words from the window at `off` in one copy.
+    fn read_words(&self, off: usize, v: &mut [u32]) {
+        assert!(off % 4 == 0 && off + 4 * v.len() <= 0x1_0000);
+        // SAFETY: see open().
+        unsafe { std::ptr::copy_nonoverlapping(self.ptr.add(off / 4), v.as_mut_ptr(), v.len()) }
+    }
     fn wr(&self, off: usize, v: u32) {
         // SAFETY: see open().
         unsafe { std::ptr::write_volatile(self.ptr.add(off / 4), v) }
@@ -95,7 +110,8 @@ pub fn available() -> bool {
 pub enum Ldpc {
     Short(Decoder),
     Model(FpgaDecoder),
-    Fpga { win: Window, rate: LongRate, q: Vec<i8>, max_iter: u32 },
+    /// `need`: decisions read back (the BCH codeword's Kbch + 192 bits).
+    Fpga { win: Window, rate: LongRate, q: Vec<u32>, max_iter: u32, need: usize },
 }
 
 impl Ldpc {
@@ -107,7 +123,7 @@ impl Ldpc {
         match Window::open() {
             Ok(win) => {
                 tracing::info!(?rate, "LDPC: the FPGA decoder");
-                Ldpc::Fpga { win, rate, q: vec![0; N], max_iter: MAX_ITER }
+                Ldpc::Fpga { win, rate, q: vec![0; N / 4], max_iter: MAX_ITER, need: (spec.kbch + 192).min(N) }
             }
             Err(e) => {
                 tracing::info!(?rate, "LDPC: FPGA decoder unavailable ({e}); its model in software");
@@ -134,14 +150,16 @@ impl Ldpc {
                 let q: Vec<i8> = llr.iter().map(|&l| quantize_llr(l, LLR_SCALE)).collect();
                 d.decode(&q, bits)
             }
-            Ldpc::Fpga { win, rate, q, max_iter } => {
-                for (d, &l) in q.iter_mut().zip(llr) {
-                    *d = quantize_llr(l, LLR_SCALE);
+            Ldpc::Fpga { win, rate, q, max_iter, need } => {
+                let t_q = std::time::Instant::now();
+                // Four 6-bit LLRs a word, then one bulk copy into the
+                // window (word writes one at a time cost 10 ms a frame).
+                for (w, c) in q.iter_mut().zip(llr.chunks_exact(4)) {
+                    let b = |l: f32| quantize_llr(l, LLR_SCALE) as u8 as u32;
+                    *w = b(c[0]) | b(c[1]) << 8 | b(c[2]) << 16 | b(c[3]) << 24;
                 }
-                for (w, c) in q.chunks_exact(4).enumerate() {
-                    let v = u32::from_le_bytes([c[0] as u8, c[1] as u8, c[2] as u8, c[3] as u8]);
-                    win.wr(4 * w, v);
-                }
+                win.write_words(0, q);
+                let t_in = std::time::Instant::now();
                 win.wr(0xFF00, 1 | ((*rate == LongRate::R3_4) as u32) << 1 | *max_iter << 8);
                 // 2.5 ms an iteration: sleep in small steps until done.
                 let t0 = std::time::Instant::now();
@@ -152,15 +170,21 @@ impl Ldpc {
                     }
                     std::thread::sleep(std::time::Duration::from_micros(500));
                 }
+                let t_out = std::time::Instant::now();
                 let st = win.rd(0xFF04);
-                // Decisions: the sign bits (all of them: the caller reads
-                // the BBFRAME part).
-                for w in 0..N / 4 {
-                    let v = win.rd(4 * w);
+                // Decisions: the sign bits of the BCH codeword part (the
+                // parity bits after it are never read).
+                let words = need.div_ceil(4);
+                win.read_words(0, &mut q[..words]);
+                for (w, &v) in q[..words].iter().enumerate() {
                     for i in 0..4 {
                         bits[4 * w + i] = ((v >> (8 * i + 7)) & 1) as u8;
                     }
                 }
+                use std::sync::atomic::Ordering::Relaxed;
+                PROF_NS[0].fetch_add((t_in - t_q).as_nanos() as u64, Relaxed);
+                PROF_NS[1].fetch_add((t_out - t0).as_nanos() as u64, Relaxed);
+                PROF_NS[2].fetch_add(t_out.elapsed().as_nanos() as u64, Relaxed);
                 ((st >> 1) & 1 == 1).then_some(((st >> 8) & 0x3F) as usize)
             }
         }

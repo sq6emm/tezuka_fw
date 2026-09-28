@@ -700,6 +700,38 @@ mod tests {
     }
 
     #[test]
+    fn short_bch_corrects_up_to_t() {
+        // The transmitter's short-frame codewords through the receiver's
+        // BCH decoder with 1..12 bits flipped.
+        let bch = super::bch::Bch::short();
+        for rate in [Rate::R1_4, Rate::R1_2, Rate::R3_4] {
+            let fec = Fec::new(rate);
+            let bb: Vec<u8> = (0..rate.kbch() / 8).map(|i| (i * 53 + 7) as u8).collect();
+            let bits = fec.encode(&bb);
+            let cw = bits[..rate.kldpc()].to_vec();
+            let mut c = cw.clone();
+            assert!(matches!(bch.decode(&mut c), super::bch::Outcome::Clean), "{rate:?} clean");
+            let mut x = 12345u32;
+            for ne in [1usize, 4, 12] {
+                let mut c = cw.clone();
+                let mut flipped = std::collections::BTreeSet::new();
+                while flipped.len() < ne {
+                    x = x.wrapping_mul(1103515245).wrapping_add(12345);
+                    flipped.insert((x >> 8) as usize % c.len());
+                }
+                for &p in &flipped {
+                    c[p] ^= 1;
+                }
+                match bch.decode(&mut c) {
+                    super::bch::Outcome::Fixed(k) => assert_eq!(k, ne, "{rate:?}"),
+                    _ => panic!("{rate:?}: {ne} errors not fixed"),
+                }
+                assert!(c == cw, "{rate:?}: {ne} errors, wrong correction");
+            }
+        }
+    }
+
+    #[test]
     fn ldpc_codewords_satisfy_every_parity_check() {
         for rate in [Rate::R1_4, Rate::R1_3, Rate::R1_2, Rate::R2_3, Rate::R3_4] {
             let fec = Fec::new(rate);

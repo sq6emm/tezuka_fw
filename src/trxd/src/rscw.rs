@@ -1,21 +1,18 @@
 //! CW copy through rain scatter (10 GHz and up): one station's keying when
 //! its carrier arrives Doppler-spread over a few hundred Hz to more than a
 //! kHz and fading fast. A narrow filter or a tone-tracking decoder catches a
-//! sliver of that; this collects all of it.
+//! sliver of that; this collects all of it (docs/RSCW.md).
 //!
-//! - Short-time spectrum of the audio (256 points at 12 kHz: 47 Hz bins,
-//!   a frame every 5.3 ms).
-//! - Noise per bin: a slow quantile tracker (the keying is on less than
-//!   half the time, and in each bin only now and then).
-//! - The signal's spread: each bin's average excess SNR over a few
-//!   seconds. Weighting the bins by S / (1 + S) (their SNR share) and
-//!   summing gives the matched energy detector for a spread signal in noise;
-//!   normalized, a z-score per frame.
-//! - Keying: that score smoothed over a fraction of a dot, two thresholds
-//!   (hysteresis) that follow the signal's level through the fading.
-//! - Timing: marks and spaces in dot units with a self-tuning dot length;
-//!   gaps shorter than a third of a dot inside a mark are fades (bridged),
-//!   marks shorter than a third of a dot are noise (dropped).
+//! Live ([`RsNnStream`], the CW box's "rs" engine and the CW-RS mode): a
+//! small neural network ([`crate::rsnn`]) gives each frame's likelihood
+//! that the key is down; a character-level Viterbi ([`CharModel`]: duration
+//! chains and a trie of the Morse codes) at six speeds turns that into text.
+//!
+//! The first engine is kept for the tests' comparison: a matched energy
+//! detector over the spectrum (bins weighted by their average excess SNR,
+//! S / (1 + S)), its score as a likelihood, an element-level Viterbi bank
+//! ([`RsStream`]); and before that, thresholds with hysteresis ([`RsCw`]).
+#![cfg_attr(not(test), allow(dead_code))]
 
 use std::sync::Arc;
 
@@ -174,6 +171,7 @@ impl RsCw {
         let warm = self.frames < 40;
         // Noise per bin (quantile in the log domain), excess SNR, the shape.
         let eta = if warm { 0.2 } else { 0.004 };
+
         let shape_a = 1.0 / (4.0 * self.fps());
         let mut num = 0f32;
         let mut wsum2 = 0f32;
@@ -865,6 +863,425 @@ pub fn llrs(z: &[f32], fps: f32) -> Vec<f32> {
         .collect()
 }
 
+/// A trie of the Morse codes: node 0 is the root; each other node is the
+/// element sequence leading to it (its last element in `dash`), with the
+/// character it spells if any.
+struct Trie {
+    child: Vec<[usize; 2]>,
+    dash: Vec<bool>,
+    ch: Vec<Option<char>>,
+    depth: Vec<usize>,
+}
+
+impl Trie {
+    fn new() -> Trie {
+        let mut t = Trie { child: vec![[0; 2]], dash: vec![false], ch: vec![None], depth: vec![0] };
+        for &(code, c) in MORSE {
+            let mut n = 0;
+            for e in code.chars() {
+                let d = (e == '-') as usize;
+                if t.child[n][d] == 0 {
+                    t.child.push([0; 2]);
+                    t.dash.push(d == 1);
+                    t.ch.push(None);
+                    t.depth.push(t.depth[n] + 1);
+                    t.child[n][d] = t.child.len() - 1;
+                }
+                n = t.child[n][d];
+            }
+            t.ch[n] = Some(c);
+        }
+        t
+    }
+}
+
+/// The character-level Morse model for one speed: chains of duration
+/// states, a mark per trie node, an element gap per node with children, one
+/// character gap and one word gap; the elements between character gaps must
+/// spell a Morse character (so one misread element cannot turn into an
+/// unknown symbol).
+struct CharModel {
+    chains: Vec<Chain>,
+    ns: usize,
+    chain_of: Vec<u16>,
+    wg: usize,
+    ch: Vec<Option<char>>,
+    /// Log bonus for ending a character at each mark chain: the element
+    /// boundaries' choices make short characters cheap (noise decodes as E
+    /// and T); `len_bonus` per element evens that out.
+    end_bonus: Vec<f64>,
+}
+
+struct Chain {
+    on: bool,
+    lo: usize,
+    hi: usize,
+    /// 0 mark, 1 element gap (of `node`), 2 character gap, 3 word gap
+    kind: u8,
+    node: usize,
+    base: usize,
+    outs: Vec<usize>,
+}
+
+impl CharModel {
+    fn new(dot: f32) -> CharModel {
+        let tr = Trie::new();
+        let nn = tr.child.len();
+        let seg = |lo: f32, hi: f32| ((lo * dot).round().max(1.0) as usize, (hi * dot).round().max(2.0) as usize);
+        let d: Vec<f32> = std::env::var("RSCW_DUR")
+            .ok()
+            .map(|v| v.split_whitespace().filter_map(|x| x.parse().ok()).collect())
+            .filter(|v: &Vec<f32>| v.len() == 8)
+            .unwrap_or(vec![0.7, 1.5, 2.4, 4.0, 0.6, 1.7, 4.0, 7.0]);
+        let (dotd, dashd, egd, cgd, wgd) = (seg(d[0], d[1]), seg(d[2], d[3]), seg(d[4], d[5]), seg(d[5], d[6]), seg(d[6], d[7]));
+        let mut chains: Vec<Chain> = Vec::new();
+        let mut mark_of = vec![usize::MAX; nn];
+        let mut egap_of = vec![usize::MAX; nn];
+        let mut base = 0;
+        for n in 1..nn {
+            let (lo, hi) = if tr.dash[n] { dashd } else { dotd };
+            mark_of[n] = chains.len();
+            chains.push(Chain { on: true, lo, hi, kind: 0, node: n, base, outs: vec![] });
+            base += hi;
+        }
+        for n in 1..nn {
+            if tr.child[n] != [0, 0] {
+                egap_of[n] = chains.len();
+                chains.push(Chain { on: false, lo: egd.0, hi: egd.1, kind: 1, node: n, base, outs: vec![] });
+                base += egd.1;
+            }
+        }
+        let cg = chains.len();
+        chains.push(Chain { on: false, lo: cgd.0, hi: cgd.1, kind: 2, node: 0, base, outs: vec![] });
+        base += cgd.1;
+        let wg = chains.len();
+        chains.push(Chain { on: false, lo: wgd.0, hi: wgd.1, kind: 3, node: 0, base, outs: vec![] });
+        base += wgd.1;
+        for c in 0..chains.len() {
+            let n = chains[c].node;
+            let outs: Vec<usize> = match chains[c].kind {
+                0 => {
+                    let mut o = Vec::new();
+                    if egap_of[n] != usize::MAX {
+                        o.push(egap_of[n]);
+                    }
+                    if tr.ch[n].is_some() {
+                        o.push(cg);
+                        o.push(wg);
+                    }
+                    o
+                }
+                1 => tr.child[n].iter().filter(|&&k| k != 0).map(|&k| mark_of[k]).collect(),
+                _ => tr.child[0].iter().filter(|&&k| k != 0).map(|&k| mark_of[k]).collect(),
+            };
+            chains[c].outs = outs;
+        }
+        let mut chain_of = vec![0u16; base];
+        for (ci, c) in chains.iter().enumerate() {
+            for p in 0..c.hi {
+                chain_of[c.base + p] = ci as u16;
+            }
+        }
+        let lb: f64 = std::env::var("RSCW_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let end_bonus = chains.iter().map(|c| if c.kind == 0 { lb * tr.depth[c.node] as f64 } else { 0.0 }).collect();
+        CharModel { chains, ns: base, chain_of, wg, ch: tr.ch, end_bonus }
+    }
+
+    /// Text from consecutive frames' chains: a character where a mark ends
+    /// in a character or word gap (a space after the word gap). `prev` is
+    /// the chain before the first frame; the last chain comes back.
+    fn text(&self, path: &[u16], mut prev: u16, out: &mut String) -> u16 {
+        for &c in path {
+            if c != prev {
+                let (pk, ck) = (self.chains[prev as usize].kind, self.chains[c as usize].kind);
+                if pk == 0 && (ck == 2 || ck == 3) {
+                    if let Some(ch) = self.ch[self.chains[prev as usize].node] {
+                        out.push(ch);
+                    }
+                    if ck == 3 {
+                        out.push(' ');
+                    }
+                }
+                prev = c;
+            }
+        }
+        prev
+    }
+}
+
+/// One speed's character-level decoder, a frame at a time, keeping the last
+/// `hist` frames' back pointers (all of them when `hist` is 0).
+struct CharBank {
+    m: CharModel,
+    score: Vec<f64>,
+    next: Vec<f64>,
+    back: std::collections::VecDeque<Vec<u16>>,
+    hist: usize,
+    /// Recent log-likelihood a frame (how well this speed explains the input).
+    fit: f64,
+    /// Sum of what was taken off the scores (the whole path's likelihood).
+    total: f64,
+    beam: f64,
+}
+
+impl CharBank {
+    fn new(dot: f32, hist: usize) -> CharBank {
+        let m = CharModel::new(dot);
+        let mut score = vec![-1e30; m.ns];
+        score[m.chains[m.wg].base] = 0.0;
+        let beam = std::env::var("RSCW_BEAM").ok().and_then(|v| v.parse().ok()).unwrap_or(if hist > 0 { 30.0 } else { 1e29 });
+        CharBank { next: vec![-1e30; m.ns], score, back: Default::default(), hist, fit: 0.0, total: 0.0, m, beam }
+    }
+
+    fn step(&mut self, l: f32) {
+        // states further than BEAM below the best are dropped
+        let neg: f64 = -self.beam;
+        let ln_half = (0.5f64).ln();
+        let (e_on, e_off) = (l as f64 / 2.0, -l as f64 / 2.0);
+        let mut bp = vec![u16::MAX; self.m.ns];
+        self.next.iter_mut().for_each(|v| *v = -1e30);
+        for c in &self.m.chains {
+            let e = if c.on { e_on } else { e_off };
+            for pos in 0..c.hi {
+                let s = c.base + pos;
+                let sc = self.score[s];
+                if sc < neg {
+                    continue;
+                }
+                let can_end = pos + 1 >= c.lo;
+                let last = pos + 1 == c.hi;
+                if !last {
+                    let v = sc + if can_end { ln_half } else { 0.0 } + e;
+                    if v > self.next[s + 1] {
+                        self.next[s + 1] = v;
+                        bp[s + 1] = s as u16;
+                    }
+                } else if c.kind == 3 {
+                    let v = sc + e;
+                    if v > self.next[s] {
+                        self.next[s] = v;
+                        bp[s] = s as u16;
+                    }
+                }
+                if can_end && !c.outs.is_empty() {
+                    let ln_out = if last { 0.0 } else { ln_half } - (c.outs.len() as f64).ln();
+                    let ci = self.m.chain_of[s] as usize;
+                    for &o in &c.outs {
+                        let t = self.m.chains[o].base;
+                        let bonus = if self.m.chains[o].kind >= 2 { self.m.end_bonus[ci] } else { 0.0 };
+                        let v = sc + ln_out + bonus + if self.m.chains[o].on { e_on } else { e_off };
+                        if v > self.next[t] {
+                            self.next[t] = v;
+                            bp[t] = s as u16;
+                        }
+                    }
+                }
+            }
+        }
+        std::mem::swap(&mut self.score, &mut self.next);
+        let best = self.score.iter().cloned().fold(f64::MIN, f64::max);
+        self.score.iter_mut().for_each(|v| *v -= best);
+        self.total += best;
+        self.fit += 0.003 * (best - self.fit);
+        self.back.push_back(bp);
+        if self.hist > 0 && self.back.len() > self.hist {
+            self.back.pop_front();
+        }
+    }
+
+    /// The best path's chains for the last `n` frames (oldest first).
+    fn path(&self, n: usize) -> Vec<u16> {
+        let n = n.min(self.back.len());
+        let mut s = (0..self.m.ns).max_by(|&a, &b| self.score[a].total_cmp(&self.score[b])).unwrap_or(0);
+        let mut out = vec![self.m.wg as u16; n];
+        let len = self.back.len();
+        for i in 0..n {
+            let t = len - 1 - i;
+            out[n - 1 - i] = self.m.chain_of[s];
+            let b = self.back[t][s];
+            if b == u16::MAX {
+                break;
+            }
+            s = b as usize;
+        }
+        out
+    }
+}
+
+/// Character-level Viterbi over a whole recording (see [`CharModel`]):
+/// the text and the path's log-likelihood per frame.
+pub fn viterbi_chars(llr: &[f32], dot: f32) -> (String, f64) {
+    let mut b = CharBank::new(dot, 0);
+    for &l in llr {
+        b.step(l);
+    }
+    let path = b.path(llr.len());
+    let mut text = String::new();
+    let last = b.m.text(&path, b.m.wg as u16, &mut text);
+    let lc = &b.m.chains[last as usize];
+    if lc.kind <= 1 {
+        if let Some(ch) = b.m.ch[lc.node] {
+            text.push(ch);
+        }
+    }
+    (text, b.total / llr.len().max(1) as f64)
+}
+
+/// The rain-scatter decoder with the neural keying detector
+/// ([`crate::rsnn`]) and character-level Viterbi banks (8-30 WPM), streaming:
+/// every half second the best-fitting speed's text is committed up to two
+/// seconds back. No text while the network has not been sure of a key-down
+/// for the last few seconds (noise alone decodes as E and T).
+pub struct RsNnStream {
+    nn: crate::rsnn::RsNn,
+    banks: Vec<CharBank>,
+    dots: Vec<f32>,
+    fps: f32,
+    pending: usize,
+    lag: usize,
+    every: usize,
+    since: usize,
+    prev: u16,
+    /// Frames since the network last gave a confident key-down.
+    quiet: usize,
+    llr: Vec<f32>,
+    dec: usize,
+    acc: (f32, usize),
+    squelch_s: f32,
+    /// The banks are resting (squelched).
+    idle: bool,
+    /// An LLR above this is a confident key-down (opens the squelch).
+    sure: f32,
+    pub text: String,
+    fresh: String,
+}
+
+impl RsNnStream {
+    pub fn new(rate: f32) -> RsNnStream {
+        let nn = crate::rsnn::RsNn::new();
+        // the decoder runs at about 94 frames a second (a network at hop 64:
+        // pairs of its LLRs summed)
+        let dec: usize = std::env::var("RSCW_DEC").ok().and_then(|v| v.parse().ok()).unwrap_or((128 / nn.hop()).max(1));
+        let fps = rate / nn.hop() as f32 / dec as f32;
+        let wpms: Vec<f32> = std::env::var("RSCW_WPMS")
+            .ok()
+            .map(|v| v.split_whitespace().filter_map(|x| x.parse().ok()).collect())
+            .unwrap_or(vec![9.5f32, 11.0, 12.5, 14.0, 15.5, 17.5, 20.0, 23.0, 27.0]);
+        let dots: Vec<f32> = wpms.iter().map(|w| 1.2 * fps / w).collect();
+        let hist = (6.0 * fps) as usize;
+        RsNnStream {
+            nn,
+            banks: dots.iter().map(|&d| CharBank::new(d, hist)).collect(),
+            dots,
+            fps,
+            pending: 0,
+            lag: (std::env::var("RSCW_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0f32) * fps) as usize,
+            every: (0.5 * fps) as usize,
+            since: 0,
+            prev: 0,
+            quiet: usize::MAX / 2,
+            llr: Vec::new(),
+            dec,
+            acc: (0.0, 0),
+            squelch_s: std::env::var("RSCW_SQS").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0),
+            idle: false,
+            sure: std::env::var("RSCW_SURE").ok().and_then(|v| v.parse().ok()).unwrap_or(5.0),
+            text: String::new(),
+            fresh: String::new(),
+        }
+    }
+
+    pub fn wpm(&self) -> f32 {
+        let b = (0..self.banks.len()).max_by(|&a, &b| self.banks[a].fit.total_cmp(&self.banks[b].fit)).unwrap_or(0);
+        1.2 * self.fps / self.dots[b]
+    }
+
+    /// The network looks at 200-3000 Hz itself and finds the signal there;
+    /// the CW filter only limits what reaches it.
+    pub fn set_band(&mut self, _lo: f32, _hi: f32) {}
+
+    pub fn process(&mut self, audio: &[f32]) {
+        self.llr.clear();
+        let mut llr = std::mem::take(&mut self.llr);
+        self.nn.process(audio, &mut llr);
+        for &l0 in &llr {
+            self.acc = (self.acc.0 + l0, self.acc.1 + 1);
+            if self.acc.1 < self.dec {
+                continue;
+            }
+            let l = self.acc.0;
+            self.acc = (0.0, 0);
+            self.quiet = if l > self.sure * self.dec as f32 { 0 } else { self.quiet.saturating_add(1) };
+            // Squelched (no confident key-down for a while): nothing would
+            // be shown, so the banks rest (on noise the beam prunes little
+            // and they cost most); they start afresh at the next key-down.
+            if self.quiet as f32 > self.squelch_s * self.fps + self.lag as f32 {
+                if !self.idle {
+                    let hist = (6.0 * self.fps) as usize;
+                    self.banks = self.dots.iter().map(|&d| CharBank::new(d, hist)).collect();
+                    self.pending = 0;
+                    self.since = 0;
+                    self.prev = 0;
+                    self.idle = true;
+                }
+                continue;
+            }
+            self.idle = false;
+            for b in &mut self.banks {
+                b.step(l);
+            }
+            self.pending += 1;
+            self.since += 1;
+            if self.since >= self.every && self.pending > self.lag {
+                self.since = 0;
+                self.commit(self.pending - self.lag);
+            }
+        }
+        self.llr = llr;
+    }
+
+    fn commit(&mut self, n: usize) {
+        let b = (0..self.banks.len()).max_by(|&a, &b| self.banks[a].fit.total_cmp(&self.banks[b].fit)).unwrap_or(0);
+        let path = self.banks[b].path(self.pending);
+        let n = n.min(path.len());
+        let m = &self.banks[b].m;
+        let mut out = String::new();
+        let prev = if (self.prev as usize) < m.chains.len() { self.prev } else { m.wg as u16 };
+        self.prev = m.text(&path[..n], prev, &mut out);
+        self.pending -= n;
+        // squelch: the network has been unsure for over 4 s
+        if self.quiet as f32 > self.squelch_s * self.fps + self.lag as f32 {
+            return;
+        }
+        if out.starts_with(' ') && self.text.ends_with(' ') {
+            out.remove(0);
+        }
+        self.text += &out;
+        self.fresh += &out;
+    }
+
+    /// What was committed since the last call.
+    pub fn take(&mut self) -> String {
+        std::mem::take(&mut self.fresh)
+    }
+
+    pub fn finish(&mut self) {
+        let n = self.pending;
+        if n > 0 {
+            self.commit(n);
+        }
+    }
+}
+
+const MORSE: &[(&str, char)] = &[
+    (".-", 'A'), ("-...", 'B'), ("-.-.", 'C'), ("-..", 'D'), (".", 'E'), ("..-.", 'F'), ("--.", 'G'), ("....", 'H'),
+    ("..", 'I'), (".---", 'J'), ("-.-", 'K'), (".-..", 'L'), ("--", 'M'), ("-.", 'N'), ("---", 'O'), (".--.", 'P'),
+    ("--.-", 'Q'), (".-.", 'R'), ("...", 'S'), ("-", 'T'), ("..-", 'U'), ("...-", 'V'), (".--", 'W'), ("-..-", 'X'),
+    ("-.--", 'Y'), ("--..", 'Z'), (".----", '1'), ("..---", '2'), ("...--", '3'), ("....-", '4'), (".....", '5'),
+    ("-....", '6'), ("--...", '7'), ("---..", '8'), ("----.", '9'), ("-----", '0'), ("-..-.", '/'), ("..--..", '?'),
+    (".-.-.-", '.'), ("--..--", ','), ("-...-", '='), (".-.-.", '+'),
+];
+
 fn decode(s: &str) -> char {
     const T: &[(&str, char)] = &[
         (".-", 'A'), ("-...", 'B'), ("-.-.", 'C'), ("-..", 'D'), (".", 'E'), ("..-.", 'F'), ("--.", 'G'), ("....", 'H'),
@@ -1029,7 +1446,78 @@ mod tests {
 
     /// The Viterbi decoder on a whole recording: scores, LLRs, the best of
     /// a range of speeds.
+    /// LLRs of a recording by the chosen detector (RS2: v2, else the
+    /// batch version of the first), and the frame rate.
+    fn file_llrs(path: &str) -> (Vec<f32>, f32) {
+        let (x, rate) = read_wav(path);
+        let hop: f32 = std::env::var("RSCW_LLRHOP").ok().and_then(|v| v.parse().ok()).unwrap_or(HOP as f32);
+        let fps = rate / hop;
+        // RSCW_LLRDIR: LLRs from elsewhere (the network), <dir>/<file>.f32
+        if let Ok(dir) = std::env::var("RSCW_LLRDIR") {
+            let name = std::path::Path::new(path).file_name().unwrap().to_string_lossy().to_string();
+            let b = std::fs::read(format!("{dir}/{name}.f32")).unwrap();
+            let s: f32 = std::env::var("RSCW_LLRSCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+            return (b.chunks_exact(4).map(|c| s * f32::from_le_bytes(c.try_into().unwrap())).collect(), fps);
+        }
+        let mut d = RsCw::new(rate);
+        d.history = Some(Vec::new());
+        for c in x.chunks(1200) {
+            d.process(c);
+        }
+        let z = d.history.take().unwrap();
+        (llrs(&z[40.min(z.len())..], fps), fps)
+    }
+
+    /// Upper bound: every speed tried, the text with the most known tokens.
+    #[test]
+    #[ignore]
+    fn rscw_oracle() {
+        let dir = std::env::var("RSCW_DIR").expect("RSCW_DIR");
+        let (mut got, mut all) = (0, 0);
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        files.sort();
+        for f in files {
+            let name = f.file_name().unwrap().to_string_lossy().replace("rsonly__", "");
+            let Some((_, toks)) = TRUTH.iter().find(|(k, _)| name.contains(k)) else { continue };
+            let (l, fps) = file_llrs(f.to_str().unwrap());
+            let mut best = (0usize, String::new(), 0f32);
+            let mut dot = 1.2 * fps / 30.0;
+            while dot <= 1.2 * fps / 8.0 {
+                let (t, _) = if std::env::var_os("RSCW_VCHAR").is_some() { viterbi_chars(&l, dot) } else { viterbi(&l, dot) };
+                let flat: String = t.chars().filter(|c| *c != ' ').collect();
+                let g = toks.iter().filter(|x| flat.contains(*x)).count();
+                if g > best.0 || best.1.is_empty() {
+                    best = (g, t, 1.2 * fps / dot);
+                }
+                dot *= 1.06;
+            }
+            all += toks.len();
+            got += best.0;
+            eprintln!("{:36} {:4.0} WPM [{}/{}] | {}", &name[..name.len().min(36)], best.2, best.0, toks.len(), best.1.trim().chars().take(150).collect::<String>());
+        }
+        eprintln!("oracle score: {got} of {all}");
+    }
+
     fn viterbi_file(path: &str) -> (String, f32) {
+        if std::env::var_os("RSCW_LLRDIR").is_some() {
+            let (l, fps) = file_llrs(path);
+            let mut best = (String::new(), f64::MIN, 0f32);
+            // RSCW_BOTHPOL: the LLRs inverted too (FSK beacons: which tone
+            // is key down is not known)
+            let inv: Vec<f32> = l.iter().map(|v| -v).collect();
+            let pols: Vec<&[f32]> = if std::env::var_os("RSCW_BOTHPOL").is_some() { vec![&l, &inv] } else { vec![&l] };
+            for lp in pols {
+                let mut dot = 1.2 * fps / 30.0;
+                while dot <= 1.2 * fps / 8.0 {
+                    let (t, ll) = if std::env::var_os("RSCW_VCHAR").is_some() { viterbi_chars(lp, dot) } else { viterbi(lp, dot) };
+                    if ll > best.1 {
+                        best = (t, ll, dot);
+                    }
+                    dot *= 1.06;
+                }
+            }
+            return (best.0, 1.2 * fps / best.2);
+        }
         let (x, rate) = read_wav(path);
         let mut d = RsCw::new(rate);
         d.history = Some(Vec::new());
@@ -1091,6 +1579,7 @@ mod tests {
             }
             return (best.0, 1.2 * fps / best.2);
         }
+        let vit = |l: &[f32], dot: f32| if std::env::var_os("RSCW_VCHAR").is_some() { viterbi_chars(l, dot) } else { viterbi(l, dot) };
         let mut best = (String::new(), f64::MIN, 0f32);
         let (w_lo, w_hi): (f32, f32) = (
             std::env::var("RSCW_WLO").ok().and_then(|x| x.parse().ok()).unwrap_or(10.0),
@@ -1098,7 +1587,7 @@ mod tests {
         );
         let mut dot = 1.2 * fps / w_hi;
         while dot <= 1.2 * fps / w_lo {
-            let (t, ll) = viterbi(&l, dot);
+            let (t, ll) = vit(&l, dot);
             if ll > best.1 {
                 best = (t, ll, dot);
             }
@@ -1162,6 +1651,62 @@ mod tests {
         eprintln!("stream score: {got} of {all}; {:.2} s of CPU for {:.0} s of audio", t0.elapsed().as_secs_f64(), audio_s);
     }
 
+    /// Time of the network alone and of one speed's character bank.
+    #[test]
+    #[ignore]
+    fn rscw_nn_cost() {
+        let (x, rate) = read_wav(&std::env::var("RSCW_FILE").expect("RSCW_FILE"));
+        let t0 = std::time::Instant::now();
+        let mut nn = crate::rsnn::RsNn::new();
+        let mut l = Vec::new();
+        for c in x.chunks(1200) {
+            nn.process(c, &mut l);
+        }
+        let t_nn = t0.elapsed().as_secs_f64();
+        let fps = rate / HOP as f32;
+        for w in [9.0f32, 15.0, 30.0] {
+            let t0 = std::time::Instant::now();
+            let mut b = CharBank::new(1.2 * fps / w, (6.0 * fps) as usize);
+            for &v in &l {
+                b.step(v);
+            }
+            eprintln!("bank {w} WPM: {} states, {:.3} s", b.m.ns, t0.elapsed().as_secs_f64());
+        }
+        eprintln!("audio {:.0} s: network {t_nn:.3} s", x.len() as f32 / rate);
+    }
+
+    /// The network + character-level streaming decoder on every recording.
+    #[test]
+    #[ignore]
+    fn rscw_nnstream() {
+        let dir = std::env::var("RSCW_DIR").expect("RSCW_DIR");
+        let (mut got, mut all) = (0, 0);
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        files.sort();
+        let t0 = std::time::Instant::now();
+        let mut audio_s = 0.0;
+        for f in files {
+            let name = f.file_name().unwrap().to_string_lossy().replace("rsonly__", "");
+            let (x, rate) = read_wav(f.to_str().unwrap());
+            audio_s += x.len() as f64 / rate as f64;
+            let mut d = RsNnStream::new(rate);
+            for c in x.chunks(1200) {
+                d.process(c);
+            }
+            d.finish();
+            let flat: String = d.text.chars().filter(|c| *c != ' ').collect();
+            let mut mark = String::new();
+            if let Some((_, toks)) = TRUTH.iter().find(|(k, _)| name.contains(k)) {
+                all += toks.len();
+                let g = toks.iter().filter(|t| flat.contains(*t)).count();
+                got += g;
+                mark = format!("[{g}/{}]", toks.len());
+            }
+            eprintln!("{:36} {:4.0} WPM {mark:6} | {}", &name[..name.len().min(36)], d.wpm(), d.text.trim());
+        }
+        eprintln!("nn stream score: {got} of {all}; {:.2} s of CPU for {:.0} s of audio", t0.elapsed().as_secs_f64(), audio_s);
+    }
+
     /// The classic narrowband decoder (sdroxide CwRx, as trxd's live CW
     /// box) on the same recordings, tuned to each one's spectral peak.
     #[test]
@@ -1218,6 +1763,29 @@ mod tests {
                 eprintln!("integ {integ} on {on} squelch {sq}: {:?}", score(&dir, p));
             }
         }
+    }
+
+    /// Debug: the detector score and the streaming LLR of RSCW_FILE, as f32
+    /// files in RSCW_OUT (…z.f32, …llr.f32).
+    #[test]
+    #[ignore]
+    fn rscw_dump() {
+        let path = std::env::var("RSCW_FILE").expect("RSCW_FILE");
+        let out = std::env::var("RSCW_OUT").expect("RSCW_OUT");
+        let (x, rate) = read_wav(&path);
+        let mut d = RsCw::new(rate);
+        d.history = Some(Vec::new());
+        d.llr_out = Some(Vec::new());
+        for c in x.chunks(1200) {
+            d.process(c);
+        }
+        let w = |name: &str, v: &[f32]| {
+            let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(format!("{out}{name}"), b).unwrap();
+        };
+        w("z.f32", d.history.as_ref().unwrap());
+        w("llr.f32", d.llr_out.as_ref().unwrap());
+        eprintln!("fps {}", d.fps());
     }
 
     /// Every recording in RSCW_DIR through the decoder:

@@ -233,7 +233,10 @@ impl FpgaDecoder {
 /// Channel LLR (float, positive = 0) to the decoder's input.
 pub fn quantize_llr(l: f32, scale: f32) -> i8 {
     let m = ((1 << (LLR_BITS - 1)) - 1) as f32;
-    (l * scale).round().clamp(-m, m) as i8
+    // Round half away from zero, as round() (a libm call on the A9, 64800
+    // of them a frame): clamp, then truncate the half-offset value.
+    let v = (l * scale).clamp(-m, m);
+    (v + if v >= 0.0 { 0.5 } else { -0.5 }) as i8
 }
 
 #[cfg(test)]

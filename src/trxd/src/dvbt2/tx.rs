@@ -87,7 +87,7 @@ pub struct T2Tx {
 impl T2Tx {
     /// Start: the FPGA path set up, the modulator thread writing `block`
     /// bytes at a time to `sink`.
-    pub fn start(mode: Mode, sink: Sender<TxBlock>, block: usize) -> Result<T2Tx, String> {
+    pub fn start(mode: Mode, sink: Sender<TxBlock>, block: usize, drive_db: f32) -> Result<T2Tx, String> {
         let fs = mode.fs() * OS4 as f64 / 4.0;
         let fpga = crate::dvbs2::fpga_tx::RawTransmitter::start(fs, true)?;
         // About a T2 frame of packets queued ahead of the modulator.
@@ -116,7 +116,7 @@ impl T2Tx {
             .map_err(|e| e.to_string())?;
         let thread = std::thread::Builder::new()
             .name("dvbt2-tx".into())
-            .spawn(move || run(p, crx, ftx, st))
+            .spawn(move || run(p, crx, ftx, st, SCALE * 10f32.powf(drive_db.clamp(-20.0, 6.0) / 20.0)))
             .map_err(|e| e.to_string())?;
         Ok(T2Tx { mode, packets: tx, stop, thread: Some(thread), _fpga: fpga })
     }
@@ -217,13 +217,18 @@ fn fec(p: Params, packets: Receiver<[u8; TS_LEN]>, cells_out: Sender<Vec<Cell>>,
 }
 
 /// Frame cells to 8-bit I/Q bytes (OFDM, conversion) for the writer.
-fn run(p: Params, cells_in: Receiver<Vec<Cell>>, frames_out: Sender<Vec<u8>>, stop: Arc<AtomicBool>) {
+fn run(p: Params, cells_in: Receiver<Vec<Cell>>, frames_out: Sender<Vec<u8>>, stop: Arc<AtomicBool>, drive: f32) {
     crate::stream::thread_nice(-5);
     let o = OfdmStage::new(p, OS4);
     let mut iq = Vec::with_capacity(o.frame_samples());
     // TRXD_T2_TONE=1: a tone 200 kHz above the LO instead (checks the raw
     // FPGA path on an analyser).
     let tone = std::env::var_os("TRXD_T2_TONE").is_some();
+    // Debug: `echo 68 > /tmp/t2-scale` drives harder (RMS in 8-bit units).
+    let scale: f32 = std::fs::read_to_string("/tmp/t2-scale").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(drive);
+    if scale != SCALE {
+        tracing::info!(scale, "DVB-T2 TX scale (trx.t2_drive_db, or /tmp/t2-scale)");
+    }
     let (mut frames, mut ofdm_s, mut conv_s) = (0u64, 0f64, 0f64);
     let mut ph = 0f64;
     for cells in cells_in.iter() {
@@ -249,8 +254,8 @@ fn run(p: Params, cells_in: Receiver<Vec<Cell>>, frames_out: Sender<Vec<u8>>, st
         let t1 = std::time::Instant::now();
         let mut bytes = vec![0u8; 2 * iq.len()];
         for (b, z) in bytes.chunks_exact_mut(2).zip(&iq) {
-            b[0] = ((z.re * SCALE) as i32).clamp(-127, 127) as i8 as u8;
-            b[1] = ((z.im * SCALE) as i32).clamp(-127, 127) as i8 as u8;
+            b[0] = ((z.re * scale) as i32).clamp(-127, 127) as i8 as u8;
+            b[1] = ((z.im * scale) as i32).clamp(-127, 127) as i8 as u8;
         }
         conv_s += t1.elapsed().as_secs_f64();
         frames += 1;

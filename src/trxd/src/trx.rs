@@ -900,7 +900,7 @@ impl Trx {
         use crate::dvbs2::fpga_tx::{LongMode, Transmitter};
         if let Some(mode) = crate::dvbt2::tx::Mode::parse(rate) {
             // DVB-T2: modulated here, resampled to the DAC rate in the FPGA.
-            let t2 = match crate::dvbt2::tx::T2Tx::start(mode, self.tx_sink.clone(), self.block * 4) {
+            let t2 = match crate::dvbt2::tx::T2Tx::start(mode, self.tx_sink.clone(), self.block * 4, self.cfg.trx.t2_drive_db) {
                 Ok(t2) => t2,
                 Err(e) => {
                     warn!("DATV: DVB-T2: {e}");

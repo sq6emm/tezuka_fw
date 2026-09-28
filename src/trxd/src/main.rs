@@ -8,6 +8,7 @@
 //! `--check` parses the config, prints it, and exits.
 
 mod rscw;
+mod rsnn;
 mod beacon;
 mod config;
 mod cwlive;

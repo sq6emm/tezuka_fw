@@ -128,6 +128,12 @@ pub struct Demod {
     pub constellation_seq: u64,
     /// Seconds spent per stage ([`PROF_NAMES`]).
     pub prof: [f64; 6],
+    /// Debug (T2SYMERR set): pilot error and power by symbol index after
+    /// the equalizer, to see the channel estimate age through a frame.
+    pub sym_err: Option<Vec<(f64, f64)>>,
+    sym_err_frame: Vec<(f64, f64)>,
+    /// This frame's pilot error and count (the MER shown).
+    pil_err: (f64, f64),
 }
 
 impl Demod {
@@ -228,6 +234,9 @@ impl Demod {
             constellation: Vec::new(),
             constellation_seq: 0,
             prof: [0.0; 6],
+            sym_err: std::env::var_os("T2SYMERR").map(|_| vec![(0.0, 0.0); 256]),
+            sym_err_frame: vec![(0.0, 0.0); 256],
+            pil_err: (0.0, 0.0),
         }
     }
 
@@ -480,6 +489,24 @@ impl Demod {
             c += v * r;
         }
         let a = if c.norm() > 0.0 { c.arg() } else { 0.0 };
+        {
+            // Pilot error after the equalizer (the display's MER; per symbol
+            // index too when debugging).
+            let rot = Complex32::from_polar(1.0, -a);
+            let (mut e, mut n) = (0f64, 0f64);
+            for (&(k, v), &(_, rf)) in z.iter().zip(&self.pilots[j]) {
+                let vn = v / rf.norm_sqr() * Complex32::from_polar(1.0, -slope * k as f32) * rot;
+                // in data-cell units (unit power): the pilot's own boost out
+                e += ((vn - Complex32::new(1.0, 0.0)).norm_sqr() * rf.norm_sqr()) as f64;
+                n += 1.0;
+            }
+            self.pil_err.0 += e;
+            self.pil_err.1 += n;
+            if self.sym_err.is_some() {
+                self.sym_err_frame[j].0 += e;
+                self.sym_err_frame[j].1 += n;
+            }
+        }
         let (mut r, mut kk) = (Complex32::from_polar(CELL_SCALE, -a), 0usize);
         let q = q8;
         let (lo, hi) = (self.data_at[j], self.data_at[j + 1]);
@@ -523,6 +550,22 @@ impl Demod {
             err += (cell(i) - Complex32::new(r, 0.0)).norm_sqr();
         }
         self.stats.mer_db = 10.0 * (sig / err.max(1e-12)).log10();
+        // The MER shown: the pilots' error after the equalizer in data-cell
+        // units, what the data cells see. The L1-pre cells' (above, for the
+        // LLR scale) read about 3 dB higher.
+        if self.pil_err.1 > 0.0 {
+            self.stats.mer_db = (-10.0 * (self.pil_err.0 / self.pil_err.1).max(1e-12).log10()) as f32;
+        }
+        self.pil_err = (0.0, 0.0);
+        if let Some(se) = self.sym_err.as_mut() {
+            if self.stats.mer_db > 0.0 {
+                for (a, b) in se.iter_mut().zip(&self.sym_err_frame) {
+                    a.0 += b.0;
+                    a.1 += b.1;
+                }
+            }
+            self.sym_err_frame.iter_mut().for_each(|x| *x = (0.0, 0.0));
+        }
         if std::env::var_os("T2PRE").is_some() && self.stats.frames < 3 {
             let v: Vec<String> = self.pre_gather.iter().zip(&self.pre_ref).take(12).map(|(&i, &r)| format!("{:+.2}{:+.2}j/{r:+}", cell(i).re, cell(i).im)).collect();
             eprintln!("L1-pre cells: {}", v.join(" "));
@@ -669,6 +712,8 @@ struct FeState {
     /// Carrier offset (absolute, Hz), the one the NCO takes out.
     f_est: f64,
     nco_hz: f64,
+    /// Frames in a row whose carrier estimate jumped from `f_est`.
+    jumps: u32,
     misses: u32,
     /// The next frame's P1, to be checked once its raw samples are in.
     p1_check: Option<u64>,
@@ -696,6 +741,7 @@ impl Demod {
                 frame: None,
                 f_est: 0.0,
                 nco_hz: 0.0,
+                jumps: 0,
                 misses: 0,
                 p1_check: None,
                 raw_all_asked: false,
@@ -915,8 +961,24 @@ impl Demod {
             }
         }
         if cp.norm() > 0.0 {
+            // The carrier moves slowly: follow small changes halfway a
+            // frame; a jump (a frame hit by a fade or a slip, its guard
+            // intervals' phase on the other side of the wrap) only when
+            // three frames in a row agree. One bad frame retuned the NCO and
+            // lost the frames after it.
             let fnew = self.resolve_freq(cp, fe.f_est);
-            fe.f_est = fnew;
+            let d = fnew - fe.f_est;
+            if d.abs() <= 100.0 {
+                fe.f_est += 0.5 * d;
+                fe.jumps = 0;
+            } else {
+                fe.jumps += 1;
+                if fe.jumps >= 3 {
+                    fe.f_est = fnew;
+                    fe.jumps = 0;
+                }
+            }
+            let fnew = fe.f_est;
             self.stats.freq_hz = (fnew - self.center_hz) as f32;
             if (fnew - fe.nco_hz).abs() > 2.0 {
                 fe.nco_hz = fnew;

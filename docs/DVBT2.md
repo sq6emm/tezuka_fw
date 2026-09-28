@@ -1,4 +1,4 @@
-# DVB-T2 transmit (amateur narrow channels)
+# DVB-T2 (amateur narrow channels)
 
 trxd sends DVB-T2 (EN 302 755) the way amateur DATV uses it: the Portsdown 4
 DVB-T2 option's profile, received by the Ryde, the Knucker and the Lynx
@@ -77,10 +77,58 @@ browser H.264/Opus -> dvbs2::ts::Mux (TS at the T2 rate)
   1919 TS packets, 90 of 99 FEC blocks.
 - Analyser: flat 1.54 MHz block, sharp edges (QPSK and 16QAM).
 
+## Receiving (live, FPGA front end)
+
+trxd receives the same profile live (DATV panel, receive, a T2 rate), with
+the FPGA doing the heavy signal processing (maia-sdr `datv-ddc`:
+t2resamp.py, t2ofdm.py) and the A9 the rest (`src/dvbt2/stream.rs`,
+`fe.rs`):
+
+- FPGA: the ADC stream resampled to 131/71 MS/s; a 32-bit sample counter;
+  once trxd has given it a frame start and a frequency, an NCO, each
+  symbol's 2048-point FFT (window timed from the frame start, 64 samples
+  into the guard interval) with only the 1705 active carriers sent, and raw
+  samples only around P1 and the guard intervals; every sample raw while
+  searching. Ring words tagged (header / carrier stream).
+- A9: P1 search in the raw samples, the frequency from the guard
+  intervals, the front end scheduled a few frames ahead; then per frame the
+  P2 channel estimate, per symbol equalization (common phase and timing
+  slope from the pilots), one gather for all deinterleavers, LLRs; the
+  FPGA's LDPC decoder, BCH, the TS demultiplexer. The frequency is tracked
+  frame to frame (a jump only when three frames agree); a missed P1 six
+  times running goes back to searching.
+- The MER shown is the pilots' after the equalizer, in data-cell units.
+
+Fixes that made it work (2026-09-27): Maia's ADC input dropped the FIFO's
+valid (about 1 % of samples duplicated); the resampler needed an input
+FIFO; the RX analog filter must open to 1.3 x the channel; the FFT and its
+window labels must restart whenever no schedule runs, and a schedule that
+starts in the past must skip that frame (its symbol counters started at 0
+mid-frame); BCH after LDPC rescues most blocks the FPGA's decoder leaves a
+few bits short, and a splitting test before the Chien search keeps its cost
+at 2-3 ms a block on the A9 (it was 67).
+
+Over the air between the Libres (QPSK 1/2, 1.7 MHz, indoor, 2026-09-27):
+
+| Band | Libre 1 -> Libre 2 | Libre 2 -> Libre 1 |
+|---|---|---|
+| 437 MHz | MER up to 8 dB, some video | MER up to 3 dB |
+| 1255 MHz | Libre 2 has local interference on 23 cm | MER about 0 dB |
+| 2330 MHz | MER 12-16 dB, 90 % of FEC blocks, 596 video frames in 90 s | MER up to 6 dB |
+| 2400 MHz | WiFi | MER up to 6 dB |
+| 3405, 5760 MHz | nothing (the antennas) | nothing |
+
+With a few dB of margin every block decodes (36 a second); what is lost is
+lost to fading on the indoor path. A9: the demodulator about 70 % of a
+core, the FEC about 31 ms a block (FPGA LDPC 22 ms of it).
+
 ## Not done
 
-- A T2 receiver in trxd (the offline one is for this profile only and not
-  real time; the 3.072 MS/s stream would need the FPGA's help).
-- 64QAM/256QAM, other FFT sizes, PAPR reduction; 16QAM decoded only in
-  simulation (the indoor path gives 2-5 dB MER, 16QAM 1/2 needs about 9).
+- 64QAM/256QAM, other FFT sizes, PAPR reduction.
+- 16QAM live: decoded over the air at 2330 MHz (MER about 10 dB, video
+  shown), but its 72 FEC blocks a second are twice what the A9 and the
+  FPGA's LDPC decoder get through: about half are dropped.
+- The receiver's A9 load: equalization and LLRs could move into the FPGA,
+  and a parallel (layered) LDPC decoder would cut the 22 ms a block; the
+  deinterleavers need a frame of cells (DDR, not block RAM).
 - A check with an independent T2 receiver (TV HAT / Ryde).

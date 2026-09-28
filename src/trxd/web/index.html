@@ -304,7 +304,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <h3>MODE · FILTER · DSP</h3>
       <div class="row" id="modes">
         <button class="k" data-mode="USB">USB</button>
-        <button class="k" data-mode="CW">CW</button><button class="k" data-mode="PKTUSB">DATA</button>
+        <button class="k" data-mode="CW">CW</button><button class="k" data-mode="CWRS" title="CW through rain scatter (10 GHz and up): the rain-scatter decoder, the filter open to 200-3000 Hz so the whole Doppler spread gets in, AGC slow">CW-RS</button><button class="k" data-mode="PKTUSB">DATA</button>
         <button class="k" data-mode="AM">AM</button><button class="k" data-mode="FM">FM</button>
         <button class="k" data-mode="DATV" title="Digital TV: DVB-S2 from this browser's camera, and received pictures">DATV</button>
       </div>
@@ -336,7 +336,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       </div>
       <div class="note datv-only" id="datv-info">—</div>
       <div class="note datv-only">Both stations use the same settings. The picture adapts to the rate (160x120 at 2 fps
-        below 40 kbit/s, 320x240 at 5-10 fps above). DVB-S2, short frames, roll-off 0.35.</div>
+        below 40 kbit/s, 320x240 at 5-10 fps above). <span id="datv-note">DVB-S2, short frames, roll-off 0.35.</span></div>
     </div>
 
     <div class="card">
@@ -474,6 +474,7 @@ const FILTERS = {
   LSB: [[-3000, -100], [-2850, -150], [-2400, -300]],
   PKTUSB: [[100, 3100], [200, 2900], [500, 2500]],
   CW: [[200, 1200], [450, 950], [600, 800]],
+  CWRS: [[200, 3000], [200, 3000], [200, 3000]],
   AM: [[-5000, 5000], [-3000, 3000], [-2000, 2000]],
   FM: [[-8000, 8000], [-5000, 5000], [-3000, 3000]],
 };
@@ -614,7 +615,7 @@ function filPreset(mode, i) {
   const all = store.get("fil." + mode, null);
   return (all && all[i]) || (FILTERS[mode] || FILTERS.USB)[i];
 }
-const FIL_MAX = { CW: 2000, USB: 4000, LSB: 4000, PKTUSB: 4000, AM: 12000, FM: 20000 };
+const FIL_MAX = { CW: 3000, USB: 4000, LSB: 4000, PKTUSB: 4000, AM: 12000, FM: 20000 };
 function renderFilter(st) {
   if (!S.filIdx) S.filIdx = store.get("filidx", {});
   const i = S.filIdx[st.mode] ?? 1, def = (FILTERS[st.mode] || FILTERS.USB)[i];
@@ -721,7 +722,8 @@ function renderState() {
   $("freq-b").textContent = fmtFreq(st.active === "B" ? st.vfo_a : st.vfo_b);
   const txf = (st.split ? (st.active === "B" ? st.vfo_a : st.vfo_b) : curFreq()) + (st.xit && st.xit[0] ? st.xit[1] : 0);
   $("freq-tx").textContent = fmtFreq(txf);
-  document.querySelectorAll("#modes .k").forEach((b) => b.classList.toggle("on", b.dataset.mode === (st.datv_mode ? "DATV" : st.mode)));
+  const shown = st.datv_mode ? "DATV" : st.mode === "CW" && st.cw_engine === "rs" ? "CWRS" : st.mode;
+  document.querySelectorAll("#modes .k").forEach((b) => b.classList.toggle("on", b.dataset.mode === shown));
   document.querySelectorAll("#agcs .k").forEach((b) => b.classList.toggle("on", b.dataset.agc === st.agc));
   $("split").classList.toggle("on", st.split);
   $("cw-rs").classList.toggle("on", st.cw_engine === "rs");
@@ -1221,6 +1223,16 @@ function buildStatic() {
     const b = e.target.closest("[data-mode]"); if (!b) return;
     const m = b.dataset.mode;
     if (m === "DATV") { DATV.enter(); return; }
+    // CW-RS: CW with the rain-scatter decoder, a wide filter and slow AGC
+    // (its filter kept apart from CW's, as FIL "CWRS").
+    if (m === "CWRS") {
+      send({ cmd: "mode", mode: "CW" });
+      send({ cmd: "cw_engine", engine: "rs" });
+      send({ cmd: "agc", mode: "slow" });
+      const [lo, hi] = filPreset("CWRS", 0); send({ cmd: "filter", lo, hi });
+      return;
+    }
+    if (m === "CW" && S.st && S.st.cw_engine === "rs") send({ cmd: "cw_engine", engine: "timing" });
     send({ cmd: "mode", mode: m });   // (also leaves DATV mode)
     if (!S.filIdx) S.filIdx = store.get("filidx", {});
     const [lo, hi] = filPreset(m, S.filIdx[m] ?? 1); send({ cmd: "filter", lo, hi });
@@ -1520,6 +1532,9 @@ const DATV = (() => {
     const { sr, rate, pilots } = settings(), f = S.st ? curFreq() : 0;
     $("datv-info").textContent = `TS ${(tsRate(sr, rate, pilots) / 1000).toFixed(1)} kbit/s · ${(occupied(sr, rate) / 1000).toFixed(0)} kHz wide` +
       (f ? ` · centred on ${(f / 1e6).toFixed(3)} MHz` : "");
+    $("datv-note").textContent = T2[rate]
+      ? "DVB-T2: 2K FFT, guard 1/8, PP2 pilots, rotated constellation, 64K LDPC (the amateur Portsdown / Ryde profile); the symbol rate setting does not apply."
+      : LONG[rate] ? "DVB-S2, long frames with pilots, roll-off 0.35." : "DVB-S2, short frames, roll-off 0.35.";
   }
   function sendBin(b) { if (ws && ws.readyState === 1 && ws.bufferedAmount < 256e3) { ws.send(b); sent += b.length; return true; } return false; }
   function stamp(b, at, us) { new DataView(b.buffer).setBigInt64(at, BigInt(Math.round(us)), true); }

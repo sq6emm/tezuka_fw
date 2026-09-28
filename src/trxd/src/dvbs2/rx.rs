@@ -144,9 +144,12 @@ enum FecMode {
     Thread { tx: crossbeam_channel::Sender<Vec<f32>>, fails: std::sync::Arc<std::sync::atomic::AtomicU32> },
 }
 
+/// Time in BCH and in deframing (ns), for the FEC thread's log.
+pub static FEC_PROF_NS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 impl Fec {
     pub fn new(spec: FrameSpec) -> Self {
-        let bch = (!spec.is_short()).then(Bch::new);
+        let bch = Some(if spec.is_short() { Bch::short() } else { Bch::new() });
         Fec { spec, dec: Ldpc::for_spec(&spec), bch, bbscr: bb_scrambling(spec.kbch / 8), bits: vec![0; spec.n], partial: Vec::new(), have_prev: false }
     }
 
@@ -154,11 +157,12 @@ impl Fec {
     pub fn frame(&mut self, llr: &[f32], stats: &mut Stats, out: &mut Vec<[u8; TS_LEN]>) -> bool {
         let t0 = std::time::Instant::now();
         let ok = self.dec.decode(llr, &mut self.bits);
-        // Long frames: BCH cleans up what LDPC left (or falsely converged
-        // on); it also rescues a nearly converged frame.
+        let t_dec = std::time::Instant::now();
+        // BCH cleans up what LDPC left (or falsely converged on); it also
+        // rescues a nearly converged frame.
         let ok = match &self.bch {
             None => ok.is_some(),
-            Some(bch) => match bch.decode(&mut self.bits[..self.spec.kbch + 192]) {
+            Some(bch) => match bch.decode(&mut self.bits[..self.spec.kbch + bch.parity()]) {
                 Outcome::Clean => true,
                 Outcome::Fixed(k) => {
                     stats.bch_fixed += k as u64;
@@ -173,13 +177,18 @@ impl Fec {
             },
         };
         stats.ldpc_s += t0.elapsed().as_secs_f64();
+        use std::sync::atomic::Ordering::Relaxed;
+        FEC_PROF_NS[0].fetch_add(t_dec.elapsed().as_nanos() as u64, Relaxed);
         if !ok {
             stats.frames_bad += 1;
             stats.ldpc_fail += 1;
             self.have_prev = false;
             return false;
         }
-        self.deframe(stats, out)
+        let t_df = std::time::Instant::now();
+        let r = self.deframe(stats, out);
+        FEC_PROF_NS[1].fetch_add(t_df.elapsed().as_nanos() as u64, Relaxed);
+        r
     }
 
     /// A frame lost before decoding: the packet straddling it is gone too.
@@ -946,6 +955,7 @@ fn spawn_fec(
             let (mut ts, mut msgs) = (Vec::new(), Vec::new());
             let mut st = Stats::default();
             let mut dumped = 0usize;
+            let (mut nblk, mut dmx_ns, mut t_prof) = (0u64, 0u64, std::time::Instant::now());
             for llr in frx.iter() {
                 if llr.is_empty() {
                     fec.lost();
@@ -959,7 +969,8 @@ fn spawn_fec(
                 fec.dec.set_max_iter(match frx.len() {
                     0..=1 => 50,
                     2..=7 => 20,
-                    _ => 12,
+                    8..=19 => 12,
+                    _ => 8,
                 });
                 // Debug on a board: `touch /tmp/datv-dump` appends each
                 // frame's LLRs (f32 LE, 16200 a frame) to
@@ -977,8 +988,29 @@ fn spawn_fec(
                 } else {
                     fl.fetch_add(1, Ordering::Relaxed);
                 }
+                let t_dmx = std::time::Instant::now();
                 for pkt in ts.drain(..) {
                     dmx.push(&pkt, &mut msgs);
+                }
+                dmx_ns += t_dmx.elapsed().as_nanos() as u64;
+                nblk += 1;
+                if t_prof.elapsed() > std::time::Duration::from_secs(30) {
+                    use super::fpga_ldpc::PROF_NS;
+                    let per = nblk as f64;
+                    let ms = |a: &std::sync::atomic::AtomicU64| a.swap(0, Ordering::Relaxed) as f64 / per / 1e6;
+                    tracing::info!(
+                        llr_in_ms = format!("{:.2}", ms(&PROF_NS[0])),
+                        fpga_ms = format!("{:.2}", ms(&PROF_NS[1])),
+                        bits_out_ms = format!("{:.2}", ms(&PROF_NS[2])),
+                        bch_ms = format!("{:.2}", ms(&FEC_PROF_NS[0])),
+                        deframe_ms = format!("{:.2}", ms(&FEC_PROF_NS[1])),
+                        demux_ms = format!("{:.2}", dmx_ns as f64 / per / 1e6),
+                        blocks = nblk,
+                        "DATV FEC per block"
+                    );
+                    dmx_ns = 0;
+                    nblk = 0;
+                    t_prof = std::time::Instant::now();
                 }
                 *fs2.lock().unwrap() = st;
                 let mut s = sh.lock().unwrap();
