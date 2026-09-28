@@ -21,6 +21,10 @@ pub trait RadioControl: Send {
     fn stream_rate(&self) -> f64;
     /// Tune the RX and TX LOs together.
     fn set_lo(&mut self, hz: f64) -> Result<(), String>;
+    /// Tune them apart (cross band: the AD936x has a synthesizer each).
+    fn set_los(&mut self, rx_hz: f64, tx_hz: f64) -> Result<(), String> {
+        if rx_hz == tx_hz { self.set_lo(rx_hz) } else { Err("this radio has one LO".into()) }
+    }
     fn set_rx_gain(&mut self, mode: GainMode, db: f64) -> Result<(), String>;
     fn set_tx_attenuation(&mut self, db: f64) -> Result<(), String>;
     /// Power the TX LO (and the external PTT line) up or down. While down the

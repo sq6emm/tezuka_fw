@@ -6,6 +6,10 @@
 //! v: LLRs in, signs out), 0xFF00 control (bit 0 start, bit 1 rate 3/4,
 //! 13:8 iterations), 0xFF04 status (bit 0 busy, bit 1 converged, 13:8
 //! iterations), 0xFF08 id "LDP1".
+//!
+//! "LDP4" (maia-sdr `ldpc_dec4.py`, four checks at a time): the same, but the
+//! parity part of the RAM in banks: parity bit p = c q + r at word
+//! k / 4 + r 90 + c / 4, byte c % 4 (the info part as above).
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
@@ -17,6 +21,7 @@ use super::ldpc_fpga::{FpgaDecoder, LongRate, N, quantize_llr};
 
 const PHYS: u64 = 0x43C4_0000;
 const ID_LDP1: u32 = 0x3150_444C;
+const ID_LDP4: u32 = 0x3450_444C;
 const MAX_ITER: u32 = 50;
 /// Time in the FPGA decoder's stages (ns): LLRs in, waiting, decisions out.
 pub static PROF_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
@@ -27,6 +32,8 @@ const LLR_SCALE: f32 = 2.0;
 pub struct Window {
     _mem: File,
     ptr: *mut u32,
+    /// 1 (LDP1) or 4 (LDP4).
+    lanes: u8,
 }
 
 // SAFETY: owned by the decoding thread alone.
@@ -48,25 +55,32 @@ impl Window {
         if p == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error().to_string());
         }
-        let w = Window { _mem: mem, ptr: p.cast() };
+        let mut w = Window { _mem: mem, ptr: p.cast(), lanes: 0 };
         // A bitstream without the decoder has nothing at this address: the
         // read raises a bus error. Look from a child process first.
-        static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*PRESENT.get_or_init(|| w.probe()) {
+        static LANES: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let lanes = *LANES.get_or_init(|| w.probe());
+        if lanes == 0 {
             return Err("no LDPC decoder in this bitstream".into());
         }
+        w.lanes = lanes;
         Ok(w)
     }
-    fn probe(&self) -> bool {
+    /// The decoder's lanes (0: none there).
+    fn probe(&self) -> u8 {
         // SAFETY: the child only reads the mapping and _exits (both
         // async-signal-safe); the parent waits for it.
         unsafe {
             match libc::fork() {
-                0 => libc::_exit(if self.rd(0xFF08) == ID_LDP1 { 0 } else { 1 }),
-                -1 => false,
+                0 => libc::_exit(match self.rd(0xFF08) {
+                    ID_LDP1 => 1,
+                    ID_LDP4 => 4,
+                    _ => 0,
+                }),
+                -1 => 0,
                 pid => {
                     let mut st = 0;
-                    libc::waitpid(pid, &mut st, 0) == pid && libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0
+                    if libc::waitpid(pid, &mut st, 0) == pid && libc::WIFEXITED(st) { libc::WEXITSTATUS(st) as u8 } else { 0 }
                 }
             }
         }
@@ -102,6 +116,19 @@ impl Drop for Window {
     }
 }
 
+/// The four-lane decoder's parity layout: for each parity byte of its RAM
+/// (word k / 4 + r 90 + c / 4, byte c % 4), the parity bit c q + r.
+pub fn parity_layout(rate: LongRate) -> Vec<u32> {
+    let q = rate.q();
+    let mut perm = vec![0u32; N - rate.k()];
+    for (i, v) in perm.iter_mut().enumerate() {
+        let (w, byte) = (i / 4, i % 4);
+        let (r, c) = (w / 90, 4 * (w % 90) + byte);
+        *v = (c * q + r) as u32;
+    }
+    perm
+}
+
 /// Is the FPGA decoder there?
 pub fn available() -> bool {
     Window::open().is_ok()
@@ -111,7 +138,9 @@ pub enum Ldpc {
     Short(Decoder),
     Model(FpgaDecoder),
     /// `need`: decisions read back (the BCH codeword's Kbch + 192 bits).
-    Fpga { win: Window, rate: LongRate, q: Vec<u32>, max_iter: u32, need: usize },
+    /// `perm` (four-lane decoder): for each parity byte of the RAM in
+    /// order, its parity bit.
+    Fpga { win: Window, rate: LongRate, q: Vec<u32>, max_iter: u32, need: usize, perm: Vec<u32> },
 }
 
 impl Ldpc {
@@ -122,8 +151,9 @@ impl Ldpc {
         let rate = spec.long_rate.expect("a long-frame rate");
         match Window::open() {
             Ok(win) => {
-                tracing::info!(?rate, "LDPC: the FPGA decoder");
-                Ldpc::Fpga { win, rate, q: vec![0; N / 4], max_iter: MAX_ITER, need: (spec.kbch + 192).min(N) }
+                tracing::info!(?rate, lanes = win.lanes, "LDPC: the FPGA decoder");
+                let perm = if win.lanes == 4 { parity_layout(rate) } else { Vec::new() };
+                Ldpc::Fpga { win, rate, q: vec![0; N / 4], max_iter: MAX_ITER, need: (spec.kbch + 192).min(N), perm }
             }
             Err(e) => {
                 tracing::info!(?rate, "LDPC: FPGA decoder unavailable ({e}); its model in software");
@@ -150,13 +180,25 @@ impl Ldpc {
                 let q: Vec<i8> = llr.iter().map(|&l| quantize_llr(l, LLR_SCALE)).collect();
                 d.decode(&q, bits)
             }
-            Ldpc::Fpga { win, rate, q, max_iter, need } => {
+            Ldpc::Fpga { win, rate, q, max_iter, need, perm } => {
                 let t_q = std::time::Instant::now();
                 // Four 6-bit LLRs a word, then one bulk copy into the
                 // window (word writes one at a time cost 10 ms a frame).
-                for (w, c) in q.iter_mut().zip(llr.chunks_exact(4)) {
-                    let b = |l: f32| quantize_llr(l, LLR_SCALE) as u8 as u32;
-                    *w = b(c[0]) | b(c[1]) << 8 | b(c[2]) << 16 | b(c[3]) << 24;
+                let b = |l: f32| quantize_llr(l, LLR_SCALE) as u8 as u32;
+                if perm.is_empty() {
+                    for (w, c) in q.iter_mut().zip(llr.chunks_exact(4)) {
+                        *w = b(c[0]) | b(c[1]) << 8 | b(c[2]) << 16 | b(c[3]) << 24;
+                    }
+                } else {
+                    let k = rate.k();
+                    for (w, c) in q[..k / 4].iter_mut().zip(llr[..k].chunks_exact(4)) {
+                        *w = b(c[0]) | b(c[1]) << 8 | b(c[2]) << 16 | b(c[3]) << 24;
+                    }
+                    let par = &llr[k..];
+                    for (w, p) in q[k / 4..].iter_mut().zip(perm.chunks_exact(4)) {
+                        let v = |i: usize| b(par[p[i] as usize]);
+                        *w = v(0) | v(1) << 8 | v(2) << 16 | v(3) << 24;
+                    }
                 }
                 win.write_words(0, q);
                 let t_in = std::time::Instant::now();
@@ -187,6 +229,20 @@ impl Ldpc {
                 PROF_NS[2].fetch_add(t_out.elapsed().as_nanos() as u64, Relaxed);
                 ((st >> 1) & 1 == 1).then_some(((st >> 8) & 0x3F) as usize)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parity_layout_is_a_permutation() {
+        for rate in [LongRate::R1_2, LongRate::R3_4] {
+            let mut p = parity_layout(rate);
+            p.sort_unstable();
+            assert!(p.iter().enumerate().all(|(i, &v)| v as usize == i), "{rate:?}");
         }
     }
 }

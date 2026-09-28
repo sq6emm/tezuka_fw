@@ -29,7 +29,32 @@ const DATV_BIT: u32 = 1 << 1;
 const RAW_BIT: u32 = 1 << 2;
 /// With RAW_BIT: 8-bit I/Q pairs, four a DMA word (half the traffic).
 const RAW8_BIT: u32 = 1 << 3;
+/// With RAW_BIT (16-bit words): the DVB-T2 transmit IFFT in front of the
+/// interpolator (maia-hdl t2ifft.py): the words are, per T2 frame, a sync
+/// word, P1's samples and each symbol's carriers.
+const IFFT_BIT: u32 = 1 << 4;
 const ID_DTX1: u32 = 0x3158_5444;
+/// The same transmitter with the DVB-T2 IFFT in front of it.
+const ID_DTX2: u32 = 0x3258_5444;
+
+fn tx_id(id: u32) -> bool {
+    id == ID_DTX1 || id == ID_DTX2
+}
+
+/// The bitstream does the DVB-T2 transmit IFFT (see [`RawMode::T2Ifft`]).
+pub fn has_t2ifft() -> bool {
+    let Ok(mem) = open_mem() else { return false };
+    Mapping::new(&mem, 4096, DATV_TX_PHYS).is_ok_and(|r| r.rd32(0xC) == ID_DTX2)
+}
+
+/// What the raw DMA words are.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RawMode {
+    /// 8-bit I/Q samples, four a word.
+    Samples8,
+    /// DVB-T2 frames for the FPGA's IFFT: 16-bit I/Q, two a word.
+    T2Ifft,
+}
 pub const FS_DAC: f64 = 3_072_000.0;
 const SPAN: usize = 16;
 const PHASES_LOG2: u32 = 8;
@@ -141,7 +166,7 @@ fn open_mem() -> Result<File, String> {
 /// Does the bitstream have the DATV transmitter?
 pub fn available() -> bool {
     let Ok(mem) = open_mem() else { return false };
-    Mapping::new(&mem, 4096, DATV_TX_PHYS).is_ok_and(|r| r.rd32(0xC) == ID_DTX1)
+    Mapping::new(&mem, 4096, DATV_TX_PHYS).is_ok_and(|r| tx_id(r.rd32(0xC)))
 }
 
 /// The RRC table for the interpolator (as `rrc_table` in arb_interp.py):
@@ -233,7 +258,7 @@ impl Transmitter {
     pub fn start(mode: LongMode, sr: f64, rolloff: f64) -> Result<Transmitter, String> {
         let mem = open_mem()?;
         let regs = Mapping::new(&mem, 4096, DATV_TX_PHYS).map_err(|e| format!("map datv_tx: {e}"))?;
-        if regs.rd32(0xC) != ID_DTX1 {
+        if !tx_id(regs.rd32(0xC)) {
             return Err("this bitstream has no DATV transmitter".into());
         }
         let ad9361 = Mapping::new(&mem, 0x1_0000, AD9361_PHYS).map_err(|e| format!("map axi_ad9361: {e}"))?;
@@ -266,13 +291,13 @@ pub struct RawTransmitter {
 }
 
 impl RawTransmitter {
-    pub fn start(fs_in: f64, eight: bool) -> Result<RawTransmitter, String> {
+    pub fn start(fs_in: f64, mode: RawMode) -> Result<RawTransmitter, String> {
         if fs_in >= FS_DAC {
             return Err(format!("{fs_in} S/s is not below the DAC rate"));
         }
         let mem = open_mem()?;
         let regs = Mapping::new(&mem, 4096, DATV_TX_PHYS).map_err(|e| format!("map datv_tx: {e}"))?;
-        if regs.rd32(0xC) != ID_DTX1 {
+        if !tx_id(regs.rd32(0xC)) {
             return Err("this bitstream has no DATV transmitter".into());
         }
         let ad9361 = Mapping::new(&mem, 0x1_0000, AD9361_PHYS).map_err(|e| format!("map axi_ad9361: {e}"))?;
@@ -282,8 +307,8 @@ impl RawTransmitter {
         }
         regs.wr32(0x0, step(fs_in));
         let g = ad9361.rd32(DAC_GPIO_OUT);
-        let bits = DATV_BIT | RAW_BIT | if eight { RAW8_BIT } else { 0 };
-        ad9361.wr32(DAC_GPIO_OUT, (g & !RAW8_BIT) | bits);
+        let bits = DATV_BIT | RAW_BIT | if mode == RawMode::Samples8 { RAW8_BIT } else { IFFT_BIT };
+        ad9361.wr32(DAC_GPIO_OUT, (g & !(RAW8_BIT | IFFT_BIT)) | bits);
         Ok(RawTransmitter { _mem: mem, ad9361 })
     }
 }
@@ -291,7 +316,7 @@ impl RawTransmitter {
 impl Drop for RawTransmitter {
     fn drop(&mut self) {
         let g = self.ad9361.rd32(DAC_GPIO_OUT);
-        self.ad9361.wr32(DAC_GPIO_OUT, g & !(DATV_BIT | RAW_BIT | RAW8_BIT));
+        self.ad9361.wr32(DAC_GPIO_OUT, g & !(DATV_BIT | RAW_BIT | RAW8_BIT | IFFT_BIT));
     }
 }
 

@@ -199,6 +199,150 @@ impl Ofdm {
         });
     }
 
+    /// Symbol `j`'s 1705 carriers (data cells and pilots), before the IFFT.
+    fn carriers(&self, syms: &[Vec<Cell>], j: usize, out: &mut [Complex32]) {
+        let (_, n_fc, _) = self.p.data_cells();
+        let n = self.p.symbols();
+        let (map, boost): (&[Carrier], f32) = if j < N_P2 {
+            (&self.p2_map, self.p2)
+        } else if n_fc != 0 && j == n - 1 {
+            (&self.fc_map, self.sp)
+        } else {
+            (&self.data_maps[j], self.sp)
+        };
+        let mut it = syms[j].iter();
+        for ((k, &c), o) in map.iter().enumerate().zip(out.iter_mut()) {
+            let bit = self.prbs[k] ^ self.pn[j];
+            let pilot = |a: f32| Complex32::new(if bit == 0 { a } else { -a }, 0.0);
+            *o = match c {
+                Carrier::Data => self.pal.get(*it.next().expect("too few cells")),
+                Carrier::Scattered | Carrier::P2Pilot => pilot(boost),
+                Carrier::Continual => pilot(self.cp),
+                Carrier::Reserved => Complex32::default(),
+            };
+        }
+        assert!(it.next().is_none(), "symbol {j}: too many cells");
+    }
+
+    /// One T2 frame for the FPGA's transmit IFFT (maia-hdl t2ifft.py), as
+    /// the DMA's 16-bit I/Q words (I low, little-endian): the sync word, P1
+    /// (samples x `scale` x 256, as the 8-bit samples of [`Self::frame`]
+    /// times `scale` became in the FPGA), then each symbol's carriers in its
+    /// bin order (bins 0..852: carriers 852..1704; bins 1196..2047: carriers
+    /// 0..851) scaled so that the FPGA's sum(bins) / 8 gives the same
+    /// samples. 2K without oversampling only.
+    pub fn frame_fpga(&self, syms: &[Vec<Cell>], scale: f32, out: &mut Vec<u8>) {
+        assert_eq!(self.n, FFT, "the FPGA's IFFT is 2K at the elementary rate");
+        let n = self.p.symbols();
+        assert_eq!(syms.len(), n);
+        let word = |re: f32, im: f32| -> [u8; 4] {
+            let q = |v: f32| (v + if v >= 0.0 { 0.5 } else { -0.5 }).clamp(-32767.0, 32767.0) as i16;
+            let (a, b) = (q(re).to_le_bytes(), q(im).to_le_bytes());
+            [a[0], a[1], b[0], b[1]]
+        };
+        // sync: I = 0x7FFF, Q = -0x7FFF
+        out.extend_from_slice(&word(32767.0, -32767.0));
+        let g1 = scale * 256.0;
+        for z in &self.p1 {
+            out.extend_from_slice(&word(z.re * g1, z.im * g1));
+        }
+        // The words, scaled once: every cell code, and the pilots' values
+        // (a table lookup a carrier instead of a multiply and two roundings:
+        // this took 90 ms a frame on the A9).
+        let g = self.norm * scale * 2048.0;
+        let data: Vec<[u8; 4]> = self.pal.0.iter().map(|z| word(z.re * g, z.im * g)).collect();
+        let pil = |a: f32| [word(a * g, 0.0), word(-a * g, 0.0)];
+        let (p2, sp, cp) = (pil(self.p2), pil(self.sp), pil(self.cp));
+        let zero = word(0.0, 0.0);
+        let (_, n_fc, _) = self.p.data_cells();
+        let mut sym = vec![[0u8; 4]; C_PS];
+        let low = C_PS / 2; // 852: bins 0..852 hold carriers 852..1704
+        let start = out.len();
+        out.resize(start + n * C_PS * 4, 0);
+        let mut at = start;
+        for j in 0..n {
+            let (map, boost) = if j < N_P2 {
+                (&self.p2_map, &p2)
+            } else if n_fc != 0 && j == n - 1 {
+                (&self.fc_map, &sp)
+            } else {
+                (&self.data_maps[j], &sp)
+            };
+            let mut it = syms[j].iter();
+            for (k, (&c, w)) in map.iter().zip(sym.iter_mut()).enumerate() {
+                let neg = (self.prbs[k] ^ self.pn[j]) as usize;
+                *w = match c {
+                    Carrier::Data => data[*it.next().expect("too few cells") as usize],
+                    Carrier::Scattered | Carrier::P2Pilot => boost[neg],
+                    Carrier::Continual => cp[neg],
+                    Carrier::Reserved => zero,
+                };
+            }
+            assert!(it.next().is_none(), "symbol {j}: too many cells");
+            for w in sym[low..].iter().chain(&sym[..low]) {
+                out[at..at + 4].copy_from_slice(w);
+                at += 4;
+            }
+        }
+    }
+
+    /// [`Self::frame_fpga`]'s carrier order for any cell type: every
+    /// symbol's 1705 carriers in bin order, data from `syms`, pilots as
+    /// `pilot(kind, negative)` (kind 0: P2, 1: scattered, 2: continual),
+    /// reserved carriers `zero`.
+    pub fn fpga_slots<T: Copy>(&self, syms: &[Vec<T>], pilot: &dyn Fn(usize, usize) -> T, zero: T) -> Vec<T> {
+        let n = self.p.symbols();
+        assert_eq!(syms.len(), n);
+        let (_, n_fc, _) = self.p.data_cells();
+        let low = C_PS / 2;
+        let mut out = Vec::with_capacity(n * C_PS);
+        let mut sym = vec![zero; C_PS];
+        for j in 0..n {
+            let (map, boost) = if j < N_P2 {
+                (&self.p2_map, 0)
+            } else if n_fc != 0 && j == n - 1 {
+                (&self.fc_map, 1)
+            } else {
+                (&self.data_maps[j], 1)
+            };
+            let mut it = syms[j].iter();
+            for (k, (&c, w)) in map.iter().zip(sym.iter_mut()).enumerate() {
+                let neg = (self.prbs[k] ^ self.pn[j]) as usize;
+                *w = match c {
+                    Carrier::Data => *it.next().expect("too few cells"),
+                    Carrier::Scattered | Carrier::P2Pilot => pilot(boost, neg),
+                    Carrier::Continual => pilot(2, neg),
+                    Carrier::Reserved => zero,
+                };
+            }
+            assert!(it.next().is_none(), "symbol {j}: too many cells");
+            out.extend_from_slice(&sym[low..]);
+            out.extend_from_slice(&sym[..low]);
+        }
+        out
+    }
+
+    /// The DMA words [`Self::frame_fpga`] sends: sync, P1 at `scale`, and
+    /// per code (the palette's, then 263 + 2 kind + negative for pilots,
+    /// as [`Self::fpga_slots`]) its carrier word.
+    pub fn fpga_words(&self, scale: f32) -> (Vec<[u8; 4]>, Vec<[u8; 4]>) {
+        let word = |re: f32, im: f32| -> [u8; 4] {
+            let q = |v: f32| (v + if v >= 0.0 { 0.5 } else { -0.5 }).clamp(-32767.0, 32767.0) as i16;
+            let (a, b) = (q(re).to_le_bytes(), q(im).to_le_bytes());
+            [a[0], a[1], b[0], b[1]]
+        };
+        let mut head = vec![word(32767.0, -32767.0)];
+        let g1 = scale * 256.0;
+        head.extend(self.p1.iter().map(|z| word(z.re * g1, z.im * g1)));
+        let g = self.norm * scale * 2048.0;
+        let mut words: Vec<[u8; 4]> = self.pal.0.iter().map(|z| word(z.re * g, z.im * g)).collect();
+        for a in [self.p2, self.sp, self.cp] {
+            words.push(word(a * g, 0.0));
+            words.push(word(-a * g, 0.0));
+        }
+        (head, words)
+    }
+
     /// Symbols `from..` into `out` (guard interval, then the symbol).
     fn symbols(&self, syms: &[Vec<Cell>], from: usize, out: &mut [Complex32]) {
         let (_, n_fc, _) = self.p.data_cells();

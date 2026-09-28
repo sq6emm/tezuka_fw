@@ -305,3 +305,22 @@ Over the air (Libre 2 -> Libre 1, Libre 1 on Auto): 33, 66, 125, 250, 333
 and 500 kS/s, QPSK 1/2, QPSK 3/4 and 8PSK 3/4 all found and locked, about
 10-20 s after the transmitter started (a scan cycle is about 5 s); a
 change from 250 kS/s QPSK 1/2 to 125 kS/s QPSK 3/4 followed by itself.
+
+## Four-lane LDPC decoder (2026-09-28)
+
+`maia-hdl/maia_hdl/ldpc_dec4.py` (id "LDP4", `ldpc_axi.py --lanes 4`):
+the serial decoder's schedule and arithmetic, four checks of a group at a
+time. Checks of a group share no variable (apart from pairs k, k + d:
+d >= 11, except one group of rate 3/4 with d = 2, which runs two at a time;
+batches that far apart wait for each other), so the result is the same,
+bit for bit (the model's vectors, `test_ldpc_dec4.py`, all three cases).
+Four consecutive checks read four consecutive positions of a table row
+(info) or four consecutive columns of the parity seen as q rows of 360:
+one byte from each of four banks, rotated. The CPU's window is unchanged
+for the info bits; the parity LLRs go in the banks' order (trxd
+`fpga_ldpc::parity_layout`, chosen by the id). Rate 1/2: about 66 000
+cycles an iteration (0.66 ms at 100 MHz) against 250 000; the same block
+RAM (4 posterior banks 16200 x 8, 4 state banks 8100 x 30). The first
+build missed 100 MHz by 0.1 ns on four decoder paths (ROM -> address ->
+RAM, pass 1 -> result FIFO, pass 2 -> unsat, pass 2 -> rotated write):
+each has a register now.

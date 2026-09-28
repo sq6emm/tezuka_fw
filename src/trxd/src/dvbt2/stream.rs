@@ -112,6 +112,11 @@ pub struct Demod {
     /// This frame's derotation (rad a sample) and channel inverse.
     w: f64,
     hinv: Vec<Complex32>,
+    /// hinv with the early window's rotation (for raw carriers).
+    hinv_e: Vec<Complex32>,
+    /// hinv_e x CELL_SCALE in fixed point (2^g_shift), for equalize_int.
+    g_int: Vec<[i32; 2]>,
+    g_shift: u32,
     /// Guard-interval correlation of the previous frame's data symbols.
     cp_prev: Complex32,
     cp_acc: Complex32,
@@ -132,6 +137,8 @@ pub struct Demod {
     /// the equalizer, to see the channel estimate age through a frame.
     pub sym_err: Option<Vec<(f64, f64)>>,
     sym_err_frame: Vec<(f64, f64)>,
+    /// Debug (T2SYMERR): pilot error and count by carrier (64-carrier buckets).
+    pub car_err: Option<Vec<(f64, f64)>>,
     /// This frame's pilot error and count (the MER shown).
     pil_err: (f64, f64),
 }
@@ -223,6 +230,9 @@ impl Demod {
             misses: 0,
             w: 0.0,
             hinv: vec![Complex32::default(); CARRIERS],
+            hinv_e: vec![Complex32::default(); CARRIERS],
+            g_int: vec![[0; 2]; CARRIERS],
+            g_shift: 16,
             cp_prev: Complex32::default(),
             cp_acc: Complex32::default(),
             work: vec![Complex32::default(); FFT],
@@ -235,6 +245,7 @@ impl Demod {
             constellation_seq: 0,
             prof: [0.0; 6],
             sym_err: std::env::var_os("T2SYMERR").map(|_| vec![(0.0, 0.0); 256]),
+            car_err: std::env::var_os("T2SYMERR").map(|_| vec![(0.0, 0.0); CARRIERS / 64 + 1]),
             sym_err_frame: vec![(0.0, 0.0); 256],
             pil_err: (0.0, 0.0),
         }
@@ -439,6 +450,19 @@ impl Demod {
         for (hi, &v) in self.hinv.iter_mut().zip(&h) {
             *hi = if v.norm_sqr() > 0.0 { v.inv() } else { Complex32::default() };
         }
+        for ((he, &hi), &e) in self.hinv_e.iter_mut().zip(&self.hinv).zip(&self.early_rot) {
+            *he = hi * e;
+        }
+        // Fixed point for equalize_int: the mean gain at about 2^12, a
+        // component at most 2^14 (a deep fade's carriers get less gain than
+        // their inverse: they carry more noise than signal anyway).
+        let mean = self.hinv_e.iter().map(|z| z.norm()).sum::<f32>() / CARRIERS as f32 * CELL_SCALE;
+        let s = if mean > 0.0 { (4096.0 / mean).log2().floor().clamp(2.0, 30.0) as u32 } else { 16 };
+        self.g_shift = s;
+        let m = 2f32.powi(s as i32) * CELL_SCALE;
+        for (g, &h) in self.g_int.iter_mut().zip(&self.hinv_e) {
+            *g = [(h.re * m).round().clamp(-16383.0, 16383.0) as i32, (h.im * m).round().clamp(-16383.0, 16383.0) as i32];
+        }
         for j in 0..N_P2 {
             self.equalize(j, j);
         }
@@ -459,9 +483,83 @@ impl Demod {
     /// common phase and phase slope across the carriers (timing drifting
     /// against the P2 symbols) from its pilots, into `flat`.
     fn equalize(&mut self, j: usize, slot: usize) {
-        let cj = &self.carriers[slot * CARRIERS..(slot + 1) * CARRIERS];
-        let hinv = &self.hinv;
-        let z: Vec<(usize, Complex32)> = self.pilots[j].iter().map(|&(k, r)| (k, cj[k] * hinv[k] * r.conj())).collect();
+        let cj = std::mem::take(&mut self.carriers);
+        self.equalize_from(j, &cj[slot * CARRIERS..(slot + 1) * CARRIERS]);
+        self.carriers = cj;
+    }
+
+    /// [`Self::equalize`] from the carriers `cj` (with the early window's
+    /// rotation undone).
+    fn equalize_from(&mut self, j: usize, cj: &[Complex32]) {
+        let hinv = std::mem::take(&mut self.hinv);
+        let (fine, mut coarse) = self.eq_phase(j, |k| cj[k] * hinv[k]);
+        for co in coarse.iter_mut() {
+            *co *= CELL_SCALE;
+        }
+        let (lo, hi) = (self.data_at[j], self.data_at[j + 1]);
+        let out = &mut self.flat[lo..hi];
+        let dest = &self.scatter[lo..hi];
+        let cells = &mut self.cells;
+        for ((o, &d), &k) in out.iter_mut().zip(dest).zip(&self.data[j]) {
+            let v = cj[k] * hinv[k] * (coarse[k >> 6] * fine[k & 63]);
+            let c = [q8f(v.re), q8f(v.im)];
+            // FEC block cells straight to their place (stores miss the
+            // caches more cheaply than a gather's loads); the rest (L1,
+            // dummy cells) in `flat`.
+            if d != u32::MAX {
+                cells[d as usize] = c;
+            } else {
+                *o = c;
+            }
+        }
+        self.hinv = hinv;
+    }
+
+    /// [`Self::equalize`] for the front end's words (as they come: the
+    /// early window's rotation is in `hinv_e`), the data cells in fixed
+    /// point: the A9's VFP took about 150 ns a cell for the three complex
+    /// multiplies, its integer multipliers (32 x 32 -> 64 bits) far less.
+    fn equalize_int(&mut self, j: usize, cj: &[[i16; 2]]) {
+        let hinv_e = std::mem::take(&mut self.hinv_e);
+        let cf = |k: usize| Complex32::new(cj[k][0] as f32, cj[k][1] as f32);
+        let (fine, coarse) = self.eq_phase(j, |k| cf(k) * hinv_e[k]);
+        self.hinv_e = hinv_e;
+        // e^(-j (a + slope k)) in Q14
+        let q14 = |z: Complex32| [(z.re * 16384.0).round() as i32, (z.im * 16384.0).round() as i32];
+        let fine: Vec<[i32; 2]> = fine.iter().map(|&z| q14(z)).collect();
+        let coarse: Vec<[i32; 2]> = coarse.iter().map(|&z| q14(z)).collect();
+        let g = &self.g_int;
+        // g is in 2^g_shift units; gain times ramp to 2^16 units (a 32-bit
+        // shift), so the last shift is a constant one (a variable 64-bit
+        // shift is a handful of instructions and branches on the A9)
+        let gs = self.g_shift - 2;
+        let q = |x: i64| ((x + (1 << 15)) >> 16).clamp(-127, 127) as i8;
+        let (lo, hi) = (self.data_at[j], self.data_at[j + 1]);
+        let out = &mut self.flat[lo..hi];
+        let dest = &self.scatter[lo..hi];
+        let cells = &mut self.cells;
+        for ((o, &d), &k) in out.iter_mut().zip(dest).zip(&self.data[j]) {
+            let (f, c) = (fine[k & 63], coarse[k >> 6]);
+            // ramp (Q14), gain times ramp (gain's format), times the carrier
+            let r = [(f[0] * c[0] - f[1] * c[1]) >> 14, (f[0] * c[1] + f[1] * c[0]) >> 14];
+            let gk = g[k];
+            let gr = [(gk[0] * r[0] - gk[1] * r[1]) >> gs, (gk[0] * r[1] + gk[1] * r[0]) >> gs];
+            let (x, y) = (cj[k][0] as i64, cj[k][1] as i64);
+            let (a, b) = (gr[0] as i64, gr[1] as i64);
+            let c = [q(x * a - y * b), q(x * b + y * a)];
+            if d != u32::MAX {
+                cells[d as usize] = c;
+            } else {
+                *o = c;
+            }
+        }
+    }
+
+    /// Symbol `j`'s common phase and phase slope from its pilots (`zc(k)`:
+    /// carrier k times the channel inverse), the pilot error for the MER:
+    /// e^(-j (a + slope k)) as fine[k % 64] coarse[k / 64].
+    fn eq_phase(&mut self, j: usize, zc: impl Fn(usize) -> Complex32) -> ([Complex32; 64], [Complex32; CARRIERS / 64 + 1]) {
+        let z: Vec<(usize, Complex32)> = self.pilots[j].iter().map(|&(k, r)| (k, zc(k) * r.conj())).collect();
         // Slope from neighbouring pilots at the commonest spacing.
         let mut hist = [0u32; 32];
         for w2 in z.windows(2) {
@@ -478,57 +576,50 @@ impl Demod {
             }
         }
         let slope = if ds.norm() > 0.0 { ds.arg() / dk as f32 } else { 0.0 };
+        // e^(-j slope k) = coarse[k / 64] fine[k % 64]: independent
+        // multiplies (a running product was a chain of 1705 dependent ones,
+        // twice a symbol).
         let step = Complex32::from_polar(1.0, -slope);
+        let mut fine = [Complex32::new(1.0, 0.0); 64];
+        for m in 1..64 {
+            fine[m] = fine[m - 1] * step;
+        }
+        let step64 = fine[63] * step;
+        let mut coarse = [Complex32::new(1.0, 0.0); CARRIERS / 64 + 1];
+        for n in 1..coarse.len() {
+            coarse[n] = coarse[n - 1] * step64;
+        }
+        let ramp = |k: usize| coarse[k >> 6] * fine[k & 63];
         let mut c = Complex32::default();
-        let (mut r, mut kk) = (Complex32::new(1.0, 0.0), 0usize);
         for &(k, v) in &z {
-            while kk < k {
-                r *= step;
-                kk += 1;
-            }
-            c += v * r;
+            c += v * ramp(k);
         }
         let a = if c.norm() > 0.0 { c.arg() } else { 0.0 };
-        {
-            // Pilot error after the equalizer (the display's MER; per symbol
-            // index too when debugging).
-            let rot = Complex32::from_polar(1.0, -a);
-            let (mut e, mut n) = (0f64, 0f64);
-            for (&(k, v), &(_, rf)) in z.iter().zip(&self.pilots[j]) {
-                let vn = v / rf.norm_sqr() * Complex32::from_polar(1.0, -slope * k as f32) * rot;
-                // in data-cell units (unit power): the pilot's own boost out
-                e += ((vn - Complex32::new(1.0, 0.0)).norm_sqr() * rf.norm_sqr()) as f64;
-                n += 1.0;
-            }
-            self.pil_err.0 += e;
-            self.pil_err.1 += n;
-            if self.sym_err.is_some() {
-                self.sym_err_frame[j].0 += e;
-                self.sym_err_frame[j].1 += n;
+        let rot = Complex32::from_polar(1.0, -a);
+        // Pilot error after the equalizer (the display's MER; per symbol
+        // index too when debugging).
+        let (mut e, mut n) = (0f64, 0f64);
+        for (&(k, v), &(_, rf)) in z.iter().zip(&self.pilots[j]) {
+            let vn = v / rf.norm_sqr() * ramp(k) * rot;
+            // in data-cell units (unit power): the pilot's own boost out
+            let ek = ((vn - Complex32::new(1.0, 0.0)).norm_sqr() * rf.norm_sqr()) as f64;
+            e += ek;
+            n += 1.0;
+            if let Some(ce) = self.car_err.as_mut() {
+                ce[k >> 6].0 += ek;
+                ce[k >> 6].1 += 1.0;
             }
         }
-        let (mut r, mut kk) = (Complex32::from_polar(CELL_SCALE, -a), 0usize);
-        let q = q8;
-        let (lo, hi) = (self.data_at[j], self.data_at[j + 1]);
-        let out = &mut self.flat[lo..hi];
-        let dest = &self.scatter[lo..hi];
-        let cells = &mut self.cells;
-        for ((o, &d), &k) in out.iter_mut().zip(dest).zip(&self.data[j]) {
-            while kk < k {
-                r *= step;
-                kk += 1;
-            }
-            let v = cj[k] * hinv[k] * r;
-            let c = [q(v.re), q(v.im)];
-            // FEC block cells straight to their place (stores miss the
-            // caches more cheaply than a gather's loads); the rest (L1,
-            // dummy cells) in `flat`.
-            if d != u32::MAX {
-                cells[d as usize] = c;
-            } else {
-                *o = c;
-            }
+        self.pil_err.0 += e;
+        self.pil_err.1 += n;
+        if self.sym_err.is_some() {
+            self.sym_err_frame[j].0 += e;
+            self.sym_err_frame[j].1 += n;
         }
+        for co in coarse.iter_mut() {
+            *co *= rot;
+        }
+        (fine, coarse)
     }
 
     /// The frame's cells are all in: MER, FEC blocks' LLRs.
@@ -705,7 +796,7 @@ struct FeState {
     /// The FFT coming in: (symbol, frame start), carriers so far.
     car: Option<(usize, u64)>,
     car_pos: usize,
-    car_buf: Vec<Complex32>,
+    car_buf: Vec<[i16; 2]>,
     /// The frame being assembled: its start, the next symbol expected,
     /// whether all came.
     frame: Option<(u64, usize, bool)>,
@@ -737,7 +828,7 @@ impl Demod {
                 runs: Default::default(),
                 car: None,
                 car_pos: 0,
-                car_buf: vec![Complex32::default(); CARRIERS],
+                car_buf: vec![[0; 2]; CARRIERS],
                 frame: None,
                 f_est: 0.0,
                 nco_hz: 0.0,
@@ -750,7 +841,55 @@ impl Demod {
         });
         let t_in = std::time::Instant::now();
         let mut acq: Vec<Complex32> = Vec::new();
-        for &w in words {
+        let mut i = 0;
+        while i < words.len() {
+            let w = words[i];
+            i += 1;
+            // Fast paths (most words): a run of carrier words into the FFT
+            // buffer, a run of raw samples onto the current run (header bit
+            // 0 clear; bit 16 marks carriers; a gap word has bit 0 set).
+            if w & 0x0001_0001 == 0x0001_0000 && fe.car.is_some() && fe.car_pos < CARRIERS {
+                let run = &words[i - 1..(i - 1 + CARRIERS - fe.car_pos).min(words.len())];
+                let n = run.iter().position(|&x| x & 0x0001_0001 != 0x0001_0000).unwrap_or(run.len());
+                let order = &self.order[fe.car_pos..fe.car_pos + n];
+                for (&x, &k) in run[..n].iter().zip(order) {
+                    fe.car_buf[k] = [(x as u16 & 0xFFFE) as i16, ((x >> 16) as u16 & 0xFFFE) as i16];
+                }
+                fe.car_pos += n;
+                i += n - 1;
+                if fe.car_pos == CARRIERS {
+                    let (j, f) = fe.car.take().unwrap();
+                    if !fe.acquiring {
+                        self.fe_symbol(&mut fe, j, f, out, ctl);
+                    }
+                }
+                continue;
+            }
+            if w & 0x0001_0001 == 0 && !fe.acquiring && fe.raw_next.is_some() && !fe.runs.is_empty() {
+                let run = &words[i - 1..];
+                let n = run.iter().position(|&x| x & 0x0001_0001 != 0).unwrap_or(run.len());
+                let r = fe.runs.back_mut().unwrap();
+                r.1.extend(run[..n].iter().map(|&x| {
+                    let v = [(x as u16 & 0xFFFE) as i16, ((x >> 16) as u16 & 0xFFFE) as i16];
+                    Complex32::new(v[0] as f32, v[1] as f32) * (1.0 / 32768.0)
+                }));
+                // A long run (every sample raw: before the schedule took):
+                // only its end can matter.
+                if r.1.len() > 3 * self.p.frame_samples() {
+                    let cut = r.1.len() - 2 * self.p.frame_samples();
+                    r.1.drain(..cut);
+                    r.0 += cut as u64;
+                }
+                let c = fe.raw_next.unwrap() + n as u64;
+                fe.raw_next = Some(c);
+                fe.now = c;
+                fe.run_len += n;
+                if fe.run_len > 3 * (P1_LEN + 512) {
+                    fe.raw_all_asked = false;
+                }
+                i += n - 1;
+                continue;
+            }
             match decode(w) {
                 Word::Gap => {
                     // Words lost: nothing continues across it.
@@ -825,7 +964,7 @@ impl Demod {
                     if fe.car.is_none() || fe.car_pos >= CARRIERS {
                         continue;
                     }
-                    fe.car_buf[self.order[fe.car_pos]] = Complex32::new(v[0] as f32, v[1] as f32);
+                    fe.car_buf[self.order[fe.car_pos]] = v;
                     fe.car_pos += 1;
                     if fe.car_pos == CARRIERS {
                         let (j, f) = fe.car.take().unwrap();
@@ -925,18 +1064,20 @@ impl Demod {
         if !ok {
             return;
         }
-        let t0 = std::time::Instant::now();
-        let slot = if j < N_P2 { j } else { 0 };
-        let e = &self.early_rot;
-        for ((o, &v), &r) in self.carriers[slot * CARRIERS..(slot + 1) * CARRIERS].iter_mut().zip(&fe.car_buf).zip(e) {
-            *o = v * r;
-        }
-        self.prof[1] += t0.elapsed().as_secs_f64();
-        if j == N_P2 - 1 {
-            self.p2_channel();
-        } else if j >= N_P2 {
+        if j < N_P2 {
             let t0 = std::time::Instant::now();
-            self.equalize(j, 0);
+            let e = &self.early_rot;
+            for ((o, &v), &r) in self.carriers[j * CARRIERS..(j + 1) * CARRIERS].iter_mut().zip(&fe.car_buf).zip(e) {
+                *o = Complex32::new(v[0] as f32, v[1] as f32) * r;
+            }
+            self.prof[1] += t0.elapsed().as_secs_f64();
+            if j == N_P2 - 1 {
+                self.p2_channel();
+            }
+        } else {
+            // data symbols straight from the front end's words
+            let t0 = std::time::Instant::now();
+            self.equalize_int(j, &fe.car_buf);
             self.prof[2] += t0.elapsed().as_secs_f64();
         }
         if j == nsym - 1 {
@@ -1028,6 +1169,15 @@ impl Demod {
             }
         }
     }
+}
+
+/// [`q8`] with the saturation in float (max/min, NaN to -127) and an
+/// unchecked conversion: no compares and branches around it.
+#[inline]
+fn q8f(v: f32) -> i8 {
+    let x = v.max(-127.0).min(127.0);
+    // SAFETY: x is finite and within -127..=127, so x +- 0.5 fits an i32.
+    unsafe { (x + 0.5f32.copysign(x)).to_int_unchecked::<i32>() as i8 }
 }
 
 /// Round to 8 bits (saturating) without libm's round().

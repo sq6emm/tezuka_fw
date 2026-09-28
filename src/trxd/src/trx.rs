@@ -174,6 +174,8 @@ pub struct Trx {
     vfo_b: f64,
     active: Vfo,
     split: bool,
+    /// RX and TX LOs apart (cross-band DATV): (RX, TX).
+    lo_split: Option<(f64, f64)>,
     mode: Mode,
     filter: (f32, f32),
     volume: f32,
@@ -214,6 +216,8 @@ pub struct Trx {
     /// FPGA and AD936x temperatures (web header).
     temps: std::sync::Arc<std::sync::Mutex<crate::temps::Temps>>,
     chan: Vec<Complex32>,
+    /// DATV mode, DDC skipped: the fraction of a channel sample carried over.
+    chan_frac: f64,
     /// The mode demodulates at 12 kHz (see [`NARROW_RATE`]).
     narrow: bool,
     dec4: Decimator,
@@ -401,6 +405,7 @@ impl Trx {
             vfo_b: vfo,
             active: Vfo::A,
             split: false,
+            lo_split: None,
             mode,
             filter,
             volume: 0.5,
@@ -440,6 +445,7 @@ impl Trx {
             agc,
             agc_mode: AgcMode::Med,
             chan: Vec::new(),
+            chan_frac: 0.0,
             narrow: false,
             dec4: Decimator::new(4),
             chan12: Vec::new(),
@@ -609,7 +615,7 @@ impl Trx {
         };
         let fits_all = |c: f64| fits(rx, c) && (self.tx_on.is_none() || fits(tx, c));
         let datv = self.datv_lo_offset();
-        if datv.is_none() && !force && fits_all(self.center) && clear(self.center) {
+        if datv.is_none() && !force && self.lo_split.is_none() && fits_all(self.center) && clear(self.center) {
             self.apply_offsets();
             return;
         }
@@ -620,6 +626,37 @@ impl Trx {
         } else {
             rx
         };
+        // Sending DATV from the FPGA (LO on the signal) and receiving DATV
+        // too far from it for one LO (split across bands): the AD936x's RX
+        // and TX synthesizers apart, TX on the signal, RX where it would
+        // be alone. Not through transverters.
+        if datv == Some(0.0)
+            && matches!(self.tx_on, Some(TxSource::Datv(_)))
+            && self.datv_rx.is_some()
+            && !fits(rx, tx)
+            && self.settings.transverter(rx).is_none()
+            && self.settings.transverter(tx).is_none()
+        {
+            let rx_off = if self.datv_rx.as_ref().is_some_and(|r| r.t2_bw.is_some()) { 0.0 } else { self.cfg.radio.lo_offset_hz };
+            let (min, max) = (self.cfg.radio.freq_min_hz, self.cfg.radio.freq_max_hz);
+            let (rx_lo, tx_lo) = ((rx - rx_off).clamp(min, max), tx.clamp(min, max));
+            if !force && self.lo_split == Some((rx_lo, tx_lo)) {
+                self.apply_offsets();
+                return;
+            }
+            if let Err(e) = self.radio.set_los(rx_lo, tx_lo) {
+                warn!("tune RX {rx_lo} TX {tx_lo}: {e}");
+                return;
+            }
+            info!(rx_lo, tx_lo, "LOs apart (cross band)");
+            self.lo_split = Some((rx_lo, tx_lo));
+            self.xvtr = None;
+            self.center = rx_lo;
+            self.scope_wide.reset();
+            self.apply_offsets();
+            return;
+        }
+        let had_split = self.lo_split.take().is_some();
         let xvtr = self.settings.transverter(anchor).cloned();
         // The LO sits `lo_offset` below the signal on the air, which through an
         // inverting transverter is above it on the AD936x.
@@ -643,13 +680,13 @@ impl Trx {
                 lo = below;
             } else if lo_max > b && fits_all(above) {
                 lo = above;
-            } else if !force && fits_all(self.center) {
+            } else if !force && !had_split && fits_all(self.center) {
                 // No room beside the view (split far apart): stay put.
                 self.apply_offsets();
                 return;
             }
         }
-        if !force && (lo - self.center).abs() < 1.0 {
+        if !force && !had_split && (lo - self.center).abs() < 1.0 {
             self.apply_offsets();
             return;
         }
@@ -881,6 +918,17 @@ impl Trx {
         }
         let half = d.sr * (1.0 + d.rolloff as f64) / 2.0;
         Some((half + 10e3).min(self.rate * 0.38 - half).max(0.0))
+    }
+
+    /// DATV reception can run now: nothing sent, or sent by the FPGA's
+    /// DVB-S2 transmitter, or DVB-T2 with the FPGA's IFFT (the software
+    /// modulator, or DVB-T2's OFDM on the A9, take its cores; a receiver
+    /// beside them made the transmission stall).
+    fn datv_rx_alongside_tx(&self) -> bool {
+        // (TRXD_TX_ALONE=1: never, for tests)
+        self.datv.as_ref().is_none_or(|d| {
+            std::env::var_os("TRXD_TX_ALONE").is_none() && (d.fpga.is_some() || d.t2.as_ref().is_some_and(|t| t.fpga_ifft))
+        })
     }
 
     /// Tell the browser why DATV did not start.
@@ -1534,9 +1582,19 @@ impl Trx {
             sc.set_center(self.rx_eff() - self.center);
         }
         self.lap(0, &mut mark);
-        // The channel.
+        // The channel. DATV mode has no audio to make and its own receiver
+        // has the IQ: the channel DDC (3.072 MS/s to 48 kHz, a fifth of an
+        // A9 core) runs only if the narrow waterfall shows it; otherwise
+        // silence of the same length keeps the rest in step.
         self.chan.clear();
-        self.ddc.process(iq, &mut self.chan);
+        if self.datv_mode && self.web_span > NARROW_SPAN_MAX {
+            self.chan_frac += iq.len() as f64 * CH_RATE / self.rate;
+            let n = self.chan_frac.floor();
+            self.chan_frac -= n;
+            self.chan.resize(n as usize, Complex32::default());
+        } else {
+            self.ddc.process(iq, &mut self.chan);
+        }
         self.lap(1, &mut mark);
         if let Some(nb) = &mut self.nb {
             nb.process(&mut self.chan);
@@ -2221,8 +2279,9 @@ impl Trx {
                 self.datv_rx_req = on.then(|| {
                     (num("sr").unwrap_or(64_000.0), m["rate"].as_str().unwrap_or("1/2").to_string(), m["pilots"].as_bool().unwrap_or(true))
                 });
-                // Sending DATV: the receiver starts when that ends.
-                if let Some((sr, rate, pilots)) = self.datv_rx_req.clone().filter(|_| self.datv.is_none()) {
+                // Sending DATV the A9 cannot carry as well (DVB-T2, the
+                // software modulator): the receiver starts when that ends.
+                if let Some((sr, rate, pilots)) = self.datv_rx_req.clone().filter(|_| self.datv_rx_alongside_tx()) {
                     self.datv_rx_start(sr, &rate, pilots);
                 }
                 // The LO back beside the signal if no DVB-T2 receiver needs it on.
@@ -2236,7 +2295,12 @@ impl Trx {
                         let sr = num("sr").unwrap_or(64_000.0);
                         let rate = m["rate"].as_str().unwrap_or("1/2").to_string();
                         self.datv_start(client, sr, &rate, m["pilots"].as_bool().unwrap_or(true));
-                        if self.datv.is_some() && (self.datv_rx.is_some() || self.datv_scan.is_some()) {
+                        // The FPGA's DVB-S2 transmitter (or DVB-T2 with the
+                        // FPGA's IFFT) leaves the A9 room: the receiver goes
+                        // on (the board hears itself, or another station on
+                        // the RX VFO: split, cross band too). The software
+                        // modulator needs the cores: receiving waits.
+                        if !self.datv_rx_alongside_tx() && (self.datv_rx.is_some() || self.datv_scan.is_some()) {
                             info!("DATV receive paused while sending");
                             self.datv_rx = None;
                             self.datv_scan = None;

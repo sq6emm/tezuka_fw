@@ -211,6 +211,28 @@ impl Bch {
         }
     }
 
+    /// [`encode`] on packed bytes (MSB first) of a normal frame: the 24
+    /// parity bytes of `data` (Kbch / 8 bytes).
+    pub fn parity_bytes(&self, data: &[u8]) -> [u8; 24] {
+        debug_assert_eq!(self.shift, 0);
+        let mut r: Reg = [0; 3];
+        for &b in data.iter().chain([0u8; 24].iter()) {
+            let top = (r[2] >> 56) as usize;
+            r[2] = (r[2] << 8) | (r[1] >> 56);
+            r[1] = (r[1] << 8) | (r[0] >> 56);
+            r[0] = (r[0] << 8) | b as u64;
+            let t = &self.byte_tab[top];
+            for i in 0..3 {
+                r[i] ^= t[i];
+            }
+        }
+        let mut out = [0u8; 24];
+        out[..8].copy_from_slice(&r[2].to_be_bytes());
+        out[8..16].copy_from_slice(&r[1].to_be_bytes());
+        out[16..].copy_from_slice(&r[0].to_be_bytes());
+        out
+    }
+
     /// Correct `bits` (n = Kbch + 192 of them, 0/1) in place.
     pub fn decode(&self, bits: &mut [u8]) -> Outcome {
         let n = bits.len();
@@ -299,6 +321,22 @@ impl Bch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parity_bytes_match_encode() {
+        let bch = Bch::new();
+        for kbch in [32208, 48408] {
+            let mut cw = vec![0u8; kbch + 192];
+            let mut x = 7u32;
+            for v in cw.iter_mut().take(kbch) {
+                x = x.wrapping_mul(1103515245).wrapping_add(12345);
+                *v = ((x >> 16) & 1) as u8;
+            }
+            bch.encode(&mut cw);
+            let bytes: Vec<u8> = cw.chunks(8).map(|c| c.iter().fold(0, |a, &b| (a << 1) | b)).collect();
+            assert_eq!(bch.parity_bytes(&bytes[..kbch / 8])[..], bytes[kbch / 8..]);
+        }
+    }
 
     #[test]
     fn bch_rejects_far_beyond_t() {

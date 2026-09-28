@@ -80,6 +80,149 @@ pub fn encode(rate: LongRate, info: &[u8]) -> Vec<u8> {
     cw
 }
 
+/// The parity of `info` (packed, MSB first, k / 8 bytes) as q rows of 360
+/// bits, LSB first: bit c of row r = parity bit c q + r, accumulated.
+///
+/// Before accumulation a table address a sends info bit m of its group to
+/// p[a + m q]: row a mod q, column a / q + m (mod 360), so each address is
+/// one 360-bit rotate-and-XOR instead of 360 single bits. The accumulation
+/// (p[i] ^= p[i - 1] in index order c q + r) is then, per row, the prefix
+/// XOR of the rows above it and of all columns left of c:
+/// acc[r] = (rows[0] ^ .. ^ rows[r]) ^ excl_prefix(rows[0] ^ .. ^ rows[q-1]).
+pub fn parity_rows(rate: LongRate, info: &[u8]) -> Vec<[u64; 6]> {
+    let q = rate.q();
+    debug_assert_eq!(info.len(), rate.k() / 8);
+    let mut rows = vec![[0u64; 6]; q];
+    for (g, addrs) in rate.table().iter().enumerate() {
+        // the group's bits LSB first (bit m = info bit g 360 + m), twice:
+        // bit m + 360 = bit m, so a rotation is a window
+        let mut d = [0u64; 12];
+        {
+            let db: &mut [u8; 96] = bytemuck_u64_bytes(&mut d);
+            for (i, &b) in info[g * 45..g * 45 + 45].iter().enumerate() {
+                let r = b.reverse_bits();
+                db[i] = r;
+                db[45 + i] = r;
+            }
+        }
+        #[cfg(target_endian = "big")]
+        for w in d.iter_mut() {
+            *w = w.swap_bytes();
+        }
+        for &a in addrs.iter() {
+            let a = a as usize;
+            let (r, s) = (a % q, a / q);
+            // row bit c ^= info bit (c - s) mod 360 = d bit c + 360 - s
+            let o = 360 - s;
+            let (wi, sh) = (o / 64, o % 64);
+            let row = &mut rows[r];
+            if sh == 0 {
+                for j in 0..6 {
+                    row[j] ^= d[wi + j];
+                }
+            } else {
+                for j in 0..6 {
+                    row[j] ^= (d[wi + j] >> sh) | (d[wi + j + 1] << (64 - sh));
+                }
+            }
+        }
+    }
+    // rows[r] = rows[0] ^ .. ^ rows[r]; the last is every column's parity
+    for r in 1..q {
+        let prev = rows[r - 1];
+        for j in 0..6 {
+            rows[r][j] ^= prev[j];
+        }
+    }
+    // exclusive prefix XOR along the 360 columns of the column parities:
+    // within a word by doubling shifts, the lower words' parity on top
+    let mut px = [0u64; 6];
+    let mut below = 0u64;
+    for j in 0..6 {
+        let mut x = rows[q - 1][j];
+        for sh in [1, 2, 4, 8, 16, 32] {
+            x ^= x << sh;
+        }
+        px[j] = (x << 1) ^ below.wrapping_neg();
+        below ^= x >> 63;
+    }
+    for row in rows.iter_mut() {
+        for j in 0..6 {
+            row[j] ^= px[j];
+        }
+        row[5] &= (1 << (360 - 320)) - 1;
+    }
+    rows
+}
+
+/// [`encode`] on packed bits (MSB first): `info` k / 8 bytes in, the
+/// codeword's 8100 bytes out (parity in index order c q + r: the rows
+/// transposed, 8 x 8 bits at a time).
+pub fn encode_packed(rate: LongRate, info: &[u8]) -> Vec<u8> {
+    let q = rate.q();
+    let rows = parity_rows(rate, info);
+    // columns (q <= 90 bits each, bit r = row r) from 8 x 8 transposes
+    let groups = q.div_ceil(8);
+    let mut cols = vec![0u128; 360];
+    for g in 0..groups {
+        for cb in 0..45 {
+            let mut x = 0u64;
+            for i in 0..8.min(q - 8 * g) {
+                let row = &rows[8 * g + i];
+                let byte = (row[cb / 8] >> (8 * (cb % 8))) & 0xFF;
+                x |= byte << (8 * i);
+            }
+            // x bit 8 i + j (row i, column j) -> bit 8 j + i
+            let t = (x ^ (x >> 7)) & 0x00AA_00AA_00AA_00AA;
+            x ^= t ^ (t << 7);
+            let t = (x ^ (x >> 14)) & 0x0000_CCCC_0000_CCCC;
+            x ^= t ^ (t << 14);
+            let t = (x ^ (x >> 28)) & 0x0000_0000_F0F0_F0F0;
+            x ^= t ^ (t << 28);
+            for j in 0..8 {
+                cols[8 * cb + j] |= (((x >> (8 * j)) & 0xFF) as u128) << (8 * g);
+            }
+        }
+    }
+    // the columns one after another, LSB first, then each byte reversed
+    let mut cw = Vec::with_capacity(N / 8);
+    cw.extend_from_slice(info);
+    let (mut acc, mut n) = (0u128, 0usize);
+    for &c in &cols {
+        acc |= c << n;
+        n += q;
+        while n >= 8 {
+            cw.push((acc as u8).reverse_bits());
+            acc >>= 8;
+            n -= 8;
+        }
+    }
+    debug_assert_eq!(n, 0);
+    debug_assert_eq!(cw.len(), N / 8);
+    cw
+}
+
+/// [`encode_packed`] with the parity interleaved (EN 302 755 6.1.1: parity
+/// bit q s + t to position 360 t + s), as 16QAM's bit interleaver takes it:
+/// the rows one after another.
+pub fn encode_packed_pi(rate: LongRate, info: &[u8]) -> Vec<u8> {
+    let rows = parity_rows(rate, info);
+    let mut u = Vec::with_capacity(N / 8);
+    u.extend_from_slice(info);
+    for row in &rows {
+        for cb in 0..45 {
+            u.push((((row[cb / 8] >> (8 * (cb % 8))) & 0xFF) as u8).reverse_bits());
+        }
+    }
+    u
+}
+
+fn bytemuck_u64_bytes(d: &mut [u64; 12]) -> &mut [u8; 96] {
+    // SAFETY: [u64; 12] and [u8; 96] have the same size, u8 has no
+    // alignment requirement and every bit pattern is valid for both.
+    unsafe { &mut *(d as *mut [u64; 12] as *mut [u8; 96]) }
+}
+
 /// The per-group edge lists: for group j, (row g, shift s) pairs.
 pub fn group_edges(rate: LongRate) -> Vec<Vec<(u16, u16)>> {
     let q = rate.q();
@@ -235,8 +378,11 @@ pub fn quantize_llr(l: f32, scale: f32) -> i8 {
     let m = ((1 << (LLR_BITS - 1)) - 1) as f32;
     // Round half away from zero, as round() (a libm call on the A9, 64800
     // of them a frame): clamp, then truncate the half-offset value.
-    let v = (l * scale).clamp(-m, m);
-    (v + if v >= 0.0 { 0.5 } else { -0.5 }) as i8
+    // max/min (NaN to -m) and an unchecked conversion: no compares and
+    // branches around it (64800 a frame on the A9)
+    let v = (l * scale).max(-m).min(m);
+    // SAFETY: v is finite and within -m..=m (m = 31), so v +- 0.5 fits.
+    unsafe { (v + 0.5f32.copysign(v)).to_int_unchecked::<i32>() as i8 }
 }
 
 #[cfg(test)]
@@ -268,6 +414,26 @@ mod tests {
             2.0 * a * y / (sigma * sigma)
         }).collect();
         (cw, llr)
+    }
+
+    #[test]
+    fn packed_encoder_matches() {
+        for rate in [LongRate::R1_2, LongRate::R3_4] {
+            let mut x = 0x1234_5678u32;
+            let info: Vec<u8> = (0..rate.k())
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    (x & 1) as u8
+                })
+                .collect();
+            let want = encode(rate, &info);
+            let packed: Vec<u8> = info.chunks(8).map(|c| c.iter().fold(0, |a, &b| (a << 1) | b)).collect();
+            let got = encode_packed(rate, &packed);
+            let bits: Vec<u8> = got.iter().flat_map(|&b| (0..8).map(move |i| (b >> (7 - i)) & 1)).collect();
+            assert_eq!(bits, want, "{rate:?}");
+        }
     }
 
     #[test]

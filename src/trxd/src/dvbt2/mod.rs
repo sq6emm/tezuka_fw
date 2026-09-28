@@ -270,6 +270,9 @@ pub struct BitInterleaver {
     c: Constellation,
     /// 16QAM: codeword bit index for each position of the permuted stream.
     lookup: Vec<u32>,
+    /// 16QAM: a row's 8 bits (bit c from column c) to its two cells' word
+    /// bits (the demux).
+    demux: [u8; 256],
 }
 
 impl BitInterleaver {
@@ -315,7 +318,55 @@ impl BitInterleaver {
                 out
             }
         };
-        BitInterleaver { c: p.constellation, lookup }
+        const MUX: [usize; 8] = [7, 1, 4, 2, 5, 3, 6, 0];
+        let mut demux = [0u8; 256];
+        for (b, d) in demux.iter_mut().enumerate() {
+            for (e, &m) in MUX.iter().enumerate() {
+                *d |= (((b >> e) & 1) as u8) << (7 - m);
+            }
+        }
+        BitInterleaver { c: p.constellation, lookup, demux }
+    }
+
+    /// 16QAM's words (two a byte, as [`Self::words_packed`]) from the
+    /// parity-interleaved codeword `u` (packed, MSB first:
+    /// [`crate::dvbs2::ldpc_fpga::encode_packed_pi`]). The column-twist
+    /// interleaver writes 8 columns of 8100 bits, column c from row
+    /// TWIST[c] on, and reads rows: column c is u's bits c 8100.. rotated,
+    /// so 8 rows at a time are a byte from each column and an 8 x 8 bit
+    /// transpose (instead of 64800 single-bit lookups).
+    pub fn words_pi(&self, u: &[u8]) -> Vec<u8> {
+        const TWIST: [usize; 8] = [0, 0, 2, 4, 4, 5, 7, 7];
+        const ROWS: usize = 64_800 / 8;
+        debug_assert_eq!(self.c, Constellation::Qam16);
+        let bit = |i: usize| (u[i >> 3] >> (7 - (i & 7))) & 1;
+        let col = |c: usize, j: usize| bit(c * ROWS + (j + ROWS - TWIST[c]) % ROWS);
+        let slow = |j: usize| self.demux[(0..8).fold(0usize, |a, c| a | (col(c, j) as usize) << c)];
+        let mut out = Vec::with_capacity(ROWS);
+        out.extend((0..8).map(slow));
+        let mut j0 = 8;
+        while j0 + 8 <= ROWS {
+            let mut x = 0u64;
+            for (c, &tw) in TWIST.iter().enumerate() {
+                let pos = c * ROWS + j0 - tw;
+                let a = pos >> 3;
+                let w = ((u[a] as u16) << 8 | u[a + 1] as u16) >> (8 - (pos & 7));
+                x |= ((w as u8).reverse_bits() as u64) << (8 * c);
+            }
+            // x bit 8 c + k (column c, row j0 + k) -> bit 8 k + c
+            let t = (x ^ (x >> 7)) & 0x00AA_00AA_00AA_00AA;
+            x ^= t ^ (t << 7);
+            let t = (x ^ (x >> 14)) & 0x0000_CCCC_0000_CCCC;
+            x ^= t ^ (t << 14);
+            let t = (x ^ (x >> 28)) & 0x0000_0000_F0F0_F0F0;
+            x ^= t ^ (t << 28);
+            for k in 0..8 {
+                out.push(self.demux[((x >> (8 * k)) & 0xFF) as usize]);
+            }
+            j0 += 8;
+        }
+        out.extend((j0..ROWS).map(slow));
+        out
     }
 
     pub fn words(&self, codeword: &[u8]) -> Vec<u8> {
@@ -333,6 +384,28 @@ impl BitInterleaver {
                     w.push(pack & 15);
                 }
                 w
+            }
+        }
+    }
+
+    /// [`words`] from a packed codeword (8100 bytes, MSB first), packed
+    /// the same way (b bits a word, MSB first; for QPSK the codeword as is).
+    pub fn words_packed(&self, cw: Vec<u8>) -> Vec<u8> {
+        match self.c {
+            Constellation::Qpsk => cw,
+            Constellation::Qam16 => {
+                const MUX: [usize; 8] = [7, 1, 4, 2, 5, 3, 6, 0];
+                let bit = |i: u32| (cw[(i >> 3) as usize] >> (7 - (i & 7))) & 1;
+                self.lookup
+                    .chunks_exact(8)
+                    .map(|l| {
+                        let mut pack = 0u8;
+                        for (e, &m) in MUX.iter().enumerate() {
+                            pack |= bit(l[e]) << (7 - m);
+                        }
+                        pack
+                    })
+                    .collect()
             }
         }
     }
@@ -420,6 +493,8 @@ pub fn interleave<T: Copy + Default>(p: &Params, blocks: &[Vec<T>]) -> Vec<T> {
 pub struct CellInterleaver {
     cells: usize,
     perm: Vec<usize>,
+    /// perm's inverse.
+    inv: Vec<u16>,
     shifts: Vec<usize>,
 }
 
@@ -446,7 +521,11 @@ impl CellInterleaver {
                 shift
             })
             .collect();
-        CellInterleaver { cells, perm, shifts }
+        let mut inv = vec![0u16; cells];
+        for (w, &x) in perm.iter().enumerate() {
+            inv[x] = w as u16;
+        }
+        CellInterleaver { cells, perm, inv, shifts }
     }
 
     pub fn frame<T: Copy + Default>(&self, blocks: &[Vec<T>]) -> Vec<T> {
@@ -470,6 +549,74 @@ impl CellInterleaver {
             for w in 0..cols {
                 out.push(ti[rows * w + k]);
             }
+        }
+        out
+    }
+
+    /// The cell interleaver alone on the blocks' cell codes ([`codes`] of
+    /// `b`-bit words, packed as [`BitInterleaver::words_packed`]): block r's
+    /// interleaved cells at r cells.. (the time interleaver's columns 5 r
+    /// to 5 r + 4). Per block a gather through the inverse permutation, the
+    /// words unpacked to bytes first (the A9's fastest); a scatter over
+    /// the whole frame, or a gather from all blocks at once, missed its
+    /// caches.
+    pub fn blocks_words(&self, b: usize, blocks: &[Vec<u8>]) -> Vec<Cell> {
+        let cells = self.cells;
+        let mut ib = vec![0 as Cell; cells * blocks.len()];
+        let mut wd = vec![0u8; cells];
+        for ((pk, dst), &shift) in blocks.iter().zip(ib.chunks_exact_mut(cells)).zip(&self.shifts) {
+            match b {
+                2 => {
+                    for (w, &x) in wd.chunks_exact_mut(4).zip(pk) {
+                        w.copy_from_slice(&[x >> 6, (x >> 4) & 3, (x >> 2) & 3, x & 3]);
+                    }
+                }
+                _ => {
+                    for (w, &x) in wd.chunks_exact_mut(2).zip(pk) {
+                        w.copy_from_slice(&[x >> 4, x & 15]);
+                    }
+                }
+            }
+            let wd = &wd[..];
+            let code = |w: usize| {
+                let prev = if w == 0 { wd[cells - 1] } else { wd[w - 1] };
+                ((wd[w] as Cell) << b) | prev as Cell
+            };
+            // x = perm[w] + shift (mod cells): x = shift.. from inv[0..],
+            // x = 0..shift from inv[cells - shift..]
+            let (lo, hi) = dst.split_at_mut(shift);
+            for (d, &w) in hi.iter_mut().zip(&self.inv[..cells - shift]) {
+                *d = code(w as usize);
+            }
+            for (d, &w) in lo.iter_mut().zip(&self.inv[cells - shift..]) {
+                *d = code(w as usize);
+            }
+        }
+        ib
+    }
+
+    /// [`frame`] of the blocks' cell codes (as [`Self::blocks_words`]): the
+    /// time interleaver's transpose of those, in tiles.
+    pub fn frame_words(&self, b: usize, blocks: &[Vec<u8>]) -> Vec<Cell> {
+        let cells = self.cells;
+        let rows = cells / 5;
+        let nb = blocks.len();
+        let ib = self.blocks_words(b, blocks);
+        // out[k cols + c] = ib[rows c + k]
+        let cols = 5 * nb;
+        let mut out = vec![0 as Cell; cells * nb];
+        const TILE: usize = 16;
+        let mut k0 = 0;
+        while k0 < rows {
+            let t = TILE.min(rows - k0);
+            let o = &mut out[k0 * cols..(k0 + t) * cols];
+            for c in 0..cols {
+                let src = &ib[rows * c + k0..rows * c + k0 + t];
+                for (kk, &v) in src.iter().enumerate() {
+                    o[kk * cols + c] = v;
+                }
+            }
+            k0 += t;
         }
         out
     }
@@ -528,30 +675,180 @@ impl FecStage {
         }
     }
 
+    /// One FEC block's codeword, packed (8100 bytes, MSB first).
+    pub fn codeword_bytes(&mut self, next: &mut dyn FnMut() -> [u8; crate::dvbs2::TS_LEN]) -> Vec<u8> {
+        let kbch = self.p.kbch();
+        let mut info = self.framer.frame_bytes(kbch / 8, 0, next);
+        for (b, s) in info.iter_mut().zip(&self.bbscr) {
+            *b ^= s;
+        }
+        let par = self.bch.parity_bytes(&info);
+        info.extend_from_slice(&par);
+        crate::dvbs2::ldpc_fpga::encode_packed(self.p.rate, &info)
+    }
+
+    /// One FEC block's cell words, packed ([`BitInterleaver::words_packed`]).
+    pub fn block_words(&mut self, next: &mut dyn FnMut() -> [u8; crate::dvbs2::TS_LEN]) -> Vec<u8> {
+        let kbch = self.p.kbch();
+        let mut info = self.framer.frame_bytes(kbch / 8, 0, next);
+        for (b, s) in info.iter_mut().zip(&self.bbscr) {
+            *b ^= s;
+        }
+        let par = self.bch.parity_bytes(&info);
+        info.extend_from_slice(&par);
+        match self.p.constellation {
+            Constellation::Qpsk => crate::dvbs2::ldpc_fpga::encode_packed(self.p.rate, &info),
+            Constellation::Qam16 => self.bi.words_pi(&crate::dvbs2::ldpc_fpga::encode_packed_pi(self.p.rate, &info)),
+        }
+    }
+
     /// One FEC block's codeword bits from the next TS packets.
     pub fn codeword(&mut self, next: &mut dyn FnMut() -> [u8; crate::dvbs2::TS_LEN]) -> Vec<u8> {
-        let kbch = self.p.kbch();
-        let bb = self.framer.frame_bytes(kbch / 8, 0, next);
-        let mut info = vec![0u8; self.p.rate.k()];
-        for (i, byte) in bb.iter().enumerate() {
-            for b in 0..8 {
-                info[i * 8 + b] = ((byte ^ self.bbscr[i]) >> (7 - b)) & 1;
-            }
-        }
-        self.bch.encode(&mut info);
-        crate::dvbs2::ldpc_fpga::encode(self.p.rate, &info)
+        self.codeword_bytes(next).iter().flat_map(|&b| (0..8).map(move |i| (b >> (7 - i)) & 1)).collect()
     }
 
     /// One T2 frame's cells (frame builder output).
     pub fn frame(&mut self, next: &mut dyn FnMut() -> [u8; crate::dvbs2::TS_LEN]) -> Vec<Cell> {
+        let blocks: Vec<Vec<u8>> = (0..self.p.fec_blocks).map(|_| self.block_words(next)).collect();
+        let data = self.ci.frame_words(self.p.constellation.bits(), &blocks);
+        self.mapper.frame(&data)
+    }
+
+    /// One T2 frame's codes for [`FastFrame`].
+    pub fn frame_codes(&mut self, next: &mut dyn FnMut() -> [u8; crate::dvbs2::TS_LEN]) -> Vec<Cell> {
+        let blocks: Vec<Vec<u8>> = (0..self.p.fec_blocks).map(|_| self.block_words(next)).collect();
+        FastFrame::codes(&self.p, &self.ci, &blocks)
+    }
+
+    /// [`frame`] the long way (bits a byte, the gr-dtv port's stages).
+    #[cfg(test)]
+    pub fn frame_ref(&mut self, next: &mut dyn FnMut() -> [u8; crate::dvbs2::TS_LEN]) -> Vec<Cell> {
         let blocks: Vec<Vec<Cell>> = (0..self.p.fec_blocks)
             .map(|_| {
-                let cw = self.codeword(next);
+                let kbch = self.p.kbch();
+                let bb = self.framer.frame_bytes(kbch / 8, 0, next);
+                let mut info = vec![0u8; self.p.rate.k()];
+                for (i, byte) in bb.iter().enumerate() {
+                    for b in 0..8 {
+                        info[i * 8 + b] = ((byte ^ self.bbscr[i]) >> (7 - b)) & 1;
+                    }
+                }
+                self.bch.encode(&mut info);
+                let cw = crate::dvbs2::ldpc_fpga::encode(self.p.rate, &info);
                 codes(&self.p, &self.bi.words(&cw))
             })
             .collect();
         let data = self.ci.frame(&blocks);
-        self.mapper.frame(&data)
+        self.mapper.frame_ref(&data)
+    }
+}
+
+/// Codes past the palette's (263): the pilots, 263 + 2 kind + negative.
+pub const PILOT_CODES: usize = 6;
+
+/// A frame's cell-interleaved FEC blocks to the FPGA IFFT's DMA bytes in
+/// one gather. Every stage after the cell interleaver (the time and
+/// frequency interleavers, the frame builder, pilots, bin order) moves
+/// cells to places that are the same in every frame, so they run once, on
+/// labels, at start-up: the result is each carrier slot's source, an index
+/// into the frame's cell-interleaved blocks followed by the constant codes
+/// (L1-pre, dummy, pilots: their own code). A symbol's 1500 or so cells
+/// come from runs of about 34 cells in each of the time interleaver's
+/// columns, so the gather reads the blocks about once, in order (a gather
+/// straight from the FEC blocks' words, through the cell interleaver too,
+/// went to DRAM a cell: 64 ms a frame on the A9).
+pub struct FastFrame {
+    p: Params,
+    /// Source of each slot (symbols x 1705, bin order).
+    src: Vec<u32>,
+    /// L1-post: (slot, cell) and each frame index's cells (they differ).
+    post_slots: Vec<(u32, u32)>,
+    post: Vec<Vec<Cell>>,
+    head: Vec<[u8; 4]>,
+    words: Vec<[u8; 4]>,
+}
+
+impl FastFrame {
+    pub fn new(p: Params, ofdm: &ofdm::Ofdm, scale: f32) -> FastFrame {
+        let cells = p.cells();
+        let dn = (cells * p.fec_blocks) as u32;
+        let post_base = dn + 1024;
+        // data cell d of the frame (time interleaver output) is row
+        // k = d / cols, column c = d % cols of the interleaver: cell k of
+        // column c, at rows c + k in the cell-interleaved blocks
+        let (rows, cols) = (cells as u32 / 5, 5 * p.fec_blocks as u32);
+        let data: Vec<u32> = (0..dn).map(|d| rows * (d % cols) + d / cols).collect();
+        let mapper = frame::FrameMapper::new(p);
+        let konst = |c: Cell| dn + c as u32;
+        let pre: Vec<u32> = mapper.pre_cells().iter().map(|&c| konst(c)).collect();
+        let post: Vec<u32> = (0..l1::post_cells() as u32).map(|m| post_base + m).collect();
+        let dummy: Vec<u32> = mapper.dummy_cells().iter().map(|&c| konst(c)).collect();
+        let layout = mapper.layout(&pre, &post, &data, &dummy, konst(ZERO));
+        let syms = frame::FreqInterleaver::new(&p).frame(&layout);
+        let pilot = |kind: usize, neg: usize| dn + 263 + (2 * kind + neg) as u32;
+        let mut src = ofdm.fpga_slots(&syms, &pilot, konst(ZERO));
+        let mut post_slots = Vec::new();
+        for (i, s) in src.iter_mut().enumerate() {
+            if *s >= post_base {
+                post_slots.push((i as u32, *s - post_base));
+                *s = konst(ZERO);
+            }
+        }
+        let (head, words) = ofdm.fpga_words(scale);
+        FastFrame { p, src, post_slots, post: (0..p.t2_frames).map(|i| l1::post(&p, i)).collect(), head, words }
+    }
+
+    /// Room for a frame's codes: the blocks' cells, then the constants.
+    pub fn codes_len(p: &Params) -> usize {
+        p.cells() * p.fec_blocks + 263 + PILOT_CODES
+    }
+
+    /// A frame's codes from its blocks' packed words
+    /// ([`BitInterleaver::words_packed`]): the cell-interleaved blocks
+    /// (the time interleaver is in the slots' sources) and the constants.
+    pub fn codes(p: &Params, ci: &CellInterleaver, blocks: &[Vec<u8>]) -> Vec<Cell> {
+        let mut out = ci.blocks_words(p.constellation.bits(), blocks);
+        out.reserve_exact(263 + PILOT_CODES);
+        out.extend(0..(263 + PILOT_CODES) as Cell);
+        out
+    }
+
+    /// Bytes a frame takes.
+    pub fn frame_bytes(&self) -> usize {
+        4 * (self.head.len() + self.src.len())
+    }
+
+    /// Bytes `at..at + dst.len()` (whole words) of the frame with codes
+    /// `codes` and frame index `fi` (the L1-post differs) into `dst`: a
+    /// frame goes straight into the TX blocks, no frame-sized copies.
+    pub fn fill(&self, codes: &[Cell], fi: usize, at: usize, dst: &mut [u8]) {
+        assert_eq!(codes.len(), Self::codes_len(&self.p));
+        debug_assert!(at % 4 == 0 && dst.len() % 4 == 0 && at + dst.len() <= self.frame_bytes());
+        let (a, b) = (at / 4, (at + dst.len()) / 4);
+        let nh = self.head.len();
+        let mut o = dst.chunks_exact_mut(4);
+        for w in &self.head[a.min(nh)..b.min(nh)] {
+            o.next().unwrap().copy_from_slice(w);
+        }
+        let (sa, sb) = (a.max(nh) - nh, b.max(nh) - nh);
+        let words = &self.words[..];
+        for (o, &s) in o.zip(&self.src[sa..sb]) {
+            o.copy_from_slice(&words[codes[s as usize] as usize]);
+        }
+        let post = &self.post[fi % self.p.t2_frames];
+        let from = self.post_slots.partition_point(|&(slot, _)| (slot as usize) < sa);
+        for &(slot, m) in self.post_slots[from..].iter().take_while(|&&(slot, _)| (slot as usize) < sb) {
+            let at = 4 * (nh + slot as usize - a);
+            dst[at..at + 4].copy_from_slice(&words[post[m as usize] as usize]);
+        }
+    }
+
+    /// Frame `fi`'s DMA bytes whole (as [`OfdmStage::frame_fpga`]).
+    #[cfg(test)]
+    pub fn frame(&self, codes: &[Cell], fi: usize, out: &mut Vec<u8>) {
+        let start = out.len();
+        out.resize(start + self.frame_bytes(), 0);
+        self.fill(codes, fi, 0, &mut out[start..]);
     }
 }
 
@@ -571,9 +868,19 @@ impl OfdmStage {
         self.ofdm.frame_samples()
     }
 
+    pub fn ofdm(&self) -> &ofdm::Ofdm {
+        &self.ofdm
+    }
+
     pub fn frame(&self, cells: &[Cell], out: &mut Vec<Complex32>) {
         let syms = self.fi.frame(cells);
         self.ofdm.frame(&syms, out);
+    }
+
+    /// The frame for the FPGA's transmit IFFT (see [`ofdm::Ofdm::frame_fpga`]).
+    pub fn frame_fpga(&self, cells: &[Cell], scale: f32, out: &mut Vec<u8>) {
+        let syms = self.fi.frame(cells);
+        self.ofdm.frame_fpga(&syms, scale, out);
     }
 }
 

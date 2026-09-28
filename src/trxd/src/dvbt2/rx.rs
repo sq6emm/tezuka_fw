@@ -37,6 +37,17 @@ pub fn receive(p: Params, x: &[Complex32], fs: f64) -> Report {
             fec.frame(&llr, &mut stats, &mut report.packets);
         }
     }
+    if let Some(se) = &d.sym_err {
+        let v: Vec<String> = se.chunks(16).enumerate().filter(|(_, c)| c.iter().any(|x| x.1 > 0.0)).map(|(i, c)| {
+            let (e, n) = c.iter().fold((0.0, 0.0), |a, x| (a.0 + x.0, a.1 + x.1));
+            format!("{}-{}: {:.1} dB", i * 16, i * 16 + 15, -10.0 * (e / n).log10())
+        }).collect();
+        eprintln!("software receiver, pilot MER by symbol index: {}", v.join(", "));
+    }
+    if let Some(ce) = &d.car_err {
+        let v: Vec<String> = ce.iter().enumerate().map(|(i, x)| format!("{}: {:.1}", i * 64, -10.0 * (x.0 / x.1.max(1.0)).log10())).collect();
+        eprintln!("software receiver, pilot MER by carrier (dB): {}", v.join(", "));
+    }
     report.frames = d.stats.frames as usize;
     report.freq_hz = d.stats.freq_hz;
     report.ldpc_fail = stats.ldpc_fail;

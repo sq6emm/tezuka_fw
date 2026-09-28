@@ -91,6 +91,14 @@ impl RadioControl for IioControl {
         Ok(())
     }
 
+    fn set_los(&mut self, rx_hz: f64, tx_hz: f64) -> Result<(), String> {
+        let (r, t) = (format!("{}", rx_hz.round() as u64), format!("{}", tx_hz.round() as u64));
+        write_attr(&self.phy, "out_altvoltage0_RX_LO_frequency", &r)?;
+        write_attr(&self.phy, "out_altvoltage1_TX_LO_frequency", &t)?;
+        self.lo = Some(r);
+        Ok(())
+    }
+
     fn set_rx_gain(&mut self, mode: GainMode, db: f64) -> Result<(), String> {
         write_attr(&self.phy, "in_voltage0_gain_control_mode", mode.iio_name())?;
         if mode == GainMode::Manual {

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
 
-use super::{Cell, FecStage, OfdmStage, Params};
+use super::{Cell, FastFrame, FecStage, OfdmStage, Params};
 use crate::dvbs2::TS_LEN;
 use crate::dvbs2::ts::Mux;
 use crate::stream::TxBlock;
@@ -17,6 +17,14 @@ use crate::stream::TxBlock;
 /// FPGA's 16-tap resampler still puts the images about 44 dB down at the
 /// channel edge (more further out, and the AD936x's analog filter adds).
 const OS4: usize = 4;
+/// The transmitter's threads above the receive decoders (nice -5) and below
+/// the sample path (-10): with both on the A9's cores at once (full duplex),
+/// a receiver that falls behind (failing blocks run the LDPC to its last
+/// iteration) must lose frames of its own, not starve the DAC: a gap in
+/// the sent frames broke the receivers of this station and its own.
+const TX_NICE: i32 = -8;
+/// Engine blocks per TX write (see [`T2Tx::start`]).
+const TX_BLOCKS: usize = 16;
 /// Unit-RMS samples to 8 bits (the FPGA scales them by 256): RMS 48 (about
 /// -9 dBFS), peaks above 2.65 sigma clip (clipping noise near -25 dB,
 /// quantization near -41 dB: both far below what QPSK/16QAM need; power is
@@ -78,6 +86,9 @@ impl Mode {
 
 pub struct T2Tx {
     pub mode: Mode,
+    /// The FPGA's IFFT does the OFDM (the A9 is left about half a core:
+    /// a receiver can run beside it).
+    pub fpga_ifft: bool,
     packets: Sender<[u8; TS_LEN]>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -88,37 +99,64 @@ impl T2Tx {
     /// Start: the FPGA path set up, the modulator thread writing `block`
     /// bytes at a time to `sink`.
     pub fn start(mode: Mode, sink: Sender<TxBlock>, block: usize, drive_db: f32) -> Result<T2Tx, String> {
+        // TX writes of 16 engine blocks: the TX queue (8 writes deep) then
+        // holds about 350 ms of T2 instead of 30. A receiver beside the
+        // transmitter (full duplex) delays its threads now and then by more
+        // than 30 ms; each time the DAC ran dry between frames and every
+        // receiver (this station's too) lost the frames around it. The
+        // latency added is nothing for video.
+        let block = block * TX_BLOCKS;
         let fs = mode.fs() * OS4 as f64 / 4.0;
-        let fpga = crate::dvbs2::fpga_tx::RawTransmitter::start(fs, true)?;
+        // The bitstream's transmit IFFT when there is one (it takes the
+        // OFDM half off the A9: about 60 % of a core); TRXD_NO_T2IFFT=1 keeps
+        // it on the CPU.
+        use crate::dvbs2::fpga_tx::{has_t2ifft, RawMode};
+        // TRXD_T2_TONE=1: a tone 200 kHz above the LO instead (checks the
+        // raw FPGA path on an analyser; samples, so no IFFT).
+        let tone = std::env::var_os("TRXD_T2_TONE").is_some();
+        let ifft = OS4 == 4 && !tone && std::env::var_os("TRXD_NO_T2IFFT").is_none() && has_t2ifft();
+        let fpga = crate::dvbs2::fpga_tx::RawTransmitter::start(fs, if ifft { RawMode::T2Ifft } else { RawMode::Samples8 })?;
+        tracing::info!(fpga_ifft = ifft, "DVB-T2 transmitter");
         // About a T2 frame of packets queued ahead of the modulator.
         let per_frame = mode.p.fec_blocks * (mode.p.kbch() - 80) / (8 * TS_LEN) + 2;
         let (tx, rx) = crossbeam_channel::bounded::<[u8; TS_LEN]>(per_frame);
         let stop = Arc::new(AtomicBool::new(false));
         let st = stop.clone();
         let p = mode.p;
-        // Frames of bytes to a writer thread of their own, two deep: the
-        // next frame is modulated while this one drains into the DMA (which
-        // takes it at the DAC's pace; the TX queue behind it holds only
-        // tens of ms).
-        let (ftx, frx) = crossbeam_channel::bounded::<Vec<u8>>(2);
-        let st2 = stop.clone();
-        std::thread::Builder::new()
-            .name("dvbt2-write".into())
-            .spawn(move || write(frx, sink, block, st2))
-            .map_err(|e| e.to_string())?;
-        // The FEC half (codewords to frame cells) on a thread of its own,
-        // one frame ahead of the OFDM half: the two A9 cores in parallel.
+        // The FEC half (codewords to frame cells, or with the FPGA's IFFT
+        // the interleaved data cells) on a thread of its own, one frame
+        // ahead of the OFDM half: the two A9 cores in parallel.
         let (ctx, crx) = crossbeam_channel::bounded::<Vec<Cell>>(1);
         let st3 = stop.clone();
         std::thread::Builder::new()
             .name("dvbt2-fec".into())
-            .spawn(move || fec(p, rx, ctx, st3))
+            .spawn(move || fec(p, rx, ctx, st3, ifft))
             .map_err(|e| e.to_string())?;
-        let thread = std::thread::Builder::new()
-            .name("dvbt2-tx".into())
-            .spawn(move || run(p, crx, ftx, st, SCALE * 10f32.powf(drive_db.clamp(-20.0, 6.0) / 20.0)))
-            .map_err(|e| e.to_string())?;
-        Ok(T2Tx { mode, packets: tx, stop, thread: Some(thread), _fpga: fpga })
+        let scale = SCALE * 10f32.powf(drive_db.clamp(-20.0, 6.0) / 20.0);
+        let thread = if ifft {
+            // The FPGA's IFFT: frames gathered straight into the TX blocks
+            // (FastFrame), the blocking send paces it.
+            std::thread::Builder::new()
+                .name("dvbt2-tx".into())
+                .spawn(move || run_fpga(p, crx, sink, block, st, scale))
+                .map_err(|e| e.to_string())?
+        } else {
+            // Frames of bytes to a writer thread of their own, two deep:
+            // the next frame is modulated while this one drains into the DMA
+            // (which takes it at the DAC's pace; the TX queue behind it
+            // holds only tens of ms).
+            let (ftx, frx) = crossbeam_channel::bounded::<Vec<u8>>(2);
+            let st2 = stop.clone();
+            std::thread::Builder::new()
+                .name("dvbt2-write".into())
+                .spawn(move || write(frx, sink, block, st2))
+                .map_err(|e| e.to_string())?;
+            std::thread::Builder::new()
+                .name("dvbt2-tx".into())
+                .spawn(move || run(p, crx, ftx, st, scale))
+                .map_err(|e| e.to_string())?
+        };
+        Ok(T2Tx { mode, fpga_ifft: ifft, packets: tx, stop, thread: Some(thread), _fpga: fpga })
     }
 
     /// Keep the modulator's packet queue full from the mux (the modulator
@@ -143,7 +181,7 @@ impl Drop for T2Tx {
 
 /// Frames of bytes into `block`-sized TX writes (blocking on the DMA).
 fn write(frames: Receiver<Vec<u8>>, sink: Sender<TxBlock>, block: usize, stop: Arc<AtomicBool>) {
-    crate::stream::thread_nice(-5);
+    crate::stream::thread_nice(TX_NICE);
     let mut rest: Vec<u8> = Vec::new();
     // Time spent waiting for the modulator after the first frames: the DAC
     // runs dry once the TX queue (tens of ms) empties meanwhile.
@@ -171,9 +209,10 @@ fn write(frames: Receiver<Vec<u8>>, sink: Sender<TxBlock>, block: usize, stop: A
     }
 }
 
-/// TS packets to frame cells (FEC, interleaving, frame builder).
-fn fec(p: Params, packets: Receiver<[u8; TS_LEN]>, cells_out: Sender<Vec<Cell>>, stop: Arc<AtomicBool>) {
-    crate::stream::thread_nice(-5);
+/// TS packets to frame cells (FEC, interleaving, frame builder), or with
+/// `codes` a frame's data cells for [`FastFrame`].
+fn fec(p: Params, packets: Receiver<[u8; TS_LEN]>, cells_out: Sender<Vec<Cell>>, stop: Arc<AtomicBool>, codes: bool) {
+    crate::stream::thread_nice(TX_NICE);
     let mut f = FecStage::new(p);
     let null = {
         let mut n = [0u8; TS_LEN];
@@ -203,7 +242,7 @@ fn fec(p: Params, packets: Receiver<[u8; TS_LEN]>, cells_out: Sender<Vec<Cell>>,
                 null
             })
         };
-        let cells = f.frame(&mut next);
+        let cells = if codes { f.frame_codes(&mut next) } else { f.frame(&mut next) };
         fec_s += t0.elapsed().as_secs_f64();
         frames += 1;
         if frames % 40 == 0 {
@@ -216,13 +255,65 @@ fn fec(p: Params, packets: Receiver<[u8; TS_LEN]>, cells_out: Sender<Vec<Cell>>,
     }
 }
 
-/// Frame cells to 8-bit I/Q bytes (OFDM, conversion) for the writer.
+/// Frames' data cells to the FPGA IFFT's words, straight into `block`-byte
+/// TX writes (blocking on the DMA).
+fn run_fpga(p: Params, codes_in: Receiver<Vec<Cell>>, sink: Sender<TxBlock>, block: usize, stop: Arc<AtomicBool>, drive: f32) {
+    crate::stream::thread_nice(TX_NICE);
+    assert!(block % 4 == 0);
+    let o = OfdmStage::new(p, OS4);
+    // Debug: `echo 68 > /tmp/t2-scale` drives harder (RMS in 8-bit units).
+    let scale: f32 = std::fs::read_to_string("/tmp/t2-scale").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(drive);
+    if scale != SCALE {
+        tracing::info!(scale, "DVB-T2 TX scale (trx.t2_drive_db, or /tmp/t2-scale)");
+    }
+    let ff = FastFrame::new(p, o.ofdm(), scale);
+    drop(o);
+    let fb = ff.frame_bytes();
+    let (mut frames, mut fill_s, mut starved) = (0u64, 0f64, 0f64);
+    let mut cur: Option<Vec<Cell>> = None;
+    let mut at = 0;
+    loop {
+        let mut blk = vec![0u8; block];
+        let mut filled = 0;
+        while filled < block {
+            let codes = match &cur {
+                Some(c) => c,
+                None => {
+                    let t = std::time::Instant::now();
+                    let Ok(c) = codes_in.recv() else { return };
+                    if frames > 4 {
+                        starved += t.elapsed().as_secs_f64();
+                    }
+                    cur.insert(c)
+                }
+            };
+            let n = (block - filled).min(fb - at);
+            let t = std::time::Instant::now();
+            ff.fill(codes, frames as usize, at, &mut blk[filled..filled + n]);
+            fill_s += t.elapsed().as_secs_f64();
+            (at, filled) = (at + n, filled + n);
+            if at == fb {
+                (cur, at) = (None, 0);
+                frames += 1;
+                if frames % 40 == 0 {
+                    let ms = |s: f64| (s / 40.0 * 1e3).round();
+                    tracing::info!(frames, fill_ms = ms(fill_s), starved_ms = ms(starved), fpga_ifft = true, "DVB-T2 OFDM");
+                    (fill_s, starved) = (0.0, 0.0);
+                }
+            }
+        }
+        if stop.load(Ordering::Relaxed) || sink.send(TxBlock::Raw(blk)).is_err() {
+            return;
+        }
+    }
+}
+
+/// Frame cells to 8-bit I/Q bytes (OFDM on the CPU, conversion) for the
+/// writer.
 fn run(p: Params, cells_in: Receiver<Vec<Cell>>, frames_out: Sender<Vec<u8>>, stop: Arc<AtomicBool>, drive: f32) {
-    crate::stream::thread_nice(-5);
+    crate::stream::thread_nice(TX_NICE);
     let o = OfdmStage::new(p, OS4);
     let mut iq = Vec::with_capacity(o.frame_samples());
-    // TRXD_T2_TONE=1: a tone 200 kHz above the LO instead (checks the raw
-    // FPGA path on an analyser).
     let tone = std::env::var_os("TRXD_T2_TONE").is_some();
     // Debug: `echo 68 > /tmp/t2-scale` drives harder (RMS in 8-bit units).
     let scale: f32 = std::fs::read_to_string("/tmp/t2-scale").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(drive);

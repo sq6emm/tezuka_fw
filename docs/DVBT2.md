@@ -122,13 +122,57 @@ With a few dB of margin every block decodes (36 a second); what is lost is
 lost to fading on the indoor path. A9: the demodulator about 70 % of a
 core, the FEC about 31 ms a block (FPGA LDPC 22 ms of it).
 
+## FPGA IFFT, lighter A9 work and full duplex (2026-09-28)
+
+- Transmit: with the bitstream's `t2ifft` (maia-hdl `t2ifft.py`, DAC GPIO
+  bit 4, id "DTX2") the A9 sends each frame's carriers (16-bit words: sync
+  word, P1, per symbol 1705 carriers in bin order) and the FPGA does the
+  IFFTs and guard intervals. `TRXD_NO_T2IFFT=1` keeps the old path.
+- FEC on packed bits: LDPC as 360-bit row rotate-XORs with the
+  accumulation done by prefix XORs (`ldpc_fpga::parity_rows`), BCH a byte at
+  a time, the 16QAM bit interleaver as 8 x 8 bit transposes from the
+  parity-interleaved codeword. `FastFrame` (src/dvbt2/mod.rs): everything
+  after the cell interleaver (time and frequency interleavers, frame
+  builder, pilots, bin order) is the same in every frame, so it is run once
+  on labels at start-up; a frame is then one gather straight into the TX
+  blocks (no writer thread, no frame-sized copies). Bit-exact with the
+  stage-by-stage path (`t2_fec_fast_matches_ref`, `t2_fast_frame_matches`)
+  and with gr-dtv. TX board trxd: 81 % -> about 40 % of a core.
+- Receive: the data cells equalized in fixed point from the front end's
+  16-bit carriers (the A9's VFP takes about 40 ns a complex multiply), the
+  early-window rotation folded into the channel inverse, fast paths for
+  runs of carrier and raw words: demodulator 155 -> about 117 ms a frame.
+- The TX queue now holds about 350 ms of T2 (TX writes of 16 engine blocks)
+  and the T2 threads run above the receive decoders (nice -8): with only
+  30 ms queued, a receiver beside the transmitter delayed it now and then
+  and the DAC ran dry between frames (P1s 458240 + 4k..56k samples apart:
+  every receiver, the board's own too, lost frames).
+- Full duplex: the receiver keeps running while T2 transmits with the FPGA
+  IFFT (as with the FPGA's DVB-S2); split (SPLIT, VFO A receive, VFO B
+  send) across bands tunes the AD936x's RX and TX synthesizers apart
+  (`RadioControl::set_los`, log "LOs apart"). Checked on the Libres: each
+  receives its own T2 at MER about 31 dB with video; DVB-S2 cross band
+  437/2330 MHz on both boards at once. Cross-band T2 between the boards is
+  limited by the link here (Libre 2 -> Libre 1 at 2330 MHz arrives 13 dB
+  weaker than the other way) and by the own transmitter at full power
+  desensing the receiver (fine at 40 dB attenuation), and the FEC below.
+- FEC throughput: T2 hands the decoder 9 blocks (QPSK) or 18 (16QAM) at
+  each frame end; the serial FPGA LDPC decoder (2.5 ms an iteration) plus
+  loading the LLRs (8-10 ms a block over AXI-Lite) could not keep up. The
+  four-lane decoder (maia-hdl `ldpc_dec4.py`, "LDP4", 0.66 ms an
+  iteration, bit-exact with the model) is the next step.
+- Harness: `datv-ref/harness/run_fdx.sh` (both boards full duplex at once,
+  CPU per thread), `cdp_fdx.py` (one board; the UI's script is private, so
+  it drives the buttons).
+
 ## Not done
 
 - 64QAM/256QAM, other FFT sizes, PAPR reduction.
 - 16QAM live: decoded over the air at 2330 MHz (MER about 10 dB, video
   shown), but its 72 FEC blocks a second are twice what the A9 and the
   FPGA's LDPC decoder get through: about half are dropped.
-- The receiver's A9 load: equalization and LLRs could move into the FPGA,
-  and a parallel (layered) LDPC decoder would cut the 22 ms a block; the
-  deinterleavers need a frame of cells (DDR, not block RAM).
+- The receiver's A9 load: equalization (about 70 ms a frame) and LLRs
+  could move into the FPGA (the per-symbol common phase and slope come from
+  the symbol's own pilots: a symbol buffer); the deinterleavers need a
+  frame of cells (DDR, not block RAM). LLRs to the LDPC decoder by DMA.
 - A check with an independent T2 receiver (TV HAT / Ryde).

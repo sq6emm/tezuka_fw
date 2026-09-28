@@ -42,6 +42,42 @@ impl FrameMapper {
     /// One T2 frame's cells from its interleaved data cells.
     pub fn frame(&mut self, data: &[Cell]) -> Vec<Cell> {
         let p = &self.p;
+        let post = &self.post[self.frame_idx];
+        self.frame_idx = (self.frame_idx + 1) % p.t2_frames;
+        // L1-pre and L1-post each spread over the P2 symbols (every N_P2-th
+        // cell to a symbol), then data and dummy cells into the P2 symbols'
+        // rest and the data symbols in order; unmodulated cells last.
+        let mut out = vec![ZERO; p.frame_cells()];
+        let npost = post.len();
+        let (pre_per, post_per) = (L1_PRE_CELLS / N_P2, npost / N_P2);
+        for n in 0..N_P2 {
+            for j in 0..pre_per {
+                out[n * C_P2 + j] = self.pre[n + j * N_P2];
+            }
+            for j in 0..post_per {
+                out[n * C_P2 + pre_per + j] = post[n + j * N_P2];
+            }
+        }
+        let mut src: [&[Cell]; 2] = [data, &self.dummy];
+        let mut put = |mut d: &mut [Cell]| {
+            for s in src.iter_mut() {
+                let n = d.len().min(s.len());
+                d[..n].copy_from_slice(&s[..n]);
+                *s = &s[n..];
+                d = &mut std::mem::take(&mut d)[n..];
+            }
+        };
+        for n in 0..N_P2 {
+            put(&mut out[n * C_P2 + pre_per + post_per..(n + 1) * C_P2]);
+        }
+        put(&mut out[N_P2 * C_P2..]);
+        debug_assert!(src.iter().all(|s| s.is_empty()));
+        out
+    }
+
+    #[cfg(test)]
+    pub fn frame_ref(&mut self, data: &[Cell]) -> Vec<Cell> {
+        let p = &self.p;
         let (_, n_fc, c_fc) = p.data_cells();
         let post = &self.post[self.frame_idx];
         self.frame_idx = (self.frame_idx + 1) % p.t2_frames;
@@ -84,6 +120,41 @@ impl FrameMapper {
 }
 
 impl FrameMapper {
+    /// [`Self::frame`]'s layout for any cell type: L1-pre and L1-post each
+    /// spread over the P2 symbols, then data, dummy and `zero` cells (for
+    /// FastFrame's labels).
+    pub fn layout<T: Copy>(&self, pre: &[T], post: &[T], data: &[T], dummy: &[T], zero: T) -> Vec<T> {
+        let mut z = Vec::with_capacity(self.p.frame_cells());
+        z.extend_from_slice(pre);
+        z.extend_from_slice(post);
+        z.extend_from_slice(data);
+        z.extend_from_slice(dummy);
+        z.resize(self.p.frame_cells(), zero);
+        let mut out = vec![zero; z.len()];
+        let npost = post.len();
+        let (pre_per, post_per) = (L1_PRE_CELLS / N_P2, npost / N_P2);
+        for n in 0..N_P2 {
+            for j in 0..pre_per {
+                out[n * C_P2 + j] = z[n + j * N_P2];
+            }
+            for j in 0..post_per {
+                out[n * C_P2 + pre_per + j] = z[L1_PRE_CELLS + n + j * N_P2];
+            }
+        }
+        let mut read = L1_PRE_CELLS + npost;
+        let mut rest = (0..N_P2).flat_map(|n| n * C_P2 + pre_per + post_per..(n + 1) * C_P2).chain(N_P2 * C_P2..z.len());
+        while read < z.len() {
+            out[rest.next().unwrap()] = z[read];
+            read += 1;
+        }
+        out
+    }
+
+    /// The dummy cells (after the data).
+    pub fn dummy_cells(&self) -> &[Cell] {
+        &self.dummy
+    }
+
     /// The reverse (receive): a frame's cells to (L1-pre, L1-post, data).
     pub fn unmap<T: Copy>(&self, out: &[T]) -> (Vec<T>, Vec<T>, Vec<T>) {
         let npost = l1::post_cells();
