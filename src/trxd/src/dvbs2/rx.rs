@@ -157,6 +157,18 @@ impl Fec {
     pub fn frame(&mut self, llr: &[f32], stats: &mut Stats, out: &mut Vec<[u8; TS_LEN]>) -> bool {
         let t0 = std::time::Instant::now();
         let ok = self.dec.decode(llr, &mut self.bits);
+        self.after_decode(ok, t0, stats, out)
+    }
+
+    /// [`Self::frame`] from LLRs already in the LDPC decoder's 6 bits
+    /// ([`super::fpga_ldpc::Ldpc::decode_q`]).
+    pub fn frame_q(&mut self, llr: &[i8], stats: &mut Stats, out: &mut Vec<[u8; TS_LEN]>) -> bool {
+        let t0 = std::time::Instant::now();
+        let ok = self.dec.decode_q(llr, &mut self.bits);
+        self.after_decode(ok, t0, stats, out)
+    }
+
+    fn after_decode(&mut self, ok: Option<usize>, t0: std::time::Instant, stats: &mut Stats, out: &mut Vec<[u8; TS_LEN]>) -> bool {
         let t_dec = std::time::Instant::now();
         // BCH cleans up what LDPC left (or falsely converged on); it also
         // rescues a nearly converged frame.
@@ -937,9 +949,43 @@ fn publish(r: &Receiver, sh: &std::sync::Mutex<RxShared>, seen: &mut u64) {
 
 /// The decoding thread: LLR vectors (64800) in, LDPC (the FPGA's when
 /// there), BCH, BBFRAME, TS, the demultiplexer's browser messages out.
-fn spawn_fec(
+/// A frame's LLRs for the FEC thread: floats (DVB-S2) or already the LDPC
+/// decoder's 6 bits (DVB-T2); empty: a frame lost.
+pub trait FecBlock: Send + 'static {
+    fn is_empty(&self) -> bool;
+    fn decode(&self, fec: &mut Fec, st: &mut Stats, ts: &mut Vec<[u8; TS_LEN]>) -> bool;
+    /// As f32 LE (the /tmp/datv-dump debug file).
+    fn dump(&self) -> Vec<u8>;
+}
+
+impl FecBlock for Vec<f32> {
+    fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+    fn decode(&self, fec: &mut Fec, st: &mut Stats, ts: &mut Vec<[u8; TS_LEN]>) -> bool {
+        fec.frame(self, st, ts)
+    }
+    fn dump(&self) -> Vec<u8> {
+        self.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+}
+
+impl FecBlock for Vec<i8> {
+    fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+    fn decode(&self, fec: &mut Fec, st: &mut Stats, ts: &mut Vec<[u8; TS_LEN]>) -> bool {
+        fec.frame_q(self, st, ts)
+    }
+    fn dump(&self) -> Vec<u8> {
+        let s = 1.0 / super::fpga_ldpc::LLR_SCALE;
+        self.iter().flat_map(|&v| (v as f32 * s).to_le_bytes()).collect()
+    }
+}
+
+fn spawn_fec<B: FecBlock>(
     p: FrameSpec,
-    frx: crossbeam_channel::Receiver<Vec<f32>>,
+    frx: crossbeam_channel::Receiver<B>,
     fl: std::sync::Arc<std::sync::atomic::AtomicU32>,
     sh: std::sync::Arc<std::sync::Mutex<RxShared>>,
     fs2: std::sync::Arc<std::sync::Mutex<Stats>>,
@@ -978,12 +1024,12 @@ fn spawn_fec(
                 if dumped < DUMP_FRAMES && std::path::Path::new("/tmp/datv-dump").exists() {
                     use std::io::Write;
                     if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/datv-llr.f32") {
-                        let b: Vec<u8> = llr.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        let b: Vec<u8> = llr.dump();
                         let _ = fh.write_all(&b);
                         dumped += 1;
                     }
                 }
-                if fec.frame(&llr, &mut st, &mut ts) {
+                if llr.decode(&mut fec, &mut st, &mut ts) {
                     fl.store(0, Ordering::Relaxed);
                 } else {
                     fl.fetch_add(1, Ordering::Relaxed);
@@ -1175,7 +1221,7 @@ impl RxThread {
         });
         let (tx, rx) = crossbeam_channel::bounded::<(Vec<Complex32>, f64)>(1);
         // Two frames of FEC blocks (18 a frame at 16QAM).
-        let (ftx, frx) = crossbeam_channel::bounded::<Vec<f32>>(40);
+        let (ftx, frx) = crossbeam_channel::bounded::<Vec<i8>>(40);
         let fails = Arc::new(AtomicU32::new(0));
         let shared = Arc::new(Mutex::new(RxShared::default()));
         let fec_stats = Arc::new(Mutex::new(Stats::default()));

@@ -165,14 +165,41 @@ core, the FEC about 31 ms a block (FPGA LDPC 22 ms of it).
   CPU per thread), `cdp_fdx.py` (one board; the UI's script is private, so
   it drives the buttons).
 
+- Equalizer in the FPGA (maia-hdl `t2eq.py`, 2026-09-28): between the
+  front end's FFTs and the ring. Per data symbol z = c G (G the channel
+  inverse the ARM loads after each frame's P2 symbols: two banks, flipped
+  at a symbol's start), the timing slope from the scattered pilots (angle
+  of the neighbours' products / D, a CORDIC), the common phase, then 7-bit
+  cells (unit 20) two to a word; a flag in the carrier header marks those
+  symbols (the frame start is 21 bits now). Two symbol banks: a symbol's
+  carriers follow the last one's without a gap (the FFT's latency). The P2
+  symbols and every symbol before the first table go through as before
+  (the A9's equalizer stays for them). Bit-exact with its model
+  (`test_t2eq.py`, at the front end's pace); the model's cells MER 37 dB.
+  Receive board: datv-rx 57-60 -> about 40 % of a core, the demodulator
+  busy 41 % of the time instead of all of it; decoded over the air.
+- Cross-band T2 full duplex between the two boards (2330 / 437 MHz): each
+  direction decodes with the right attenuation (the board sending 437
+  desenses its own 2330 receiver at full power), both at once not with
+  these antennas: link, not firmware.
+
+- Receive, later the same day: cells go only through the time
+  deinterleaver as they come (about 45 short runs a symbol; stores straight
+  to FEC block order hit the whole 580 KB frame at random, 30 ms a frame),
+  the cell deinterleaver runs per block with the LLRs; the LLRs are
+  computed in fixed point straight into the LDPC decoder's 6 bits (the FEC
+  thread no longer quantizes a float vector: 6.4 -> 3.5 ms a block).
+  Beware on the A9: f32::max/min/clamp are libm calls (fmaxf/fminf) in
+  armv7 code, about 40 ns each. Demodulator 155 -> 63 ms a frame over the
+  day; the receive board's trxd about 90 % of a core while receiving T2.
+
 ## Not done
 
 - 64QAM/256QAM, other FFT sizes, PAPR reduction.
 - 16QAM live: decoded over the air at 2330 MHz (MER about 10 dB, video
   shown), but its 72 FEC blocks a second are twice what the A9 and the
   FPGA's LDPC decoder get through: about half are dropped.
-- The receiver's A9 load: equalization (about 70 ms a frame) and LLRs
-  could move into the FPGA (the per-symbol common phase and slope come from
-  the symbol's own pilots: a symbol buffer); the deinterleavers need a
-  frame of cells (DDR, not block RAM). LLRs to the LDPC decoder by DMA.
+- The receiver's A9 load: LLRs (about 17 ms a frame) could move into the
+  FPGA; the deinterleavers need a frame of cells (DDR, not block RAM).
+  LLRs to the LDPC decoder by DMA.
 - A check with an independent T2 receiver (TV HAT / Ryde).

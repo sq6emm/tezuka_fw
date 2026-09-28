@@ -83,6 +83,20 @@ Tests: `rsnn_matches_torch` (RSNN_VEC=testvec.bin), and on a directory of
 --nocapture` (also `rscw_viterbi`, `rscw_oracle` with RSCW_LLRDIR for
 LLRs from the training side, `rscw_stream` for the previous engine).
 
+### Larger networks (2026-09-28)
+
+train.py takes the temporal layers' width and dilations (C1D, DIL); the
+weight format RSN3 carries them and rsnn.rs runs any size, now frame by
+frame (`Stream`: every frame through every layer once, bit for bit the
+batch pass; the chunked batch redid 2 x reach frames of context each time).
+Tried: C2D 16, C1D 64, DIL 1..32 (132 k weights) and C2D 24, C1D 64,
+DIL 1..64 (161 k), 8000 steps each. Midway they scored no better than the
+shipped network on the recordings; at the end (streaming, as trxd runs):
+the 161 k one 34 of 55 (characters 33, oracle 35), the 132 k one 33,
+against the shipped network's 30. The cost on the A9 (streaming): about
+23.5 % of a core for 132 k (6 % shipped): the case for running it in the
+FPGA.
+
 ## Not done
 
 - A language model (callsign structure, repeated calls combined): the

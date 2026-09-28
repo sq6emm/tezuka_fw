@@ -7,14 +7,18 @@ torch.set_num_threads(int(os.environ.get('THREADS', '24')))
 
 
 class Net(nn.Module):
-    def __init__(self, c2d=int(os.environ.get('C2D', '12')), c1d=32):
+    # C1D: temporal channels; DIL: the temporal convolutions' dilations
+    # (context: 4 x sum of them frames either side). The shipped network:
+    # C2D=8, C1D=32, DIL=1,2,4,8 (about 23 k weights, for the A9).
+    def __init__(self, c2d=int(os.environ.get('C2D', '12')), c1d=int(os.environ.get('C1D', '32')),
+                 dil=tuple(int(x) for x in os.environ.get('DIL', '1,2,4,8').split(','))):
         super().__init__()
         self.c1 = nn.Conv2d(1, c2d, (3, 5), padding=(1, 2))
         self.c2 = nn.Conv2d(c2d, c2d, (3, 5), padding=(1, 2), stride=(1, 2))
         self.c3 = nn.Conv2d(c2d, c2d, (3, 3), padding=(1, 1))
         self.att = nn.Conv2d(c2d, 1, 1)
         self.inp = nn.Conv1d(2 * c2d, c1d, 1)
-        self.t = nn.ModuleList([nn.Conv1d(c1d, c1d, 5, padding=2 * d, dilation=d) for d in (1, 2, 4, 8)])
+        self.t = nn.ModuleList([nn.Conv1d(c1d, c1d, 5, padding=2 * d, dilation=d) for d in dil])
         self.out = nn.Conv1d(c1d, 1, 1)
 
     def forward(self, x):                       # x: (B, T, F)

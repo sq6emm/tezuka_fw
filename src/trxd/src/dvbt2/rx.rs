@@ -34,7 +34,7 @@ pub fn receive(p: Params, x: &[Complex32], fs: f64) -> Report {
             report.mer_db.push(d.stats.mer_db);
         }
         for llr in blocks.drain(..) {
-            fec.frame(&llr, &mut stats, &mut report.packets);
+            fec.frame_q(&llr, &mut stats, &mut report.packets);
         }
     }
     if let Some(se) = &d.sym_err {
@@ -176,6 +176,11 @@ mod tests {
             .collect();
         let bins: Vec<usize> = (0..1705).map(|k| super::super::ofdm::Ofdm::new(p).bin(k)).collect();
         let mut fe = Model::new(p.frame_samples() as u64, p.symbols() as u64, p.guard.samples() as u64, &bins);
+        // T2EQ=0: without the FPGA's equalizer (in the model)
+        if std::env::var("T2EQ").map_or(true, |v| v != "0") {
+            let (dx, dy) = p.pilots.dxdy();
+            fe.enable_eq(super::super::N_P2, dx, dy, p.symbols() - 1);
+        }
         let mut d = super::super::stream::Demod::new(p, fs);
         d.set_center(25_000.0);
         let mut fec = crate::dvbs2::rx::Fec::new(crate::dvbs2::FrameSpec::long(crate::dvbs2::fpga_tx::LongMode::Qpsk12));
@@ -186,14 +191,14 @@ mod tests {
         for (i, c) in samples.chunks(chunk).enumerate() {
             // Commands reach the front end two chunks (10 ms) later.
             for (_, cmd) in late.iter().filter(|(at, _)| *at == i) {
-                fe.apply(*cmd);
+                fe.apply(cmd.clone());
             }
             words.clear();
             fe.run(c, &mut words);
             d.push_words(&words, &mut blocks, &mut ctl);
             late.extend(ctl.drain(..).map(|cmd| (i + 2, cmd)));
             for llr in blocks.drain(..) {
-                fec.frame(&llr, &mut stats, &mut packets);
+                fec.frame_q(&llr, &mut stats, &mut packets);
             }
         }
         eprintln!("frames {}, blocks {}, packets {}, MER {:.1} dB, freq {:.0} Hz, P1 missed {}, LDPC failures {}", d.stats.frames, d.stats.blocks, packets.len(), d.stats.mer_db, d.stats.freq_hz, d.stats.p1_missed, stats.ldpc_fail);
@@ -234,7 +239,7 @@ mod tests {
                 eprintln!("ctl {cmd:?}");
             }
             for llr in blocks.drain(..) {
-                fec.frame(&llr, &mut stats, &mut packets);
+                fec.frame_q(&llr, &mut stats, &mut packets);
             }
         }
         if let Some(se) = &d.sym_err {
@@ -268,7 +273,7 @@ mod tests {
                         next = next.map(|n| n + 1);
                     }
                 }
-                Word::CarHeader { j, f22 } => ffts.push((j, f22, Vec::new())),
+                Word::CarHeader { j, f21, .. } => ffts.push((j, f21, Vec::new())),
                 Word::Car(v) => {
                     if let Some(f) = ffts.last_mut() {
                         f.2.push(Complex32::new(v[0] as f32, v[1] as f32));
@@ -324,7 +329,7 @@ mod tests {
             let fft = planner.plan_fft_forward(2048);
             let mut done = 0;
             for (j, f22, v) in ffts.iter().filter(|f| f.2.len() == 1705).skip(8) {
-                let fr = super::super::fe::extend(*f22, 22, *c0 + 1_000_000);
+                let fr = super::super::fe::extend(*f22, 21, *c0 + 1_000_000);
                 let start = fr + 2048 + *j as u64 * 2304 + 256 - 64;
                 if start < *c0 || start + 2100 > c0 + big.len() as u64 {
                     continue;
@@ -387,7 +392,7 @@ mod tests {
             let skip: usize = std::env::var("T2SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
             let mut near = near0 + 1_000_000;
             for (idx, (j, f22, v)) in ffts.iter().filter(|f| f.2.len() == 1705).enumerate() {
-                let fr = super::super::fe::extend(*f22, 22, near);
+                let fr = super::super::fe::extend(*f22, 21, near);
                 near = fr;
                 if idx < skip {
                     continue;
@@ -553,6 +558,11 @@ mod tests {
         let samples: Vec<[i16; 2]> = x.iter().map(|z| [q(z.re), q(z.im)]).collect();
         let bins: Vec<usize> = (0..1705).map(|k| super::super::ofdm::Ofdm::new(p).bin(k)).collect();
         let mut fe = Model::new(p.frame_samples() as u64, p.symbols() as u64, p.guard.samples() as u64, &bins);
+        // T2EQ=1: with the FPGA's equalizer (in the model)
+        if std::env::var_os("T2EQ").is_some() {
+            let (dx, dy) = p.pilots.dxdy();
+            fe.enable_eq(super::super::N_P2, dx, dy, p.symbols() - 1);
+        }
         let mut d = super::super::stream::Demod::new(p, fs);
         let (mut blocks, mut ctl) = (Vec::new(), Vec::new());
         let mut chunks = Vec::new();

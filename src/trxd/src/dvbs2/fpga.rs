@@ -75,6 +75,15 @@ const REG_T2_TRACK: usize = 0x4C;
 const REG_T2_FREQ: usize = 0x50;
 const REG_T2_NEXT_START: usize = 0x54;
 const REG_T2_STATUS: usize = 0x5C;
+// The T2 equalizer (maia-hdl t2eq.py), bitstreams that have it: control (0
+// enable, 1 gbank, 9:2 p2, 14:10 gshift, 22:15 fc_j), pilots (5:0 dx, 8:6
+// dy), 1/D (15:0 data symbols, 31:16 the frame closing one, x 65536), the
+// G write address (10:0, 11 bank, 12 write), G data, status (symbols).
+const REG_T2EQ_CONTROL: usize = 0x60;
+const REG_T2EQ_PILOTS: usize = 0x64;
+const REG_T2EQ_REC: usize = 0x68;
+const REG_T2EQ_GADDR: usize = 0x6C;
+const REG_T2EQ_GDATA: usize = 0x70;
 const T2_ENABLE: u32 = 1;
 const T2_SCHEDULED: u32 = 1 << 1;
 const T2_LOAD: u32 = 1 << 2;
@@ -146,6 +155,10 @@ pub struct FrontEnd {
     flagged: bool,
     /// DVB-T2 with the FPGA's OFDM front end: the ring holds its words.
     t2_fe: bool,
+    /// The T2 equalizer's control word (p2, fc_j) when the bitstream has
+    /// one, and the G bank in use.
+    t2_eq: Option<u32>,
+    eq_bank: std::cell::Cell<u32>,
 }
 
 impl FrontEnd {
@@ -216,7 +229,7 @@ impl FrontEnd {
         }
         // 16-bit mode (0), start: the ring fills from RING_START.
         regs.wr32(REG_REC_CONTROL, 1);
-        Ok(FrontEnd { _mem: mem, regs, ring, fs_out: design.fs_out(), rd: RING_START, center_hz, generation, symbols, flagged, t2_fe: false })
+        Ok(FrontEnd { _mem: mem, regs, ring, fs_out: design.fs_out(), rd: RING_START, center_hz, generation, symbols, flagged, t2_fe: false, t2_eq: None, eq_bank: std::cell::Cell::new(0) })
     }
 
     /// DVB-T2: the recorder takes the T2 resampler's samples at (about)
@@ -273,6 +286,24 @@ impl FrontEnd {
             regs.wr32(REG_T2_TRACK, TRACK);
             regs.wr32(REG_T2_FREQ, 0);
         }
+        // The equalizer, if there (its pilot layout reads back); on once the
+        // receiver sends the first channel inverse. TRXD_NO_T2EQ=1: off.
+        let (dx, dy) = p.pilots.dxdy();
+        let pilots = dx as u32 | (dy as u32) << 6;
+        let mut t2_eq = None;
+        if t2_fe {
+            regs.wr32(REG_T2EQ_CONTROL, 0);
+            regs.wr32(REG_T2EQ_PILOTS, pilots);
+            if regs.rd32(REG_T2EQ_PILOTS) == pilots && std::env::var_os("TRXD_NO_T2EQ").is_none() {
+                let (_, n_fc, _) = p.data_cells();
+                let fc_j = if n_fc != 0 { p.symbols() as u32 - 1 } else { 255 };
+                let rec = |d: usize| ((65536.0 / d as f64).round() as u32).min(0xFFFF);
+                regs.wr32(REG_T2EQ_REC, rec(dx * dy) | rec(dx) << 16);
+                let base = (crate::dvbt2::N_P2 as u32) << 2 | fc_j << 15;
+                regs.wr32(REG_T2EQ_CONTROL, base);
+                t2_eq = Some(base);
+            }
+        }
         regs.wr32(REG_SYMSYNC, T2);
         if t2_fe {
             regs.wr32(REG_T2_CONTROL, T2_ENABLE);
@@ -289,6 +320,8 @@ impl FrontEnd {
             symbols: false,
             flagged: false,
             t2_fe,
+            t2_eq,
+            eq_bank: std::cell::Cell::new(0),
         })
     }
 
@@ -312,6 +345,18 @@ impl FrontEnd {
                 self.regs.wr32(REG_T2_CONTROL, en | T2_SCHEDULED | T2_LOAD);
             }
             Ctl::Freq(f) => self.regs.wr32(REG_T2_FREQ, f),
+            Ctl::EqTable { g, gshift } => {
+                let Some(base) = self.t2_eq else { return };
+                // into the bank not in use, then flip (taken at the next
+                // symbol's start)
+                let bank = self.eq_bank.get() ^ 1;
+                for (k, &v) in g.iter().enumerate() {
+                    self.regs.wr32(REG_T2EQ_GDATA, v);
+                    self.regs.wr32(REG_T2EQ_GADDR, k as u32 | bank << 11 | 1 << 12);
+                }
+                self.regs.wr32(REG_T2EQ_CONTROL, base | 1 | bank << 1 | (gshift & 31) << 10);
+                self.eq_bank.set(bank);
+            }
         }
     }
 

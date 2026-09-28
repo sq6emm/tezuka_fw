@@ -96,8 +96,12 @@ pub struct Demod {
     /// The same the other way: for each flat cell, its place in `cells`
     /// (FEC block * block cells + cell), or u32::MAX (L1, dummy cells).
     scatter: Vec<u32>,
-    /// The frame's FEC block cells, in block order, 8-bit I/Q.
+    /// The frame's FEC block cells, cell-interleaved (time deinterleaved
+    /// only), 8-bit I/Q.
     cells: Vec<[i8; 2]>,
+    /// One FEC block's cells in order (the cell deinterleaver's output).
+    blk: Vec<[i8; 2]>,
+    ci: CellInterleaver,
     /// The frame's data cells, equalized, 8-bit I/Q.
     flat: Vec<[i8; 2]>,
     /// Samples from absolute index `base` on.
@@ -193,11 +197,16 @@ impl Demod {
         let cells = fi.unframe(&idx);
         let (pre_gather, _post, dcells) = fm.unmap(&cells);
         let gather = ci.deinterleave(&dcells, p.fec_blocks);
+        // Cells go only through the time deinterleaver here: data cell d
+        // (row d / cols, column d % cols of it) to rows column + row, FEC
+        // block r's cell-interleaved cells at r cells..: a symbol's cells
+        // land in about 45 short runs. The cell deinterleaver runs per block
+        // with the LLRs, in its 64 KB. (Stores straight to FEC block order
+        // hit the whole 580 KB frame at random: 30 ms a frame on the A9.)
+        let (rows, cols) = (p.cells() / 5, 5 * p.fec_blocks);
         let mut scatter = vec![u32::MAX; at];
-        for (b, g) in gather.iter().enumerate() {
-            for (j, &i) in g.iter().enumerate() {
-                scatter[i as usize] = (b * g.len() + j) as u32;
-            }
+        for (d, &i) in dcells.iter().enumerate() {
+            scatter[i as usize] = (rows * (d % cols) + d / cols) as u32;
         }
         let ncells = gather.iter().map(|g| g.len()).sum();
         let fft = FftPlanner::new().plan_fft_forward(FFT);
@@ -223,6 +232,8 @@ impl Demod {
             pre_gather,
             scatter,
             cells: vec![[0; 2]; ncells],
+            blk: Vec::new(),
+            ci,
             buf: Vec::new(),
             base: 0,
             center_hz: 0.0,
@@ -281,7 +292,7 @@ impl Demod {
 
     /// Samples in; the FEC blocks of every frame completed, as LLRs
     /// (positive = 0, 64800 each), onto `out`.
-    pub fn push(&mut self, x: &[Complex32], out: &mut Vec<Vec<f32>>) {
+    pub fn push(&mut self, x: &[Complex32], out: &mut Vec<Vec<i8>>) {
         let t_in = std::time::Instant::now();
         self.buf.extend_from_slice(x);
         self.prof[5] += t_in.elapsed().as_secs_f64();
@@ -623,7 +634,7 @@ impl Demod {
     }
 
     /// The frame's cells are all in: MER, FEC blocks' LLRs.
-    fn finish(&mut self, out: &mut Vec<Vec<f32>>) {
+    fn finish(&mut self, out: &mut Vec<Vec<i8>>) {
         let t0 = std::time::Instant::now();
         let p = self.p;
         let flat = &self.flat;
@@ -684,37 +695,52 @@ impl Demod {
         let (sn, cs) = (-angle.to_radians()).sin_cos();
         let bits = p.constellation.bits();
         let n = self.gather[0].len();
-        for blk in self.cells.chunks(n) {
-            let mut llr = vec![0f32; n * bits];
-            let (k, a) = match p.constellation {
-                Constellation::Qpsk => (2.0 * std::f32::consts::FRAC_1_SQRT_2 * 2.0 / sigma2 / CELL_SCALE, 0.0),
-                Constellation::Qam16 => {
-                    let a = 1.0 / 10f32.sqrt();
-                    (4.0 * a / sigma2 / CELL_SCALE, 2.0 * a * CELL_SCALE)
-                }
-            };
+        // Fixed point (the A9's VFP takes about 40 ns a complex multiply):
+        // the rotation in Q14, the LLR scale (x LLR_SCALE: straight into the
+        // LDPC decoder's 6 bits) in fixed point too.
+        let (k, a) = match p.constellation {
+            Constellation::Qpsk => (2.0 * std::f32::consts::FRAC_1_SQRT_2 * 2.0 / sigma2 / CELL_SCALE, 0.0),
+            Constellation::Qam16 => {
+                let a = 1.0 / 10f32.sqrt();
+                (4.0 * a / sigma2 / CELL_SCALE, 2.0 * a * CELL_SCALE)
+            }
+        };
+        // (Q10, capped at 64: |cell| >= 1 saturates there; in i32 with the
+        // cells in Q7, no 64-bit multiplies)
+        let kq = (k * crate::dvbs2::fpga_ldpc::LLR_SCALE * 1024.0).clamp(0.0, 65536.0) as i32;
+        let (c14, s14) = ((cs * 16384.0).round() as i32, (sn * 16384.0).round() as i32);
+        let a14 = (a * 16384.0).round() as i32;
+        let rot = p.rotation;
+        let q = |z14: i32| -> i8 {
+            let v = ((z14 >> 7) * kq + (1 << 16)) >> 17;
+            (if v > 31 { 31 } else if v < -31 { -31 } else { v }) as i8
+        };
+        for (r, ti) in self.cells.chunks(n).enumerate() {
+            self.ci.block_gather(r, ti, &mut self.blk);
+            let blk = &self.blk;
+            let mut llr = vec![0i8; n * bits];
             for j in 0..n {
                 let c = blk[j];
-                let (zr, zi) = if p.rotation {
+                let (zr, zi) = if rot {
                     // word j: I from cell j, Q from cell j + 1; rotate back
                     let d = blk[if j + 1 == n { 0 } else { j + 1 }];
-                    let (re, im) = (c[0] as f32, d[1] as f32);
-                    (re * cs - im * sn, re * sn + im * cs)
+                    let (re, im) = (c[0] as i32, d[1] as i32);
+                    (re * c14 - im * s14, re * s14 + im * c14)
                 } else {
-                    (c[0] as f32, c[1] as f32)
+                    (c[0] as i32 * 16384, c[1] as i32 * 16384)
                 };
                 match p.constellation {
                     Constellation::Qpsk => {
-                        llr[2 * j] = zr * k;
-                        llr[2 * j + 1] = zi * k;
+                        llr[2 * j] = q(zr);
+                        llr[2 * j + 1] = q(zi);
                     }
                     Constellation::Qam16 => {
                         // Word bits 3, 2: signs of I, Q (0 positive); 1, 0:
                         // outer (0) or inner level. Max-log, per axis.
-                        llr[4 * j] = zr * k;
-                        llr[4 * j + 1] = zi * k;
-                        llr[4 * j + 2] = (zr.abs() - a) * k;
-                        llr[4 * j + 3] = (zi.abs() - a) * k;
+                        llr[4 * j] = q(zr);
+                        llr[4 * j + 1] = q(zi);
+                        llr[4 * j + 2] = q(zr.abs() - a14);
+                        llr[4 * j + 3] = q(zi.abs() - a14);
                     }
                 }
             }
@@ -797,6 +823,10 @@ struct FeState {
     car: Option<(usize, u64)>,
     car_pos: usize,
     car_buf: Vec<[i16; 2]>,
+    /// The symbol coming in was equalized by the FPGA (t2eq): its cells in
+    /// carrier order.
+    car_eq: bool,
+    eq_cells: Vec<[i8; 2]>,
     /// The frame being assembled: its start, the next symbol expected,
     /// whether all came.
     frame: Option<(u64, usize, bool)>,
@@ -818,7 +848,7 @@ struct FeState {
 impl Demod {
     /// Words from the FPGA's OFDM front end ([`super::fe`]) in; FEC blocks
     /// out as from [`Self::push`]; `ctl` gets what the front end must do.
-    pub fn push_words(&mut self, words: &[u32], out: &mut Vec<Vec<f32>>, ctl: &mut Vec<super::fe::Ctl>) {
+    pub fn push_words(&mut self, words: &[u32], out: &mut Vec<Vec<i8>>, ctl: &mut Vec<super::fe::Ctl>) {
         use super::fe::{decode, extend, Word};
         let mut fe = self.fe.take().unwrap_or_else(|| {
             Box::new(FeState {
@@ -829,6 +859,8 @@ impl Demod {
                 car: None,
                 car_pos: 0,
                 car_buf: vec![[0; 2]; CARRIERS],
+                car_eq: false,
+                eq_cells: vec![[0; 2]; 2 * super::fe::EQ_WORDS],
                 frame: None,
                 f_est: 0.0,
                 nco_hz: 0.0,
@@ -848,19 +880,33 @@ impl Demod {
             // Fast paths (most words): a run of carrier words into the FFT
             // buffer, a run of raw samples onto the current run (header bit
             // 0 clear; bit 16 marks carriers; a gap word has bit 0 set).
-            if w & 0x0001_0001 == 0x0001_0000 && fe.car.is_some() && fe.car_pos < CARRIERS {
-                let run = &words[i - 1..(i - 1 + CARRIERS - fe.car_pos).min(words.len())];
+            let limit = if fe.car_eq { super::fe::EQ_WORDS } else { CARRIERS };
+            if w & 0x0001_0001 == 0x0001_0000 && fe.car.is_some() && fe.car_pos < limit {
+                let run = &words[i - 1..(i - 1 + limit - fe.car_pos).min(words.len())];
                 let n = run.iter().position(|&x| x & 0x0001_0001 != 0x0001_0000).unwrap_or(run.len());
-                let order = &self.order[fe.car_pos..fe.car_pos + n];
-                for (&x, &k) in run[..n].iter().zip(order) {
-                    fe.car_buf[k] = [(x as u16 & 0xFFFE) as i16, ((x >> 16) as u16 & 0xFFFE) as i16];
+                if fe.car_eq {
+                    for (p, &x) in run[..n].iter().enumerate() {
+                        let c = super::fe::eq_cells(x);
+                        let at = 2 * (fe.car_pos + p);
+                        fe.eq_cells[at] = c[0];
+                        fe.eq_cells[at + 1] = c[1];
+                    }
+                } else {
+                    let order = &self.order[fe.car_pos..fe.car_pos + n];
+                    for (&x, &k) in run[..n].iter().zip(order) {
+                        fe.car_buf[k] = [(x as u16 & 0xFFFE) as i16, ((x >> 16) as u16 & 0xFFFE) as i16];
+                    }
                 }
                 fe.car_pos += n;
                 i += n - 1;
-                if fe.car_pos == CARRIERS {
+                if fe.car_pos == limit {
                     let (j, f) = fe.car.take().unwrap();
                     if !fe.acquiring {
-                        self.fe_symbol(&mut fe, j, f, out, ctl);
+                        if fe.car_eq {
+                            self.fe_symbol_eq(&mut fe, j, f, out, ctl);
+                        } else {
+                            self.fe_symbol(&mut fe, j, f, out, ctl);
+                        }
                     }
                 }
                 continue;
@@ -947,7 +993,7 @@ impl Demod {
                         fe.raw_all_asked = false;
                     }
                 }
-                Word::CarHeader { j, f22 } => {
+                Word::CarHeader { j, f21, eq } => {
                     if fe.acquiring && fe.raw_next.is_some() && !fe.raw_all_asked {
                         // The front end is already scheduled (the receiver
                         // restarted, a recording): take its frames.
@@ -957,11 +1003,13 @@ impl Demod {
                         acq.clear();
                         self.stats.locked = true;
                     }
-                    fe.car = Some((j as usize, extend(f22, 22, fe.now)));
+                    fe.car = Some((j as usize, extend(f21, 21, fe.now)));
                     fe.car_pos = 0;
+                    fe.car_eq = eq;
                 }
                 Word::Car(v) => {
-                    if fe.car.is_none() || fe.car_pos >= CARRIERS {
+                    if fe.car.is_none() || fe.car_pos >= CARRIERS || fe.car_eq {
+                        // (equalized words always take the fast path above)
                         continue;
                     }
                     fe.car_buf[self.order[fe.car_pos]] = v;
@@ -1054,14 +1102,81 @@ impl Demod {
     }
 
     /// One FFT from the front end: symbol `j` of the frame starting at `f`.
-    fn fe_symbol(&mut self, fe: &mut FeState, j: usize, f: u64, out: &mut Vec<Vec<f32>>, ctl: &mut Vec<super::fe::Ctl>) {
-        let nsym = self.p.symbols();
+    /// A symbol of frame `f` is in: whether the frame has all of its
+    /// symbols so far.
+    fn fe_frame_ok(fe: &mut FeState, j: usize, f: u64) -> bool {
         match fe.frame {
             Some((ff, next, ok)) if ff == f => fe.frame = Some((f, j + 1, ok && j == next)),
             _ => fe.frame = Some((f, j + 1, j == 0)),
         }
-        let ok = fe.frame.unwrap().2;
-        if !ok {
+        fe.frame.unwrap().2
+    }
+
+    /// A symbol the FPGA equalized (t2eq): its cells as they are.
+    fn fe_symbol_eq(&mut self, fe: &mut FeState, j: usize, f: u64, out: &mut Vec<Vec<i8>>, ctl: &mut Vec<super::fe::Ctl>) {
+        let nsym = self.p.symbols();
+        if !Self::fe_frame_ok(fe, j, f) || j < N_P2 {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let cells = std::mem::take(&mut fe.eq_cells);
+        self.eq_symbol(j, &cells);
+        fe.eq_cells = cells;
+        self.prof[2] += t0.elapsed().as_secs_f64();
+        if j == nsym - 1 {
+            self.finish(out);
+            self.fe_track(fe, f, ctl);
+        }
+    }
+
+    /// Symbol `j`'s cells from the FPGA (unit EQ_UNIT, carrier order): the
+    /// pilot error for the MER, the data cells (to CELL_SCALE) to their
+    /// places.
+    fn eq_symbol(&mut self, j: usize, cells: &[[i8; 2]]) {
+        let u = 1.0 / super::fe::EQ_UNIT as f32;
+        let (mut e, mut n) = (0f64, 0f64);
+        for &(k, rf) in &self.pilots[j] {
+            let c = cells[k];
+            e += (Complex32::new(c[0] as f32 * u, c[1] as f32 * u) - rf).norm_sqr() as f64;
+            n += 1.0;
+        }
+        self.pil_err.0 += e;
+        self.pil_err.1 += n;
+        if self.sym_err.is_some() {
+            self.sym_err_frame[j].0 += e;
+            self.sym_err_frame[j].1 += n;
+        }
+        // (CELL_SCALE is twice EQ_UNIT)
+        let (lo, hi) = (self.data_at[j], self.data_at[j + 1]);
+        let out = &mut self.flat[lo..hi];
+        let dest = &self.scatter[lo..hi];
+        let dst = &mut self.cells;
+        for ((o, &d), &k) in out.iter_mut().zip(dest).zip(&self.data[j]) {
+            let c = cells[k];
+            let c = [c[0] << 1, c[1] << 1];
+            if d != u32::MAX {
+                dst[d as usize] = c;
+            } else {
+                *o = c;
+            }
+        }
+    }
+
+    /// The channel inverse for the FPGA's equalizer (from `hinv_e`, with the
+    /// early window's rotation, as the carrier words come).
+    fn eq_table(&self) -> super::fe::Ctl {
+        let z = super::fe::EQ_Z_UNIT;
+        let mean = self.hinv_e.iter().map(|h| h.norm()).sum::<f32>() / CARRIERS as f32 * z;
+        let gshift = if mean > 0.0 { (8192.0 / mean).log2().floor().clamp(1.0, 30.0) as u32 } else { 16 };
+        let m = z * 2f32.powi(gshift as i32);
+        let q = |v: f32| ((v * m).round().clamp(-32767.0, 32767.0) as i32 as u32) & 0xFFFF;
+        let g = self.hinv_e.iter().map(|h| q(h.re) | q(h.im) << 16).collect();
+        super::fe::Ctl::EqTable { g, gshift }
+    }
+
+    fn fe_symbol(&mut self, fe: &mut FeState, j: usize, f: u64, out: &mut Vec<Vec<i8>>, ctl: &mut Vec<super::fe::Ctl>) {
+        let nsym = self.p.symbols();
+        if !Self::fe_frame_ok(fe, j, f) {
             return;
         }
         if j < N_P2 {
@@ -1073,6 +1188,8 @@ impl Demod {
             self.prof[1] += t0.elapsed().as_secs_f64();
             if j == N_P2 - 1 {
                 self.p2_channel();
+                // the FPGA's equalizer takes it from the next symbol on
+                ctl.push(self.eq_table());
             }
         } else {
             // data symbols straight from the front end's words
@@ -1171,13 +1288,11 @@ impl Demod {
     }
 }
 
-/// [`q8`] with the saturation in float (max/min, NaN to -127) and an
-/// unchecked conversion: no compares and branches around it.
+/// [`q8`] with plain compares (f32::max/min are libm calls on armv7).
 #[inline]
 fn q8f(v: f32) -> i8 {
-    let x = v.max(-127.0).min(127.0);
-    // SAFETY: x is finite and within -127..=127, so x +- 0.5 fits an i32.
-    unsafe { (x + 0.5f32.copysign(x)).to_int_unchecked::<i32>() as i8 }
+    let x = if v > 127.0 { 127.0 } else if v < -127.0 { -127.0 } else { v };
+    (if x >= 0.0 { x + 0.5 } else { x - 0.5 }) as i32 as i8
 }
 
 /// Round to 8 bits (saturating) without libm's round().

@@ -27,7 +27,7 @@ const MAX_ITER: u32 = 50;
 pub static PROF_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Channel LLR -> the decoder's 6-bit input (as the model was tuned).
-const LLR_SCALE: f32 = 2.0;
+pub const LLR_SCALE: f32 = 2.0;
 
 pub struct Window {
     _mem: File,
@@ -116,6 +116,58 @@ impl Drop for Window {
     }
 }
 
+/// The LLR words of the window: `v(i)` the 6-bit LLR of variable i, the
+/// parity in the four-lane decoder's layout when `perm` is there.
+fn pack(q: &mut [u32], perm: &[u32], k: usize, v: impl Fn(usize) -> u32) {
+    if perm.is_empty() {
+        for (w, o) in q.iter_mut().enumerate() {
+            let i = 4 * w;
+            *o = v(i) | v(i + 1) << 8 | v(i + 2) << 16 | v(i + 3) << 24;
+        }
+    } else {
+        for (w, o) in q[..k / 4].iter_mut().enumerate() {
+            let i = 4 * w;
+            *o = v(i) | v(i + 1) << 8 | v(i + 2) << 16 | v(i + 3) << 24;
+        }
+        for (o, p) in q[k / 4..].iter_mut().zip(perm.chunks_exact(4)) {
+            let x = |j: usize| v(k + p[j] as usize);
+            *o = x(0) | x(1) << 8 | x(2) << 16 | x(3) << 24;
+        }
+    }
+}
+
+/// The LLRs into the window, a decode, the decisions back.
+fn run_fpga(win: &Window, rate: LongRate, q: &mut [u32], max_iter: u32, need: usize, bits: &mut [u8], t_q: std::time::Instant) -> Option<usize> {
+    win.write_words(0, q);
+    let t_in = std::time::Instant::now();
+    win.wr(0xFF00, 1 | ((rate == LongRate::R3_4) as u32) << 1 | max_iter << 8);
+    // 2.5 ms an iteration: sleep in small steps until done.
+    let t0 = std::time::Instant::now();
+    while win.rd(0xFF04) & 1 == 1 {
+        if t0.elapsed() > std::time::Duration::from_millis(500) {
+            tracing::warn!("LDPC: the FPGA decoder did not finish");
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(500));
+    }
+    let t_out = std::time::Instant::now();
+    let st = win.rd(0xFF04);
+    // Decisions: the sign bits of the BCH codeword part (the
+    // parity bits after it are never read).
+    let words = need.div_ceil(4);
+    win.read_words(0, &mut q[..words]);
+    for (w, &v) in q[..words].iter().enumerate() {
+        for i in 0..4 {
+            bits[4 * w + i] = ((v >> (8 * i + 7)) & 1) as u8;
+        }
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    PROF_NS[0].fetch_add((t_in - t_q).as_nanos() as u64, Relaxed);
+    PROF_NS[1].fetch_add((t_out - t0).as_nanos() as u64, Relaxed);
+    PROF_NS[2].fetch_add(t_out.elapsed().as_nanos() as u64, Relaxed);
+    ((st >> 1) & 1 == 1).then_some(((st >> 8) & 0x3F) as usize)
+}
+
 /// The four-lane decoder's parity layout: for each parity byte of its RAM
 /// (word k / 4 + r 90 + c / 4, byte c % 4), the parity bit c q + r.
 pub fn parity_layout(rate: LongRate) -> Vec<u32> {
@@ -171,6 +223,24 @@ impl Ldpc {
         }
     }
 
+    /// [`Self::decode`] from LLRs already in the decoder's 6 bits
+    /// ([`quantize_llr`] at [`LLR_SCALE`]): the DVB-T2 receiver makes them
+    /// so, without a float vector between.
+    pub fn decode_q(&mut self, llr: &[i8], bits: &mut [u8]) -> Option<usize> {
+        match self {
+            Ldpc::Short(_) => {
+                let f: Vec<f32> = llr.iter().map(|&v| v as f32 / LLR_SCALE).collect();
+                self.decode(&f, bits)
+            }
+            Ldpc::Model(d) => d.decode(llr, bits),
+            Ldpc::Fpga { win, rate, q, max_iter, need, perm } => {
+                let t_q = std::time::Instant::now();
+                pack(q, perm, rate.k(), |i| llr[i] as u8 as u32);
+                run_fpga(win, *rate, q, *max_iter, *need, bits, t_q)
+            }
+        }
+    }
+
     /// Decode `llr` (positive = 0) into `bits`; the iterations when every
     /// check is satisfied.
     pub fn decode(&mut self, llr: &[f32], bits: &mut [u8]) -> Option<usize> {
@@ -185,49 +255,8 @@ impl Ldpc {
                 // Four 6-bit LLRs a word, then one bulk copy into the
                 // window (word writes one at a time cost 10 ms a frame).
                 let b = |l: f32| quantize_llr(l, LLR_SCALE) as u8 as u32;
-                if perm.is_empty() {
-                    for (w, c) in q.iter_mut().zip(llr.chunks_exact(4)) {
-                        *w = b(c[0]) | b(c[1]) << 8 | b(c[2]) << 16 | b(c[3]) << 24;
-                    }
-                } else {
-                    let k = rate.k();
-                    for (w, c) in q[..k / 4].iter_mut().zip(llr[..k].chunks_exact(4)) {
-                        *w = b(c[0]) | b(c[1]) << 8 | b(c[2]) << 16 | b(c[3]) << 24;
-                    }
-                    let par = &llr[k..];
-                    for (w, p) in q[k / 4..].iter_mut().zip(perm.chunks_exact(4)) {
-                        let v = |i: usize| b(par[p[i] as usize]);
-                        *w = v(0) | v(1) << 8 | v(2) << 16 | v(3) << 24;
-                    }
-                }
-                win.write_words(0, q);
-                let t_in = std::time::Instant::now();
-                win.wr(0xFF00, 1 | ((*rate == LongRate::R3_4) as u32) << 1 | *max_iter << 8);
-                // 2.5 ms an iteration: sleep in small steps until done.
-                let t0 = std::time::Instant::now();
-                while win.rd(0xFF04) & 1 == 1 {
-                    if t0.elapsed() > std::time::Duration::from_millis(500) {
-                        tracing::warn!("LDPC: the FPGA decoder did not finish");
-                        return None;
-                    }
-                    std::thread::sleep(std::time::Duration::from_micros(500));
-                }
-                let t_out = std::time::Instant::now();
-                let st = win.rd(0xFF04);
-                // Decisions: the sign bits of the BCH codeword part (the
-                // parity bits after it are never read).
-                let words = need.div_ceil(4);
-                win.read_words(0, &mut q[..words]);
-                for (w, &v) in q[..words].iter().enumerate() {
-                    for i in 0..4 {
-                        bits[4 * w + i] = ((v >> (8 * i + 7)) & 1) as u8;
-                    }
-                }
-                use std::sync::atomic::Ordering::Relaxed;
-                PROF_NS[0].fetch_add((t_in - t_q).as_nanos() as u64, Relaxed);
-                PROF_NS[1].fetch_add((t_out - t0).as_nanos() as u64, Relaxed);
-                PROF_NS[2].fetch_add(t_out.elapsed().as_nanos() as u64, Relaxed);
-                ((st >> 1) & 1 == 1).then_some(((st >> 8) & 0x3F) as usize)
+                pack(q, perm, rate.k(), |i| b(llr[i]));
+                run_fpga(win, *rate, q, *max_iter, *need, bits, t_q)
             }
         }
     }

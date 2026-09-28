@@ -412,12 +412,12 @@ impl BitInterleaver {
 
     /// The reverse for soft bits: per cell the word bits' LLRs (MSB first)
     /// back to codeword order.
-    pub fn deinterleave_llr(&self, cell_llr: &[f32]) -> Vec<f32> {
+    pub fn deinterleave_llr<T: Copy + Default>(&self, cell_llr: &[T]) -> Vec<T> {
         match self.c {
             Constellation::Qpsk => cell_llr.to_vec(),
             Constellation::Qam16 => {
                 const MUX: [usize; 8] = [7, 1, 4, 2, 5, 3, 6, 0];
-                let mut out = vec![0f32; cell_llr.len()];
+                let mut out = vec![T::default(); cell_llr.len()];
                 for d in 0..cell_llr.len() / 8 {
                     // pack bit 7 - m is cell_llr[8d + m] (word bits MSB first)
                     for (e, &m) in MUX.iter().enumerate() {
@@ -619,6 +619,18 @@ impl CellInterleaver {
             k0 += t;
         }
         out
+    }
+
+    /// The cell deinterleaver for FEC block `r` of a frame: its
+    /// cell-interleaved cells in, in order out.
+    pub fn block_gather<T: Copy>(&self, r: usize, ti: &[T], out: &mut Vec<T>) {
+        let cells = self.cells;
+        let shift = self.shifts[r];
+        out.clear();
+        out.extend(self.perm.iter().map(|&x| {
+            let x = x + shift;
+            ti[if x >= cells { x - cells } else { x }]
+        }));
     }
 
     /// The reverse (receive): a frame's data cells back to FEC blocks.

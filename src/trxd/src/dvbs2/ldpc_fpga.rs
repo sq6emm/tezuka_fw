@@ -378,11 +378,16 @@ pub fn quantize_llr(l: f32, scale: f32) -> i8 {
     let m = ((1 << (LLR_BITS - 1)) - 1) as f32;
     // Round half away from zero, as round() (a libm call on the A9, 64800
     // of them a frame): clamp, then truncate the half-offset value.
-    // max/min (NaN to -m) and an unchecked conversion: no compares and
-    // branches around it (64800 a frame on the A9)
-    let v = (l * scale).max(-m).min(m);
-    // SAFETY: v is finite and within -m..=m (m = 31), so v +- 0.5 fits.
-    unsafe { (v + 0.5f32.copysign(v)).to_int_unchecked::<i32>() as i8 }
+    // Plain compares: f32::max/min/clamp are NaN-aware and on armv7 calls
+    // into libm (fmaxf/fminf: 40 ns a value on the A9). The saturating `as`
+    // takes a NaN to 0.
+    // Rounding to nearest (ties to even) without a branch on the sign
+    // (random here: a mispredicted branch a value): 1.5 x 2^23 added and
+    // taken off leaves |v| <= 31 rounded to an integer.
+    const MAGIC: f32 = 12_582_912.0;
+    let v = l * scale;
+    let v = if v > m { m } else if v < -m { -m } else { v };
+    ((v + MAGIC) - MAGIC) as i32 as i8
 }
 
 #[cfg(test)]

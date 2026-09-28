@@ -12,7 +12,8 @@
 //! the second halving the frequency axis; attention and max pooling over
 //! frequency (the carrier may sit anywhere); four dilated 1-D convolutions
 //! over time (1, 2, 4, 8) with 32 channels, residual; one output per frame.
-//! The weight file gives the hop and the 2-D layers' channels. The 2-D and
+//! The weight file gives the hop and the 2-D layers' channels (RSN2), and
+//! the temporal layers' channels and dilations (RSN3: larger networks). The 2-D and
 //! temporal layers run in 16-bit fixed point (twice as fast as floats on
 //! the A9, whose NEON does not take floats in auto-vectorized code).
 
@@ -27,10 +28,7 @@ const HI: usize = 64;
 pub const NB: usize = HI - LO + 1;
 const Q: f32 = 0.25;
 const WARM: usize = 64;
-const C1: usize = 32;
 const NB2: usize = (NB + 4 - 5) / 2 + 1;
-/// Frames of context either side a frame's output depends on.
-pub const REACH: usize = 3 + 2 * (1 + 2 + 4 + 8);
 
 /// Streaming features: audio in, feature rows out.
 pub struct Features {
@@ -137,6 +135,9 @@ pub struct Net {
     pub hop: usize,
     /// The 2-D layers' channels.
     c2: usize,
+    /// The temporal layers' channels and dilations.
+    c1: usize,
+    dils: Vec<usize>,
     c1w: Vec<f32>,
     c1b: Vec<f32>,
     c2w: Vec<f32>,
@@ -174,16 +175,29 @@ impl Net {
         Net::from_bytes(WEIGHTS).expect("rsnn.bin")
     }
 
+    /// RSN2: hop, 2-D channels, count, weights (32 temporal channels,
+    /// dilations 1, 2, 4, 8); RSN3: hop, 2-D channels, temporal channels,
+    /// layers, their dilations, count, weights.
     pub fn from_bytes(b: &[u8]) -> Result<Net, String> {
-        if b.len() < 16 || &b[..4] != b"RSN2" {
-            return Err("not an RSN2 weight file".into());
-        }
-        let u = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as usize;
-        let (hop, c2, n) = (u(4), u(8), u(12));
-        if b.len() != 16 + 4 * n {
+        let u = |i: usize| b.get(i..i + 4).map_or(0, |x| u32::from_le_bytes(x.try_into().unwrap()) as usize);
+        let (hop, c2, c1, dils, start) = match b.get(..4) {
+            Some(b"RSN2") => (u(4), u(8), 32, vec![1, 2, 4, 8], 12),
+            Some(b"RSN3") => {
+                let nl = u(16);
+                if nl == 0 || nl > 16 {
+                    return Err(format!("{nl} temporal layers"));
+                }
+                (u(4), u(8), u(12), (0..nl).map(|i| u(20 + 4 * i)).collect(), 20 + 4 * nl)
+            }
+            _ => return Err("not an RSN2/RSN3 weight file".into()),
+        };
+        let n = u(start);
+        if b.len() != start + 4 + 4 * n {
             return Err(format!("{} bytes for {n} weights", b.len()));
         }
-        let all: Vec<f32> = b[16..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let all: Vec<f32> = b[start + 4..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        #[allow(non_snake_case)]
+        let C1 = c1;
         let mut at = 0;
         let mut take = |k: usize| {
             let v = all[at..at + k].to_vec();
@@ -202,7 +216,7 @@ impl Net {
         let inpb = take(C1);
         let mut tw = Vec::new();
         let mut tb = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..dils.len() {
             tw.push(take(C1 * C1 * 5));
             tb.push(take(C1));
         }
@@ -215,11 +229,38 @@ impl Net {
         let (c1q, c2q, c3q) = (q(&c1w), q(&c2w), q(&c3w));
         let twq = tw.iter().map(|v| q(v)).collect();
         let float = std::env::var_os("RSNN_FLOAT").is_some();
-        Ok(Net { hop, c2, c1w, c1b, c2w, c2b, c3w, c3b, attw, attb, inpw, inpb, tw, tb, outw, outb, c1q, c2q, c3q, twq, float })
+        Ok(Net { hop, c2, c1, dils, c1w, c1b, c2w, c2b, c3w, c3b, attw, attb, inpw, inpb, tw, tb, outw, outb, c1q, c2q, c3q, twq, float })
+    }
+
+    /// Frames of context either side a frame's output depends on.
+    pub fn reach(&self) -> usize {
+        3 + 2 * self.dils.iter().sum::<usize>()
+    }
+
+    /// Weights (the network's size).
+    pub fn weights(&self) -> usize {
+        self.c1w.len() + self.c2w.len() + self.c3w.len() + self.inpw.len() + self.tw.iter().map(|w| w.len()).sum::<usize>() + self.outw.len()
     }
 
     /// Logits (key down against up) of `x` (T rows of features).
     pub fn forward(&self, x: &[[f32; NB]]) -> Vec<f32> {
+        let t = x.len();
+        if t == 0 {
+            return Vec::new();
+        }
+        let h = self.front(x);
+        if self.float {
+            self.temporal_f(h, t)
+        } else {
+            self.temporal_i(&h, t)
+        }
+    }
+
+    /// The 2-D layers, pooling and the 1x1 into the temporal layers: h
+    /// ([c][t], C1 x T). A frame's value depends on the rows 3 either side.
+    fn front(&self, x: &[[f32; NB]]) -> Vec<f32> {
+        #[allow(non_snake_case)]
+        let C1 = self.c1;
         let t = x.len();
         if t == 0 {
             return Vec::new();
@@ -295,16 +336,14 @@ impl Net {
             }
             out.iter_mut().for_each(|v| *v = v.max(0.0));
         }
-        if self.float {
-            self.temporal_f(h, t)
-        } else {
-            self.temporal_i(&h, t)
-        }
+        h
     }
 
     fn temporal_f(&self, mut h: Vec<f32>, t: usize) -> Vec<f32> {
+        #[allow(non_snake_case)]
+        let C1 = self.c1;
         let mut tmp = vec![0f32; C1 * t];
-        for (layer, d) in [1usize, 2, 4, 8].iter().enumerate() {
+        for (layer, d) in self.dils.iter().enumerate() {
             let (w, b) = (&self.tw[layer], &self.tb[layer]);
             for o in 0..C1 {
                 let out = &mut tmp[o * t..(o + 1) * t];
@@ -342,11 +381,13 @@ impl Net {
     /// The temporal layers and the output in fixed point (h x AQ in i32,
     /// taken as i16 into each layer; weights x WQ).
     fn temporal_i(&self, h: &[f32], t: usize) -> Vec<f32> {
+        #[allow(non_snake_case)]
+        let C1 = self.c1;
         let mut hq: Vec<i32> = h.iter().map(|v| (v * AQ).round() as i32).collect();
         let mut inp = vec![0i16; C1 * t];
         let mut acc = vec![0i32; t];
         let mut add = vec![0i32; C1 * t];
-        for (layer, d) in [1usize, 2, 4, 8].iter().enumerate() {
+        for (layer, d) in self.dils.iter().enumerate() {
             for (o, v) in inp.iter_mut().zip(&hq) {
                 *o = (*v).clamp(-32767, 32767) as i16;
             }
@@ -508,45 +549,173 @@ fn conv2d_i<const KF: usize, const ST: usize>(a: &ActI, w: &[i16], b: &[f32], co
 
 /// Streaming: audio in, each frame's LLR out (a little behind: the
 /// network's reach, in chunks).
-pub struct RsNn {
-    feat: Features,
+/// The network frame by frame: every frame through every layer once (the
+/// batch [`Net::forward`] on overlapping chunks redid 2 x reach frames of
+/// context each time: 2.3 times the work for the larger networks). The
+/// same fixed-point arithmetic as `temporal_i`: equal to the batch, bit for
+/// bit, on the frames it gives out.
+pub struct Stream {
     net: Net,
+    /// Feature rows from absolute frame `rows_at` on; `front_done`: frames
+    /// whose h is out.
     rows: Vec<[f32; NB]>,
-    /// Frames of `rows` whose output has been given (the rest waits for
-    /// context after it).
-    done: usize,
-    prior: f32,
+    rows_at: usize,
+    front_done: usize,
+    /// Per temporal layer: its input frames (i32 and clamped i16) from
+    /// absolute frame `at` on, the next frame it gives out; the weights as
+    /// [out][tap][in].
+    layers: Vec<TLayer>,
+    /// The last layer's outputs not yet turned into logits start here.
+    out_next: usize,
 }
 
-/// Frames run through the network at once (plus the reach either side).
-const CHUNK: usize = 192;
+struct TLayer {
+    d: usize,
+    at: usize,
+    next: usize,
+    h: std::collections::VecDeque<Vec<i32>>,
+    q: std::collections::VecDeque<Vec<i16>>,
+    w: Vec<i16>,
+    b: Vec<i32>,
+}
+
+impl Stream {
+    pub fn new(net: Net) -> Stream {
+        let c1 = net.c1;
+        let layers = net
+            .dils
+            .iter()
+            .enumerate()
+            .map(|(l, &d)| {
+                let src = &net.twq[l];
+                let mut w = vec![0i16; c1 * 5 * c1];
+                for o in 0..c1 {
+                    for i in 0..c1 {
+                        for k in 0..5 {
+                            w[(o * 5 + k) * c1 + i] = src[(o * c1 + i) * 5 + k];
+                        }
+                    }
+                }
+                let b = net.tb[l].iter().map(|v| (v * AQ * WQ).round() as i32).collect();
+                TLayer { d, at: 0, next: 0, h: Default::default(), q: Default::default(), w, b }
+            })
+            .collect();
+        Stream { net, rows: Vec::new(), rows_at: 0, front_done: 0, layers, out_next: 0 }
+    }
+
+    pub fn net(&self) -> &Net {
+        &self.net
+    }
+
+    /// Feature rows in; the logits of the frames now final appended to
+    /// `out` (each frame's once all the context it takes is in).
+    pub fn push(&mut self, rows: &[[f32; NB]], out: &mut Vec<f32>) {
+        self.rows.extend_from_slice(rows);
+        let end = self.rows_at + self.rows.len();
+        // the front: frames with 3 rows after them (and 3 before, or the start)
+        if end >= self.front_done + 3 + 1 {
+            let (s, e) = (self.front_done, end - 3);
+            let lo = s.saturating_sub(3).max(self.rows_at);
+            let win = &self.rows[lo - self.rows_at..end - self.rows_at];
+            let h = self.net.front(win);
+            let t = win.len();
+            let c1 = self.net.c1;
+            for f in s..e {
+                let v: Vec<i32> = (0..c1).map(|c| (h[c * t + (f - lo)] * AQ).round() as i32).collect();
+                self.feed(0, v, out);
+            }
+            self.front_done = e;
+            // keep 3 rows of context before the next frame
+            let keep = self.front_done.saturating_sub(3);
+            if keep > self.rows_at {
+                self.rows.drain(..keep - self.rows_at);
+                self.rows_at = keep;
+            }
+        }
+    }
+
+    /// Frame `v` (i32, x AQ) into temporal layer `l`; what it completes
+    /// goes on.
+    fn feed(&mut self, l: usize, v: Vec<i32>, out: &mut Vec<f32>) {
+        if l == self.layers.len() {
+            let net = &self.net;
+            let mut o = net.outb;
+            for (c, &hv) in v.iter().enumerate() {
+                o += net.outw[c] / AQ * hv as f32;
+            }
+            out.push(o);
+            self.out_next += 1;
+            return;
+        }
+        let c1 = self.net.c1;
+        let lay = &mut self.layers[l];
+        lay.q.push_back(v.iter().map(|x| (*x).clamp(-32767, 32767) as i16).collect());
+        lay.h.push_back(v);
+        let mut done = Vec::new();
+        loop {
+            let (d, t) = (lay.d, lay.next);
+            // out[t] takes in[t - 2d ..= t + 2d]
+            if lay.at + lay.h.len() <= t + 2 * d {
+                break;
+            }
+            let mut o = vec![0i32; c1];
+            for (oc, ov) in o.iter_mut().enumerate() {
+                let mut acc = lay.b[oc];
+                for k in 0..5 {
+                    let tau = t as isize + (k as isize - 2) * d as isize;
+                    if tau < 0 {
+                        continue;
+                    }
+                    let x = &lay.q[tau as usize - lay.at];
+                    let w = &lay.w[(oc * 5 + k) * c1..(oc * 5 + k + 1) * c1];
+                    acc += w.iter().zip(x.iter()).map(|(&a, &b)| a as i32 * b as i32).sum::<i32>();
+                }
+                *ov = lay.h[t - lay.at][oc] + acc.max(0) / WQ as i32;
+            }
+            done.push(o);
+            lay.next += 1;
+            // inputs older than next - 2d are not needed again
+            while lay.at + 2 * d < lay.next {
+                lay.h.pop_front();
+                lay.q.pop_front();
+                lay.at += 1;
+            }
+        }
+        for o in done {
+            self.feed(l + 1, o, out);
+        }
+    }
+}
+
+pub struct RsNn {
+    feat: Features,
+    stream: Stream,
+    rows: Vec<[f32; NB]>,
+    lg: Vec<f32>,
+    prior: f32,
+}
 
 impl RsNn {
     pub fn new() -> RsNn {
         let net = Net::builtin();
-        RsNn { feat: Features::new(net.hop), net, rows: Vec::new(), done: 0, prior: (0.45f32 / 0.55).ln() }
+        RsNn { feat: Features::new(net.hop), stream: Stream::new(net), rows: Vec::new(), lg: Vec::new(), prior: (0.45f32 / 0.55).ln() }
     }
 
     /// Samples between the frames (and LLRs) given out.
     pub fn hop(&self) -> usize {
-        self.net.hop
+        self.stream.net().hop
     }
 
     /// Audio in (12 kHz); LLRs of the frames now final appended to `out`.
     pub fn process(&mut self, audio: &[f32], out: &mut Vec<f32>) {
+        self.rows.clear();
         self.feat.process(audio, &mut self.rows);
-        while self.rows.len() >= self.done + CHUNK + REACH {
-            let lo = self.done.saturating_sub(REACH);
-            let hi = self.done + CHUNK + REACH;
-            let lg = self.net.forward(&self.rows[lo..hi]);
-            out.extend(lg[self.done - lo..self.done - lo + CHUNK].iter().map(|v| v - self.prior));
-            self.done += CHUNK;
-            let drop = self.done.saturating_sub(REACH);
-            if drop > 0 {
-                self.rows.drain(..drop);
-                self.done -= drop;
-            }
+        if self.rows.is_empty() {
+            return;
         }
+        self.lg.clear();
+        self.stream.push(&self.rows, &mut self.lg);
+        out.extend(self.lg.iter().map(|v| v - self.prior));
     }
 }
 
@@ -559,6 +728,70 @@ impl Default for RsNn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The streamer against the batch forward pass: equal, bit for bit
+    /// (RSNN_WEIGHTS: another network).
+    #[test]
+    fn stream_matches_batch() {
+        let net = Net::builtin();
+        let t = 600 + 2 * net.reach();
+        let mut x = 7u32;
+        let rows: Vec<[f32; NB]> = (0..t)
+            .map(|_| {
+                std::array::from_fn(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    (x % 1800) as f32 / 100.0 - 6.0
+                })
+            })
+            .collect();
+        let want = net.forward(&rows);
+        let reach = net.reach();
+        let mut st = Stream::new(Net::builtin());
+        let mut got = Vec::new();
+        let mut at = 0;
+        let mut n = 1;
+        while at < t {
+            let e = (at + n).min(t);
+            st.push(&rows[at..e], &mut got);
+            at = e;
+            n = n * 3 % 37 + 1;
+        }
+        // (the batch pads the end with zeros; the streamer waits for rows)
+        let upto = t - reach;
+        assert!(got.len() >= upto - 10, "{} of {upto}", got.len());
+        let bad = (0..upto.min(got.len())).find(|&i| got[i] != want[i]);
+        assert!(bad.is_none(), "first difference at frame {bad:?}: {} vs {}", got[bad.unwrap()], want[bad.unwrap()]);
+    }
+
+    /// The network's time a frame (run on the board: `trxd-test rsnn_speed
+    /// --ignored --nocapture`; RSNN_WEIGHTS for another network).
+    #[test]
+    #[ignore]
+    fn rsnn_speed() {
+        let net = Net::builtin();
+        let t = 192 + 2 * net.reach();
+        let x: Vec<[f32; NB]> = (0..t).map(|i| std::array::from_fn(|k| ((i * 7 + k * 3) % 11) as f32 - 3.0)).collect();
+        let t0 = std::time::Instant::now();
+        let reps = 10;
+        for _ in 0..reps {
+            std::hint::black_box(net.forward(&x));
+        }
+        let per = t0.elapsed().as_secs_f64() / (reps * 192) as f64;
+        let fps = 12_000.0 / net.hop as f64;
+        eprintln!("{} weights: batch {:.2} ms a frame (192 a chunk, reach {}): {:.1} % of a core at {fps:.0} frames/s", net.weights(), per * 1e3, net.reach(), 100.0 * per * fps);
+        let (hop, w) = (net.hop, net.weights());
+        let mut st = Stream::new(net);
+        let long: Vec<[f32; NB]> = (0..2000).map(|i| x[i % x.len()]).collect();
+        let mut out = Vec::new();
+        let t0 = std::time::Instant::now();
+        for c in long.chunks(8) {
+            st.push(c, &mut out);
+        }
+        let per = t0.elapsed().as_secs_f64() / long.len() as f64;
+        eprintln!("{w} weights: streaming {:.2} ms a frame: {:.1} % of a core ({} out)", per * 1e3, 100.0 * per * 12_000.0 / hop as f64, out.len());
+    }
 
     /// Against PyTorch: RSNN_VEC=<testvec.bin> (export.py, the same weights
     /// as rsnn.bin).
