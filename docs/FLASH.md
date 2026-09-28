@@ -94,13 +94,20 @@ U-Boot is never written, so these always remain:
 * JTAG: `flash/jtag/` in the build zip.
 * An SD card with `sdimg/` on it, if the board's boot switch allows SD.
 
-## Known issue: a warm reboot into a fresh slot can hang (Libre 1)
+## Fixed: a warm reboot could hang (LibreSDR, Winbond W25Q256)
 
-Twice (2026-09-27 and -28) LibreSDR 1 did not come back from the reboot
-after fw-update wrote slot A; slot B the same night rebooted fine, and a
-power cycle always booted the new slot normally (it then confirmed itself).
-Libre 2 never showed it. Unverified lead: the S25FL256 (32 MB) left by
-Linux in a state the BootROM cannot read after a warm reset (4-byte
-addressing or its bank register); if so, `broken-flash-reset;` on the flash
-node makes Linux restore it at shutdown. To be checked with the debug
-port's UART attached before changing anything in the boot path.
+Until 2026-09-28 a LibreSDR sometimes did not come back from a warm reboot
+(twice after fw-update), and a power cycle always cured it. The QSPI is a
+32 MiB Winbond W25Q256; the Zynq QSPI driver reaches its upper 16 MiB with
+3-byte addresses and the chip's extended address register (the bank), and
+resets the bank to 0 at shutdown so that the BootROM, which reads the lower
+16 MiB, finds the boot image. The ADI kernel read the bank register only
+for ST/Micron, Macronix and PMC; the upstream tezuka patch (0004) added
+CFI_MFR_WINBOND, which is 0xda, but the chip reports the JEDEC ID 0xef. So
+the bank read failed at probe ("failed to read ear reg"), the driver took
+the bank for 0 whatever U-Boot had left (it reads slot B above 16 MiB),
+skipped the switches to 0 and the reset at shutdown, and the BootROM could
+come up reading the upper half. Patch 0010-spi-nor-winbond-ear.patch
+matches 0xef and treats an unreadable bank as unknown. Checked on Libre 1
+with the UART console: no warning, 10 warm reboots in a row and a flash
+into slot A with its reboot, all fine.

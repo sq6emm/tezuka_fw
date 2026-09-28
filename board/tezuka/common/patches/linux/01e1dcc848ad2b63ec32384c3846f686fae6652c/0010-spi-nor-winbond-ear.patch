@@ -1,0 +1,65 @@
+spi-nor: Winbond W25Q256 extended address register; unknown bank at probe
+
+The LibreSDR QSPI is a Winbond W25Q256 (JEDEC ef4019). 0004 added
+CFI_MFR_WINBOND to the EAR read/write paths, but that is 0xda, not the
+JEDEC 0xef the chip reports: read_ear() returned -EINVAL ("failed to read
+ear reg"), curbank stayed 0 whatever bank the boot loader left, bank
+switches to 0 and the reset to bank 0 at shutdown were skipped, and a
+warm reboot could leave the BootROM reading the upper 16 MiB (hang until
+power cycle). Match 0xef too, and mark the bank unknown if it cannot be
+read.
+
+--- a/drivers/mtd/spi-nor/core.c	2026-09-28 05:27:42.887570079 +0000
++++ b/drivers/mtd/spi-nor/core.c	2026-09-28 05:27:42.893683677 +0000
+@@ -633,6 +633,9 @@
+  *
+  * Return: 0 on success, -errno otherwise.
+  */
++/* Winbond's JEDEC manufacturer ID (CFI_MFR_WINBOND is its old CFI one, 0xda) */
++#define SNOR_ID_WINBOND 0xef
++
+ static int spi_nor_write_ear(struct spi_nor *nor, u32 addr)
+ {
+ 	u8 code = SPINOR_OP_WREAR;
+@@ -674,7 +677,8 @@
+ 	if (nor->info->id->bytes[0] == CFI_MFR_ST ||
+ 	    nor->info->id->bytes[0] == CFI_MFR_MACRONIX ||
+ 	    nor->info->id->bytes[0] == CFI_MFR_PMC ||
+-	    nor->info->id->bytes[0] == CFI_MFR_WINBOND) {
++	    nor->info->id->bytes[0] == CFI_MFR_WINBOND ||
++	    nor->info->id->bytes[0] == SNOR_ID_WINBOND) {
+ 		spi_nor_write_enable(nor);
+ 		code = SPINOR_OP_WREAR;
+ 	}
+@@ -722,7 +726,8 @@
+ 	else if (nor->info->id->bytes[0] == CFI_MFR_ST ||
+ 		 nor->info->id->bytes[0] == CFI_MFR_MACRONIX ||
+ 		 nor->info->id->bytes[0] == CFI_MFR_PMC ||
+-		 nor->info->id->bytes[0] == CFI_MFR_WINBOND)
++		 nor->info->id->bytes[0] == CFI_MFR_WINBOND ||
++		 nor->info->id->bytes[0] == SNOR_ID_WINBOND)
+ 		code = SPINOR_OP_RDEAR;
+ 	else
+ 		return -EINVAL;
+@@ -3171,10 +3176,19 @@
+ 			}
+ 			nor->spimem->spi->cs_index_mask = 0x01;
+ 			status = read_ear(nor, (struct flash_info *)nor->info);
+-			if (status < 0)
++			if (status < 0) {
+ 				dev_warn(nor->dev, "failed to read ear reg\n");
+-			else
++				/*
++				 * Bank unknown (the boot loader may have left
++				 * it anywhere): make the first bank switch, and
++				 * the reset to bank 0 at shutdown, really go
++				 * out. A warm reset otherwise can leave the
++				 * BootROM reading the upper 16 MiB.
++				 */
++				nor->curbank = 0xff;
++			} else {
+ 				nor->curbank = status & EAR_SEGMENT_MASK;
++			}
+ 		} else if (of_property_match_string(np_spi, "compatible",
+ 						    "xlnx,xps-spi-2.00.a") >= 0) {
+ 			nor->addr_nbytes = 3;
