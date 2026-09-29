@@ -66,7 +66,11 @@ collection, phone recordings of receiver audio among them); 55 tokens
 | Network + character Viterbi, whole recording | 30-31 |
 | Network + character Viterbi, streaming (as trxd runs it) | 30 |
 
-The shipped weights are the average of three checkpoints (two of a
+(Since 2026-09-29 `rsnn.bin` is the 161 k network b2 below: 34 of 55
+streaming; with the whole network in the FPGA it costs the A9 0.5 % of a
+core. Where the FPGA has no engine it runs on the CPU at about 48 %.)
+
+The first shipped weights were the average of three checkpoints (two of a
 network trained from scratch, one of it fine-tuned with fluctuating noise
 and weaker signals); single checkpoints scored 26-31, training longer on
 the synthetic signals made it worse on the recordings. With the best
@@ -109,7 +113,28 @@ network (a frame is 10.7 ms), up to c2 24 / c1 64. A feature row in, the
 time kernels take) and the weights (in BRAM, loaded once) stay in the FPGA.
 rsnn_fpga.rs drives it: `Stream` takes it when the bitstream has one and
 nobody else holds it, else the CPU (TRXD_NO_RSNN_FPGA=1: always the CPU).
-The temporal layers stay on the ARM.
+
+The temporal layers followed (2026-09-29), in the `trx` bitstream only
+(docs/FPGA-MODES.md; the `all` one has no room): maia-sdr
+`rsnn_temporal.py`, `rsnn_axi.py` ("RSF2"). Their weights stay in DDR
+(1 MB reserved at 0x16200000, device tree `rsnn_weights`, written by
+trxd once) and stream in over HP0 each frame, one multiply a cycle; each
+layer keeps its last 4d + 1 input frames in block RAM (up to 520 frames of
+64 channels, 8 layers). The engine starts on its own when the front is
+done with a frame; the ARM keeps the features, the last 1x1 and the
+character decoder. trxd reads the layer registers back and runs the
+temporal layers itself if they do not match.
+
+On Libre 1 (`stream_matches_batch` bit for bit on the FPGA path):
+
+| Network | ARM, all on the CPU | front in the FPGA | front + temporal in the FPGA |
+|---|---|---|---|
+| shipped (23 k weights) | 6.9 % of a core | 1.7 % | 0.4 % |
+| b2 (161 k) | 47.7 % | 8.8 % | 0.5 % (6.3 ms a 10.7 ms frame) |
+
+trxd as a whole in CW-RS mode: about 18 % of a core more than idle USB
+(31.5 -> 49.8 %), almost all of it the features and the character
+Viterbi banks now.
 
 Tests: maia-hdl `test_rsnn_front.py` against `rsnn_front_vectors`
 (`cargo test rsnn_front_vectors -- --ignored`, RSNN_FRONT_VEC=<json>,

@@ -106,6 +106,26 @@ fn main() -> ExitCode {
                     }
                 };
             }
+            "--fit-data" => {
+                let (Some(f), Some(p)) = (args.next(), args.next()) else { usage() };
+                let prop = args.next().unwrap_or_else(|| "data".into());
+                return match fpgamode::fit_data_cli(&f, &p, &prop) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("trxd --fit-data: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            "--bit2bin" => {
+                return match fpgamode::bit2bin_cli() {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("trxd --bit2bin: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
             "--bench-deepcw" => {
                 let Some(m) = args.next() else { usage() };
                 let n = args.next().and_then(|v| v.parse().ok()).unwrap_or(5);

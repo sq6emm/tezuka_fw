@@ -22,6 +22,18 @@ cur=$(cat $STATE 2>/dev/null || cat /etc/fpga-boot-mode 2>/dev/null || echo all)
 [ -z "$1" ] && { echo "$cur"; exit 0; }
 want=$1
 [ "$want" = "$cur" ] && exit 0
+
+# The boot mode's bitstream is not in the rootfs (flash space): take it out
+# of the running slot's FIT (U-Boot's fpga@1, gzip) the first time.
+if [ ! -f "$FW/fpga-$want.bin" ] && [ "$want" = "$(cat /etc/fpga-boot-mode 2>/dev/null)" ]; then
+	slot=$(sed -n 's/.*UBOOT_SLOT=\([ab]\).*/\1/p' /proc/cmdline)
+	mtd=$(sed -n "s/^\(mtd[0-9]*\):.*\"linux-$slot\"/\1/p" /proc/mtd)
+	if [ -n "$mtd" ]; then
+		mkdir -p $FW
+		/usr/bin/trxd --fit-data /dev/$mtd /images/fpga@1 | zcat | /usr/bin/trxd --bit2bin > $FW/fpga-$want.bin.tmp \
+			&& mv $FW/fpga-$want.bin.tmp $FW/fpga-$want.bin || rm -f $FW/fpga-$want.bin.tmp
+	fi
+fi
 [ -f "$FW/fpga-$want.bin" ] || { echo "fpga-mode: no $FW/fpga-$want.bin" >&2; exit 1; }
 pidof trxd >/dev/null && { echo "fpga-mode: trxd is running" >&2; exit 1; }
 

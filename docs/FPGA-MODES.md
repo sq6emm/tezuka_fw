@@ -7,7 +7,7 @@ its own bitstream, and trxd loads the one a feature needs while Linux runs.
 | Mode | What is in it | LUTs | BRAM tiles | DSPs |
 |---|---|---|---|---|
 | `all` | everything (the single bitstream as before) | 75 % | 139.5 | 195 |
-| `trx` | radio, wide scope, CW-RS network front end | 30 % | 52 | 100 |
+| `trx` | radio, wide scope, CW-RS network (front end and temporal layers, weights in DDR over HP0) | 34 % | 86 | 101 |
 | `datv` | radio, wide scope, DVB-S2/T2 receive and transmit, LDPC | 71 % | 124.5 | 191 |
 
 "Radio" is the AD936x interface, the DMAs, the x8 decimator/interpolator,
@@ -49,9 +49,11 @@ partition interface would mean redesigning them.
 ## Image
 
 `board/tezuka/<board>/bitstream/boot-mode` names the boot mode (Libre:
-`trx`). U-Boot loads `simple-<boot>.xsa` from the FIT; every
-`simple-<mode>.xsa` (the boot one too, to switch back to it) goes into the
-rootfs as `/lib/firmware/fpga-<mode>.bin`
+`trx`). U-Boot loads `simple-<boot>.xsa` from the FIT; every other
+`simple-<mode>.xsa` goes into the rootfs as `/lib/firmware/fpga-<mode>.bin`;
+the boot one fpga-mode takes out of the running slot's FIT the first time
+it switches back (`trxd --fit-data /dev/mtdN /images/fpga@1 | zcat | trxd
+--bit2bin`: the flash has no room for it twice)
 (package/board-fpga; `board/tezuka/common/bit2bin.py`), and the boot mode's
 name into `/etc/fpga-boot-mode`. Without a boot-mode file a board builds as
 before (`simple.xsa`, no modes). The flash is full (two 12.25 MB slots and

@@ -1,12 +1,21 @@
-//! The CW-RS keying detector's front end in the FPGA (maia-sdr
-//! `rsnn_front.py`, 0x43C50000): [`crate::rsnn::Net::front_q`] bit for bit,
-//! a feature row in, the 1x1's outputs for the frame three rows back out.
-//! The temporal layers stay on the ARM.
+//! The CW-RS keying detector in the FPGA (maia-sdr `rsnn_front.py`,
+//! `rsnn_temporal.py`, `rsnn_axi.py`; 0x43C50000): a feature row in, the
+//! front end's outputs for the frame three rows back ([`crate::rsnn::Net::
+//! front_q`] bit for bit) and, with "RSF2" (the trx bitstream), the last
+//! temporal layer's outputs whenever a frame is through them
+//! ([`crate::rsnn::Stream`]'s fixed point, bit for bit): the ARM does only
+//! the features and the last 1x1 then.
 //!
 //! Window: 0x0000.. weights (two a word, the even one low), 0x9000..
-//! biases, 0x9400.. the next row (two bins a word), 0x9500.. the outputs
-//! (i32), 0xFF00 control (bit 0 go, bit 1 reset; 12:8 c2, 22:16 c1),
-//! 0xFF04 status (bit 0 busy, bit 1 valid), 0xFF08 id "RSF1".
+//! biases, 0x9400.. the next row (two bins a word), 0x9500.. the front's
+//! outputs (i32), 0x9600.. the temporal outputs, 0x9800.. temporal biases
+//! (64 a layer), 0xFF00 control (bit 0 go, bit 1 reset; 12:8 c2, 22:16
+//! c1), 0xFF04 status (bit 0 busy, bit 1 front valid, bit 2 temporal
+//! valid), 0xFF08 id "RSF1"/"RSF2", 0xFF10 temporal layers, 0xFF14 their
+//! weights' DDR address, 0xFF18 its 64-bit words, 0xFF20 + 4 l layer l
+//! (6:0 dilation, 16:7 first ring frame, 26:17 ring frames). The temporal
+//! weights live in the reserved memory at 0x16200000 (device tree
+//! rsnn_weights).
 //!
 //! One engine: the first detector to open it has it (the others run on the
 //! CPU). TRXD_NO_RSNN_FPGA=1: never.
@@ -21,6 +30,12 @@ use crate::rsnn::{Net, NB};
 
 const PHYS: u64 = 0x43C5_0000;
 const ID: u32 = 0x3146_5352;
+const ID2: u32 = 0x3246_5352;
+const W_PHYS: u64 = 0x1620_0000;
+const W_BYTES: usize = 0x10_0000;
+const DT_WEIGHTS: &str = "/proc/device-tree/reserved-memory/rsnn_weights@16200000";
+const LMAX: usize = 8;
+const RING_FRAMES: usize = 520;
 const C2MAX: usize = 24;
 const C1MAX: usize = 64;
 const WMAX: usize = 17408;
@@ -39,6 +54,16 @@ pub struct FpgaFront {
     frame_us: u64,
     row: [u32; 32],
     out: Vec<u32>,
+    /// The temporal layers run here too.
+    temporal: bool,
+}
+
+/// What a row gave: the front's outputs (frame n - 3), or with the
+/// temporal layers in the FPGA the last one's (a frame 2 x the dilations
+/// further back), or nothing yet.
+pub enum Out<'a> {
+    Front(&'a [u32]),
+    Temporal(&'a [u32]),
 }
 
 // SAFETY: owned by the detector's thread alone.
@@ -47,7 +72,7 @@ unsafe impl Send for FpgaFront {}
 impl FpgaFront {
     /// The engine loaded with `net`'s front, if the bitstream has one, it is
     /// free and the network fits.
-    pub fn open(net: &Net) -> Option<FpgaFront> {
+    pub fn open(net: &Net, temporal: Option<(Vec<i16>, Vec<i32>, Vec<usize>)>) -> Option<FpgaFront> {
         if std::env::var_os("TRXD_NO_RSNN_FPGA").is_some() {
             return None;
         }
@@ -63,7 +88,10 @@ impl FpgaFront {
         match FpgaFront::map(c2, c1) {
             Ok(mut f) => {
                 f.load(&w, &b);
-                tracing::info!("rsnn: front end in the FPGA ({c2}/{c1} channels, ~{} us a frame)", f.frame_us);
+                if let Some(t) = temporal {
+                    f.load_temporal(c1, &t);
+                }
+                tracing::info!(temporal = f.temporal, "rsnn: in the FPGA ({c2}/{c1} channels, ~{} us a frame)", f.frame_us);
                 Some(f)
             }
             Err(e) => {
@@ -98,6 +126,7 @@ impl FpgaFront {
             frame_us: (cycles / CYCLES_PER_US) as u64,
             row: [0; 32],
             out: vec![0; c1],
+            temporal: false,
         };
         // A bitstream without the engine has nothing at this address: the
         // read raises a bus error. Look from a child process first.
@@ -113,11 +142,15 @@ impl FpgaFront {
         // async-signal-safe); the parent waits for it.
         unsafe {
             match libc::fork() {
-                0 => libc::_exit((self.rd(0xFF08) == ID) as i32),
+                0 => libc::_exit(match self.rd(0xFF08) {
+                    ID => 1,
+                    ID2 => 2,
+                    _ => 0,
+                }),
                 -1 => false,
                 pid => {
                     let mut st = 0;
-                    libc::waitpid(pid, &mut st, 0) == pid && libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 1
+                    libc::waitpid(pid, &mut st, 0) == pid && libc::WIFEXITED(st) && libc::WEXITSTATUS(st) != 0
                 }
             }
         }
@@ -161,6 +194,68 @@ impl FpgaFront {
         self.reset();
     }
 
+    /// The temporal layers into the engine ("RSF2" and the reserved memory
+    /// there, the network within its limits): weights to DDR, the rest to
+    /// its registers.
+    fn load_temporal(&mut self, c1: usize, (w, b, dils): &(Vec<i16>, Vec<i32>, Vec<usize>)) {
+        let frames: usize = dils.iter().map(|d| 4 * d + 1).sum();
+        if self.rd(0xFF08) != ID2 || !std::path::Path::new(DT_WEIGHTS).exists() {
+            return;
+        }
+        if dils.is_empty() || dils.len() > LMAX || c1 % 2 != 0 || frames > RING_FRAMES || 2 * w.len() > W_BYTES || dils.iter().any(|&d| d > 127) {
+            tracing::info!(layers = dils.len(), frames, "rsnn: temporal layers too large for the FPGA");
+            return;
+        }
+        let mem = match OpenOptions::new().read(true).write(true).custom_flags(libc::O_SYNC).open("/dev/mem") {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("rsnn: /dev/mem: {e}");
+                return;
+            }
+        };
+        // SAFETY: MAP_SHARED of the reserved (no-map) weight memory; written
+        // below as aligned words inside it, then unmapped.
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), W_BYTES, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, mem.as_raw_fd(), W_PHYS as libc::off_t) };
+        if p == libc::MAP_FAILED {
+            tracing::warn!("rsnn: map the weight memory: {}", std::io::Error::last_os_error());
+            return;
+        }
+        let words: Vec<u32> = w.chunks(2).map(|p| (p[0] as u16 as u32) | (p.get(1).map_or(0, |&v| v as u16 as u32) << 16)).collect();
+        // SAFETY: inside the mapping (2 w.len() <= W_BYTES), word-aligned.
+        unsafe {
+            std::ptr::copy_nonoverlapping(words.as_ptr(), p.cast::<u32>(), words.len());
+            libc::munmap(p, W_BYTES);
+        }
+        self.wait();
+        let mut base = 0;
+        for (l, &d) in dils.iter().enumerate() {
+            let cfg = d as u32 | (base as u32) << 7 | ((4 * d + 1) as u32) << 17;
+            self.wr(0xFF20 + 4 * l, cfg);
+            // the layer registers read back (a bitstream that decodes fewer
+            // of them would run a different network)
+            if self.rd(0xFF20 + 4 * l) != cfg {
+                tracing::warn!(layer = l, "rsnn: temporal layer registers do not read back: temporal layers on the CPU");
+                self.wr(0xFF10, 0);
+                return;
+            }
+            let bw: Vec<u32> = b[l * c1..(l + 1) * c1].iter().map(|&v| v as u32).collect();
+            self.write_words(0x9800 + 4 * 64 * l, &bw);
+            base += 4 * d + 1;
+        }
+        self.wr(0xFF14, W_PHYS as u32);
+        self.wr(0xFF18, w.len().div_ceil(4) as u32);
+        self.wr(0xFF10, dils.len() as u32);
+        self.temporal = true;
+        let macs: usize = dils.len() * (c1 * (5 * c1 + 8) + c1);
+        self.frame_us += (macs / CYCLES_PER_US) as u64;
+        self.reset();
+    }
+
+    /// The temporal layers run in the FPGA.
+    pub fn temporal(&self) -> bool {
+        self.temporal
+    }
+
     /// A fresh stream: the rows before the next are zeros.
     pub fn reset(&mut self) {
         self.wait();
@@ -168,9 +263,8 @@ impl FpgaFront {
         self.wait();
     }
 
-    /// Row n in (as [`Net::front_q`] quantizes it); the outputs for frame
-    /// n - 3 (x AQ), from the fourth row on.
-    pub fn push(&mut self, row: &[f32; NB]) -> Option<&[u32]> {
+    /// Row n in (as [`Net::front_q`] quantizes it); what came out (x AQ).
+    pub fn push(&mut self, row: &[f32; NB]) -> Option<Out<'_>> {
         let q = |v: f32| (v * crate::rsnn::AQ).round() as i16 as u16 as u32;
         for (k, w) in self.row.iter_mut().enumerate() {
             let a = row.get(2 * k).map_or(0, |&v| q(v));
@@ -181,13 +275,22 @@ impl FpgaFront {
         self.wr(0xFF00, self.cfg | 1);
         std::thread::sleep(Duration::from_micros(self.frame_us));
         self.wait();
-        if self.rd(0xFF04) & 2 == 0 {
-            return None;
-        }
+        let st = self.rd(0xFF04);
+        let at = if self.temporal {
+            if st & 4 == 0 {
+                return None;
+            }
+            0x9600
+        } else {
+            if st & 2 == 0 {
+                return None;
+            }
+            0x9500
+        };
         let mut out = std::mem::take(&mut self.out);
-        self.read_words(0x9500, &mut out[..self.c1]);
+        self.read_words(at, &mut out[..self.c1]);
         self.out = out;
-        Some(&self.out)
+        Some(if self.temporal { Out::Temporal(&self.out) } else { Out::Front(&self.out) })
     }
 }
 

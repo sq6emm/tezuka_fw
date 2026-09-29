@@ -663,6 +663,8 @@ pub struct Stream {
     layers: Vec<TLayer>,
     /// The last layer's outputs not yet turned into logits start here.
     out_next: usize,
+    /// Tests: the last temporal layer's outputs (i32, x AQ) a frame.
+    tap: Option<Vec<Vec<i32>>>,
     /// The front in the FPGA (on a board with the engine free), else
     /// [`Net::front_q`] here.
     #[cfg(target_os = "linux")]
@@ -700,22 +702,44 @@ impl Stream {
                 TLayer { d, at: 0, next: 0, h: Default::default(), q: Default::default(), w, b }
             })
             .collect();
-        #[cfg(target_os = "linux")]
-        let fpga = crate::rsnn_fpga::FpgaFront::open(&net);
-        Stream {
+        let mut st = Stream {
             net,
             rows: Vec::new(),
             rows_at: 0,
             front_done: 0,
             layers,
             out_next: 0,
+            tap: None,
             #[cfg(target_os = "linux")]
-            fpga,
+            fpga: None,
+        };
+        #[cfg(target_os = "linux")]
+        {
+            st.fpga = crate::rsnn_fpga::FpgaFront::open(&st.net, Some(st.temporal_image()));
         }
+        st
     }
 
     pub fn net(&self) -> &Net {
         &self.net
+    }
+
+    /// The temporal layers as the FPGA engine takes them (maia-hdl
+    /// rsnn_temporal.py): per layer its weights [out][tap][in] (x WQ) one
+    /// after another, the biases (x AQ WQ) likewise, the dilations.
+    pub fn temporal_image(&self) -> (Vec<i16>, Vec<i32>, Vec<usize>) {
+        let w = self.layers.iter().flat_map(|l| l.w.iter().copied()).collect();
+        let b = self.layers.iter().flat_map(|l| l.b.iter().copied()).collect();
+        (w, b, self.layers.iter().map(|l| l.d).collect())
+    }
+
+    /// Tests: keep the last temporal layer's outputs ([`Self::take_tap`]).
+    pub fn set_tap(&mut self) {
+        self.tap = Some(Vec::new());
+    }
+
+    pub fn take_tap(&mut self) -> Vec<Vec<i32>> {
+        self.tap.replace(Vec::new()).unwrap_or_default()
     }
 
     /// The front runs in the FPGA.
@@ -726,19 +750,32 @@ impl Stream {
         false
     }
 
+    /// The temporal layers run in the FPGA too.
+    pub fn on_fpga_temporal(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.fpga.as_ref().is_some_and(|f| f.temporal());
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
     /// Feature rows in; the logits of the frames now final appended to
     /// `out` (each frame's once all the context it takes is in).
     pub fn push(&mut self, rows: &[[f32; NB]], out: &mut Vec<f32>) {
         #[cfg(target_os = "linux")]
         if let Some(f) = self.fpga.as_mut() {
+            use crate::rsnn_fpga::Out;
+            // (layer to feed, its input): the front's outputs to the first
+            // temporal layer, or the last one's straight to the logit
             let mut hs = Vec::new();
             for row in rows {
-                if let Some(h) = f.push(row) {
-                    hs.push(h.iter().map(|&v| v as i32).collect::<Vec<i32>>());
+                match f.push(row) {
+                    Some(Out::Front(h)) => hs.push((0, h.iter().map(|&v| v as i32).collect::<Vec<i32>>())),
+                    Some(Out::Temporal(h)) => hs.push((self.layers.len(), h.iter().map(|&v| v as i32).collect())),
+                    None => {}
                 }
             }
-            for h in hs {
-                self.feed(0, h, out);
+            for (l, h) in hs {
+                self.feed(l, h, out);
                 self.front_done += 1;
             }
             return;
@@ -771,6 +808,9 @@ impl Stream {
     /// goes on.
     fn feed(&mut self, l: usize, v: Vec<i32>, out: &mut Vec<f32>) {
         if l == self.layers.len() {
+            if let Some(t) = self.tap.as_mut() {
+                t.push(v.clone());
+            }
             let net = &self.net;
             let mut o = net.outb;
             for (c, &hv) in v.iter().enumerate() {
@@ -882,7 +922,7 @@ mod tests {
         let want = net.forward(&rows);
         let reach = net.reach();
         let mut st = Stream::new(Net::builtin());
-        eprintln!("front on the FPGA: {}", st.on_fpga());
+        eprintln!("front on the FPGA: {}, temporal layers too: {}", st.on_fpga(), st.on_fpga_temporal());
         // RSNN_EXPECT_FPGA=1: on a board with the engine
         assert!(st.on_fpga() || std::env::var_os("RSNN_EXPECT_FPGA").is_none());
         let mut got = Vec::new();
@@ -910,7 +950,8 @@ mod tests {
         // to simulate; else RSNN_WEIGHTS or the built-in one.
         let net = if std::env::var_os("RSNN_FRONT_SMALL").is_some() {
             let (c2, c1) = (4usize, 8usize);
-            let n = c2 * 15 + c2 + c2 * c2 * 15 + c2 + c2 * c2 * 9 + c2 + c2 + 1 + c1 * 2 * c2 + c1 + c1 * c1 * 5 + c1 + c1 + 1;
+            // two temporal layers, dilations 1 and 2
+            let n = c2 * 15 + c2 + c2 * c2 * 15 + c2 + c2 * c2 * 9 + c2 + c2 + 1 + c1 * 2 * c2 + c1 + 2 * (c1 * c1 * 5 + c1) + c1 + 1;
             let mut r = 5u32;
             let mut rnd = || {
                 r ^= r << 13;
@@ -919,7 +960,7 @@ mod tests {
                 (r % 2001) as f32 / 1000.0 - 1.0
             };
             let mut b = b"RSN3".to_vec();
-            for v in [128u32, c2 as u32, c1 as u32, 1, 1, n as u32] {
+            for v in [128u32, c2 as u32, c1 as u32, 2, 1, 2, n as u32] {
                 b.extend(v.to_le_bytes());
             }
             for _ in 0..n {
@@ -929,7 +970,9 @@ mod tests {
         } else {
             Net::builtin()
         };
-        let t = 24;
+        // RSNN_FRONT_ROWS: rows (the temporal layers' outputs start 2 x the
+        // dilations' sum later than the front's)
+        let t: usize = std::env::var("RSNN_FRONT_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
         let mut x = 11u32;
         let rows: Vec<[f32; NB]> = (0..t)
             .map(|_| {
@@ -947,9 +990,23 @@ mod tests {
         let expect: Vec<Vec<i32>> = (0..t - 3).map(|k| (0..c1).map(|c| h[c * t + k]).collect()).collect();
         let rq: Vec<Vec<i16>> = rows.iter().map(|r| r.iter().map(|v| (v * AQ).round() as i16).collect()).collect();
         let (w, b) = net.fpga_image();
-        let j = serde_json::json!({"c2": c2, "c1": c1, "w": w, "b": b, "rows": rq, "h": expect});
+        // the temporal layers, streaming a row at a time as trxd does
+        let mut st = Stream::new(net);
+        #[cfg(target_os = "linux")]
+        {
+            st.fpga = None;
+        }
+        st.set_tap();
+        let mut logits = Vec::new();
+        for r in &rows {
+            st.push(std::slice::from_ref(r), &mut logits);
+        }
+        let t_out = st.take_tap();
+        let (tw, tb, dils) = st.temporal_image();
+        let j = serde_json::json!({"c2": c2, "c1": c1, "w": w, "b": b, "rows": rq, "h": expect,
+            "tw": tw, "tb": tb, "dils": dils, "t_out": t_out});
         std::fs::write(std::env::var("RSNN_FRONT_VEC").expect("RSNN_FRONT_VEC"), j.to_string()).unwrap();
-        eprintln!("front vectors: c2 {c2} c1 {c1}, {} weights, {} biases, {t} rows", w.len(), b.len());
+        eprintln!("front vectors: c2 {c2} c1 {c1}, {} weights, {} biases, {t} rows; temporal: dilations {dils:?}, {} weights, {} frames out", w.len(), b.len(), tw.len(), t_out.len());
     }
 
     /// The network's time a frame (run on the board: `trxd-test rsnn_speed
@@ -985,12 +1042,13 @@ mod tests {
         let per = (cpu() - c0) / long.len() as f64;
         let wall = t0.elapsed().as_secs_f64() / long.len() as f64;
         eprintln!(
-            "{w} weights: streaming {:.2} ms CPU ({:.2} ms wall) a frame: {:.1} % of a core ({} out, front on the FPGA: {})",
+            "{w} weights: streaming {:.2} ms CPU ({:.2} ms wall) a frame: {:.1} % of a core ({} out, front on the FPGA: {}, temporal: {})",
             per * 1e3,
             wall * 1e3,
             100.0 * per * 12_000.0 / hop as f64,
             out.len(),
-            st.on_fpga()
+            st.on_fpga(),
+            st.on_fpga_temporal()
         );
     }
 

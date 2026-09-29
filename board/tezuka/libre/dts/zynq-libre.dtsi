@@ -66,6 +66,13 @@
 			no-map;
 			reg = <0x16100000 0x100000>;
 		};
+
+		/* CW-RS network: the temporal layers' weights, written by trxd
+		 * through /dev/mem, read by the FPGA (rsnn_axi, HP0). */
+		rsnn_weights: rsnn_weights@16200000 {
+			no-map;
+			reg = <0x16200000 0x100000>;
+		};
 	};
 };
 
