@@ -9,6 +9,7 @@
 
 mod rscw;
 mod rsnn;
+mod fpgamode;
 #[cfg(target_os = "linux")]
 mod rsnn_fpga;
 mod beacon;
@@ -236,7 +237,7 @@ fn main() -> ExitCode {
     // The transceiver always reads CW; a beacon receiver when asked to.
     let wants_cw = cfg.role == Role::Trx || cfg.beacon_rx.decoders.contains(&config::DecoderKind::Cw);
     if wants_cw && cfg.role != Role::BeaconTx {
-        model::install(&cfg.cw_model);
+        model::install_background(cfg.cw_model.clone());
     }
     let rate = radio.control.stream_rate();
     let rx = stream::spawn_rx(radio.rx, rate, cfg.radio.buffer_samples);

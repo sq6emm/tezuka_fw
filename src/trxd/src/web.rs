@@ -18,7 +18,8 @@
 //!   pages alone.
 //!
 //! Operator-only: every logged-in browser may do everything. Sessions live in
-//! memory, so a reboot logs everyone out.
+//! memory and /run/trxd-sessions (tmpfs): a restart of trxd keeps them (an
+//! FPGA bitstream switch restarts it), a reboot logs everyone out.
 //!
 //! Threads: an acceptor per port, one thread per connection. The engine talks
 //! to all of them through [`WebHandle`] and never blocks on a slow browser —
@@ -40,6 +41,27 @@ use tungstenite::{Message, WebSocket};
 static INDEX_HTML: &[u8] = include_bytes!("../web/index.html");
 
 const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+const SESSIONS_FILE: &str = "/run/trxd-sessions";
+
+/// The sessions to /run: a token and its age (s) a line.
+fn save_sessions(s: &HashMap<String, Instant>) {
+    let text: String = s.iter().map(|(tok, t)| format!("{tok} {}\n", t.elapsed().as_secs())).collect();
+    let _ = std::fs::write(SESSIONS_FILE, text);
+}
+
+fn load_sessions() -> HashMap<String, Instant> {
+    let now = Instant::now();
+    std::fs::read_to_string(SESSIONS_FILE)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (tok, age) = l.split_once(' ')?;
+            let age = Duration::from_secs(age.trim().parse().ok()?);
+            (age < SESSION_TTL).then_some(())?;
+            Some((tok.to_string(), now.checked_sub(age)?))
+        })
+        .collect()
+}
 /// Microphone audio kept at most (12 kHz samples): 0.5 s.
 const MIC_CAP: usize = 6_000;
 
@@ -420,7 +442,11 @@ fn handle_https(
                 .unwrap_or_default();
             if same(&pw, &shared.password) {
                 let tok = new_token();
-                shared.sessions.lock().unwrap().insert(tok.clone(), Instant::now());
+                {
+                    let mut s = shared.sessions.lock().unwrap();
+                    s.insert(tok.clone(), Instant::now());
+                    save_sessions(&s);
+                }
                 info!("web login");
                 respond(
                     reader.get_mut(),
@@ -439,7 +465,9 @@ fn handle_https(
         }
         ("GET", "/logout") => {
             if let Some(tok) = cookie(&req, "trxd") {
-                shared.sessions.lock().unwrap().remove(&tok);
+                let mut s = shared.sessions.lock().unwrap();
+                s.remove(&tok);
+                save_sessions(&s);
             }
             respond(
                 reader.get_mut(),
@@ -595,7 +623,7 @@ pub fn start(cfg: &WebConfig) -> Option<WebHandle> {
     }
     let shared = Arc::new(Shared {
         clients: Mutex::new(Vec::new()),
-        sessions: Mutex::new(HashMap::new()),
+        sessions: Mutex::new(load_sessions()),
         password,
         mic: Mutex::new(VecDeque::new()),
         mic_owner: Mutex::new(None),

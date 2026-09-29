@@ -26,9 +26,12 @@ start() {
 		echo "config error, see $LOG"
 		return 1
 	fi
-	# Keep restarting on a crash, but not in a tight loop.
+	# Keep restarting on a crash, but not in a tight loop. trxd asks for
+	# another FPGA bitstream by writing /run/fpga-mode.want and exiting:
+	# load it (fpga-mode: the PL reloaded, the drivers bound again) and
+	# start trxd again at once (docs/FPGA-MODES.md).
 	start-stop-daemon -S -b -m -p "$PIDFILE" -x /bin/sh -- -c \
-		"while :; do RUST_LOG=\${RUST_LOG:-info} $DAEMON --config '$CONF' >>$LOG 2>&1; sleep 5; done"
+		"while :; do if [ -f /run/fpga-mode.want ]; then /usr/sbin/fpga-mode \$(cat /run/fpga-mode.want) >>$LOG 2>&1; rm -f /run/fpga-mode.want; fi; RUST_LOG=\${RUST_LOG:-info} $DAEMON --config '$CONF' >>$LOG 2>&1; [ -f /run/fpga-mode.want ] || sleep 5; done"
 	echo "OK"
 }
 

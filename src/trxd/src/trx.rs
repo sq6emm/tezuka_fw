@@ -2218,10 +2218,59 @@ impl Trx {
         }
     }
 
+    /// The state saved before an FPGA bitstream switch ([`crate::fpgamode`]):
+    /// VFOs, split, mode, filter, then the command that asked for it.
+    fn resume(&mut self, r: &serde_json::Value) {
+        use serde_json::json;
+        info!(fpga = %crate::fpgamode::loaded(), "resuming after the FPGA bitstream switch");
+        if let (Some(a), Some(b)) = (r["vfo_a"].as_f64(), r["vfo_b"].as_f64()) {
+            self.apply_web(0, &json!({"cmd": "vfo", "sel": "A"}));
+            self.apply_web(0, &json!({"cmd": "freq", "hz": a}));
+            self.apply_web(0, &json!({"cmd": "vfo", "sel": "B"}));
+            self.apply_web(0, &json!({"cmd": "freq", "hz": b}));
+            let sel = if r["active_b"].as_bool() == Some(true) { "B" } else { "A" };
+            self.apply_web(0, &json!({"cmd": "vfo", "sel": sel}));
+        }
+        if r["split"].as_bool() == Some(true) {
+            self.apply_web(0, &json!({"cmd": "split", "on": true}));
+        }
+        if let Some(md) = r["mode"].as_str() {
+            self.apply_web(0, &json!({"cmd": "mode", "mode": md}));
+        }
+        if let (Some(lo), Some(hi)) = (r["filter"][0].as_f64(), r["filter"][1].as_f64()) {
+            self.apply_web(0, &json!({"cmd": "filter", "lo": lo, "hi": hi}));
+        }
+        for c in r["cmds"].as_array().into_iter().flatten() {
+            self.apply_web(0, c);
+        }
+    }
+
     fn apply_web(&mut self, client: u64, m: &serde_json::Value) {
         let cmd = m["cmd"].as_str().unwrap_or("");
         let num = |k: &str| m[k].as_f64();
         let on = m["on"].as_bool().unwrap_or(false);
+        // A feature on a part of the FPGA the loaded bitstream lacks: load
+        // one that has it (trxd restarts and takes this command up again).
+        let part = match cmd {
+            "datv_mode" | "datv_rx" | "datv" if on => Some(crate::fpgamode::Part::Datv),
+            "cw_engine" if m["engine"].as_str() == Some("rs") => Some(crate::fpgamode::Part::Rsnn),
+            _ => None,
+        };
+        if let Some(want) = part.and_then(crate::fpgamode::switch_for) {
+            if self.tx_on.is_none() {
+                if let Some(w) = &self.web {
+                    let msg = format!("loading the FPGA image for this ({want}): back in a few seconds");
+                    w.send_json_to(client, &serde_json::json!({"type": "datv_error", "msg": msg}));
+                }
+                let resume = serde_json::json!({
+                    "vfo_a": self.vfo_a, "vfo_b": self.vfo_b, "active_b": self.active == Vfo::B,
+                    "split": self.split, "mode": mode_name(self.mode),
+                    "filter": [self.filter.0, self.filter.1], "cmds": [m],
+                });
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                crate::fpgamode::request(want, &resume);
+            }
+        }
         match cmd {
             "freq" => {
                 if let Some(hz) = num("hz") {
@@ -2497,6 +2546,9 @@ impl Trx {
     pub fn run(mut self, rx: Receiver<RxBlock>) {
         crate::stream::realtime_thread();
         info!(freq = self.rx_vfo(), mode = mode_name(self.mode), rate = self.rate, "transceiver running");
+        if let Some(r) = crate::fpgamode::take_resume() {
+            self.resume(&r);
+        }
         // Sockets: the band's own pair (SET), else the last one used.
         let band = self.cal_band();
         let p = self.settings.ports.get(&band).copied().unwrap_or(self.settings.port);

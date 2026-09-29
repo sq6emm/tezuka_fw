@@ -172,6 +172,7 @@ impl DecodeWorker {
                         Job::Pi4 { audio, boundary, slot_utc, dial_hz } => pi4(&audio, boundary, slot_utc, dial_hz),
                         Job::Cw { audio_3k2, slot_utc, carrier_hz, audio_hz, snr_db } => {
                             if deepcw.is_none() {
+                                crate::model::wait_installed();
                                 match sdroxide_deepcw::Stream::new() {
                                     Ok(d) => deepcw = Some(d),
                                     Err(e) => warn!("DeepCW model: {e}"),

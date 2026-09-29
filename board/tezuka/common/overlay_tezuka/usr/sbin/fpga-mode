@@ -1,0 +1,74 @@
+#!/bin/sh
+#
+# fpga-mode NAME: load the FPGA bitstream for a trxd mode at runtime
+# (/lib/firmware/fpga-NAME.bin, the byte-swapped .bin the zynq fpga
+# manager takes). fpga-mode with no argument prints the loaded one.
+#
+# The whole PL is reconfigured, so nothing may touch it meanwhile: trxd must
+# not be running (its S80trxd loop calls this between runs), the drivers of
+# the PL devices are unbound first and bound again after (the AD936x phy
+# too: it tunes the digital interface into the new fabric), and on LibreSDR
+# the GPSDO script is stopped and started again through S22gpsdo (the
+# reload resets vctcxo_lock; the script re-acquires as at boot).
+#
+# /run/fpga-mode holds the loaded mode ("boot": the one U-Boot loaded).
+
+FW=/lib/firmware
+STATE=/run/fpga-mode
+MGR=/sys/class/fpga_manager/fpga0
+LOG=/var/log/fpga-mode.log
+
+cur=$(cat $STATE 2>/dev/null || cat /etc/fpga-boot-mode 2>/dev/null || echo all)
+[ -z "$1" ] && { echo "$cur"; exit 0; }
+want=$1
+[ "$want" = "$cur" ] && exit 0
+[ -f "$FW/fpga-$want.bin" ] || { echo "fpga-mode: no $FW/fpga-$want.bin" >&2; exit 1; }
+pidof trxd >/dev/null && { echo "fpga-mode: trxd is running" >&2; exit 1; }
+
+log() { echo "$(date +%T) $*" >> $LOG; logger -t fpga-mode "$*" 2>/dev/null; }
+
+# driver:device, in probe order (unbound in reverse)
+DEVS="uio_pdrv_genirq:7c460000.maia-sdr
+dma-axi-dmac:7c400000.dma
+dma-axi-dmac:7c420000.dma
+ad9361:spi0.0
+cf_axi_dds:79024000.cf-ad9361-dds-core-lpc
+cf_axi_adc:79020000.cf-ad9361-lpc"
+
+bus_of() { case "$1" in ad9361) echo spi;; *) echo platform;; esac; }
+
+unbind_all() {
+	for d in $(echo "$DEVS" | sed -n '1!G;h;$p'); do
+		drv=${d%%:*}; dev=${d#*:}; b=/sys/bus/$(bus_of $drv)/drivers/$drv
+		[ -e "$b/$dev" ] && echo "$dev" > "$b/unbind"
+	done
+}
+
+bind_all() {
+	ok=0
+	for d in $DEVS; do
+		drv=${d%%:*}; dev=${d#*:}; b=/sys/bus/$(bus_of $drv)/drivers/$drv
+		[ -e "$b/$dev" ] || echo "$dev" > "$b/bind" || ok=1
+	done
+	return $ok
+}
+
+gpsdo=
+[ -x /etc/init.d/S22gpsdo ] && [ -f /var/run/gpsdo_boot.pid ] && gpsdo=1
+
+log "$cur -> $want"
+[ -n "$gpsdo" ] && { /etc/init.d/S22gpsdo stop >/dev/null 2>&1; sleep 1; }
+unbind_all
+echo 0 > $MGR/flags
+if echo "fpga-$want.bin" > $MGR/firmware && [ "$(cat $MGR/state)" = operating ]; then
+	echo "$want" > $STATE
+	r=0
+else
+	log "load of fpga-$want.bin failed (state $(cat $MGR/state))"
+	echo unknown > $STATE
+	r=1
+fi
+bind_all || { log "rebinding failed"; r=1; }
+[ -n "$gpsdo" ] && /etc/init.d/S22gpsdo start >/dev/null 2>&1
+log "now $(cat $STATE)"
+exit $r

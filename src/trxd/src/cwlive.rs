@@ -364,6 +364,7 @@ impl CwLive {
 }
 
 fn start_deep() -> Option<Worker> {
+    crate::model::wait_installed();
     match Worker::with_window(WINDOW_S) {
         Ok(w) => Some(w),
         Err(e) => {

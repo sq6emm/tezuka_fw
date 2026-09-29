@@ -152,6 +152,41 @@ fn mtd_by_label(label: &str) -> Option<String> {
     })
 }
 
+/// Set once [`install`] has run (whatever came of it).
+static INSTALLED: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// [`install`] in the background: reading the flash takes about 5 s on the
+/// board, and trxd restarts for an FPGA bitstream switch. Users of DeepCW
+/// call [`wait_installed`] first.
+pub fn install_background(source: String) {
+    STARTED.store(true, std::sync::atomic::Ordering::Release);
+    let spawned = std::thread::Builder::new().name("model".into()).spawn(move || {
+        install(&source);
+        mark_installed();
+    });
+    if spawned.is_err() {
+        mark_installed();
+    }
+}
+
+fn mark_installed() {
+    *INSTALLED.0.lock().unwrap() = true;
+    INSTALLED.1.notify_all();
+}
+
+/// Until [`install_background`] is done (at once if it never started).
+pub fn wait_installed() {
+    if !STARTED.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let mut done = INSTALLED.0.lock().unwrap();
+    while !*done {
+        done = INSTALLED.1.wait(done).unwrap();
+    }
+}
+
+static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Find, verify and install the model for DeepCW. `source` is "auto" (the
 /// `model` flash partition), or a path to a blob or a plain `.onnx` file.
 /// Failure only disables neural CW decoding; everything else runs on.
