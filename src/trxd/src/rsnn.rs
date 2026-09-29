@@ -126,8 +126,17 @@ impl Features {
 /// in i32. Measured on the recordings (m4): activations up to 55 (7040
 /// here), weights under 1.3 (2660): both fit 16 bits; a sum is a
 /// preactivation (under about 60) x AQ x WQ, some 1.6e7, far below 2^31.
-const AQ: f32 = 128.0;
+pub(crate) const AQ: f32 = 128.0;
 const WQ: f32 = 2048.0;
+
+/// exp(-d) for the attention's softmax: d in steps of 1 / 2^(18 - EXP_SHIFT)
+/// = 1/128 (the logits are x AQ WQ = 2^18), Q15, EXP_N entries (to 16).
+pub const EXP_SHIFT: u32 = 11;
+pub const EXP_N: usize = 2048;
+
+pub fn exp_table() -> Vec<i32> {
+    (0..EXP_N).map(|i| (32767.0 * (-(i as f64) / 128.0).exp()).round() as i32).collect()
+}
 
 /// The network's weights.
 pub struct Net {
@@ -232,6 +241,32 @@ impl Net {
         Ok(Net { hop, c2, c1, dils, c1w, c1b, c2w, c2b, c3w, c3b, attw, attb, inpw, inpb, tw, tb, outw, outb, c1q, c2q, c3q, twq, float })
     }
 
+    /// The front's parameters as the FPGA engine (maia-hdl rsnn_front.py)
+    /// takes them: 16-bit weights c1, c2, c3 (conv2d_i layouts), attention,
+    /// 1x1 input (x WQ); 32-bit biases c1, c2, c3, attention, 1x1 (x AQ WQ).
+    pub fn fpga_image(&self) -> (Vec<i16>, Vec<i32>) {
+        let q = |v: f32| (v * WQ).round().clamp(-32767.0, 32767.0) as i16;
+        let b = |v: f32| (v * AQ * WQ).round() as i32;
+        let mut w: Vec<i16> = Vec::new();
+        w.extend(&self.c1q);
+        w.extend(&self.c2q);
+        w.extend(&self.c3q);
+        w.extend(self.attw.iter().map(|&v| q(v)));
+        w.extend(self.inpw.iter().map(|&v| q(v)));
+        let mut bs: Vec<i32> = Vec::new();
+        bs.extend(self.c1b.iter().map(|&v| b(v)));
+        bs.extend(self.c2b.iter().map(|&v| b(v)));
+        bs.extend(self.c3b.iter().map(|&v| b(v)));
+        bs.push(b(self.attb));
+        bs.extend(self.inpb.iter().map(|&v| b(v)));
+        (w, bs)
+    }
+
+    /// The 2-D and 1x1 channels (the FPGA engine's configuration).
+    pub fn channels(&self) -> (usize, usize) {
+        (self.c2, self.c1)
+    }
+
     /// Frames of context either side a frame's output depends on.
     pub fn reach(&self) -> usize {
         3 + 2 * self.dils.iter().sum::<usize>()
@@ -248,12 +283,68 @@ impl Net {
         if t == 0 {
             return Vec::new();
         }
-        let h = self.front(x);
         if self.float {
+            let h = self.front(x);
             self.temporal_f(h, t)
         } else {
-            self.temporal_i(&h, t)
+            let hq = self.front_q(x);
+            self.temporal_iq(hq, t)
         }
+    }
+
+    /// [`Self::front`] in fixed point all through (what the FPGA's engine
+    /// does, bit for bit): h x AQ ([c][t], i32). The 2-D layers as
+    /// conv2d_i; attention logits x AQ WQ in i32; softmax weights exp(-d)
+    /// from [`exp_table`] (Q15, steps of 1/128, d the distance to the
+    /// largest logit), their sum's reciprocal (2^31 / sum) once a frame;
+    /// the pooled values x AQ; the 1x1 in i64 sums of weights x WQ.
+    pub fn front_q(&self, x: &[[f32; NB]]) -> Vec<i32> {
+        let (c1n, c2, t) = (self.c1, self.c2, x.len());
+        let mut a0 = ActI::new(1, t, NB);
+        for (ti, row) in x.iter().enumerate() {
+            for (o, v) in a0.row_mut(0, ti).iter_mut().zip(row) {
+                *o = (v * AQ).round() as i16;
+            }
+        }
+        let a1 = conv2d_i::<5, 1>(&a0, &self.c1q, &self.c1b, c2, NB);
+        let a2 = conv2d_i::<5, 2>(&a1, &self.c2q, &self.c2b, c2, NB2);
+        let a3 = conv2d_i::<3, 1>(&a2, &self.c3q, &self.c3b, c2, NB2);
+        let exp = exp_table();
+        let q = |v: f32, s: f32| (v * s).round().clamp(-32767.0, 32767.0) as i32;
+        let attw: Vec<i32> = self.attw.iter().map(|&w| q(w, WQ)).collect();
+        let attb = (self.attb * AQ * WQ).round() as i32;
+        let inpw: Vec<i32> = self.inpw.iter().map(|&w| q(w, WQ)).collect();
+        let inpb: Vec<i64> = self.inpb.iter().map(|&b| (b * AQ * WQ).round() as i64).collect();
+        let mut h = vec![0i32; c1n * t];
+        let mut z = vec![0i64; 2 * c2];
+        for ti in 0..t {
+            let mut lg = [attb; NB2];
+            for (c, &w) in attw.iter().enumerate() {
+                for (l, &v) in lg.iter_mut().zip(a3.row(c, ti)) {
+                    *l += w * v as i32;
+                }
+            }
+            let m = *lg.iter().max().unwrap();
+            let mut e = [0i64; NB2];
+            for (ev, &l) in e.iter_mut().zip(&lg) {
+                *ev = exp[(((m - l) as u32) >> EXP_SHIFT).min(EXP_N as u32 - 1) as usize] as i64;
+            }
+            let den: i64 = e.iter().sum();
+            let r = (1i64 << 31) / den;
+            for c in 0..c2 {
+                let row = a3.row(c, ti);
+                let num: i64 = row.iter().zip(&e).map(|(&v, &ev)| v as i64 * ev).sum();
+                // (num >> 16) x r in 48 bits: one DSP48 in the FPGA
+                z[c] = ((num >> 16) * r) >> 15;
+                z[c2 + c] = *row.iter().max().unwrap() as i64;
+            }
+            for o in 0..c1n {
+                let w = &inpw[o * 2 * c2..(o + 1) * 2 * c2];
+                let acc: i64 = inpb[o] + w.iter().zip(&z).map(|(&a, &b)| a as i64 * b).sum::<i64>();
+                h[o * t + ti] = (acc.max(0) / WQ as i64) as i32;
+            }
+        }
+        h
     }
 
     /// The 2-D layers, pooling and the 1x1 into the temporal layers: h
@@ -380,10 +471,15 @@ impl Net {
 
     /// The temporal layers and the output in fixed point (h x AQ in i32,
     /// taken as i16 into each layer; weights x WQ).
+    /// [`Self::temporal_iq`] from h in float.
+    #[allow(dead_code)]
     fn temporal_i(&self, h: &[f32], t: usize) -> Vec<f32> {
+        self.temporal_iq(h.iter().map(|v| (v * AQ).round() as i32).collect(), t)
+    }
+
+    fn temporal_iq(&self, mut hq: Vec<i32>, t: usize) -> Vec<f32> {
         #[allow(non_snake_case)]
         let C1 = self.c1;
-        let mut hq: Vec<i32> = h.iter().map(|v| (v * AQ).round() as i32).collect();
         let mut inp = vec![0i16; C1 * t];
         let mut acc = vec![0i32; t];
         let mut add = vec![0i32; C1 * t];
@@ -567,6 +663,10 @@ pub struct Stream {
     layers: Vec<TLayer>,
     /// The last layer's outputs not yet turned into logits start here.
     out_next: usize,
+    /// The front in the FPGA (on a board with the engine free), else
+    /// [`Net::front_q`] here.
+    #[cfg(target_os = "linux")]
+    fpga: Option<crate::rsnn_fpga::FpgaFront>,
 }
 
 struct TLayer {
@@ -600,16 +700,49 @@ impl Stream {
                 TLayer { d, at: 0, next: 0, h: Default::default(), q: Default::default(), w, b }
             })
             .collect();
-        Stream { net, rows: Vec::new(), rows_at: 0, front_done: 0, layers, out_next: 0 }
+        #[cfg(target_os = "linux")]
+        let fpga = crate::rsnn_fpga::FpgaFront::open(&net);
+        Stream {
+            net,
+            rows: Vec::new(),
+            rows_at: 0,
+            front_done: 0,
+            layers,
+            out_next: 0,
+            #[cfg(target_os = "linux")]
+            fpga,
+        }
     }
 
     pub fn net(&self) -> &Net {
         &self.net
     }
 
+    /// The front runs in the FPGA.
+    pub fn on_fpga(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.fpga.is_some();
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
     /// Feature rows in; the logits of the frames now final appended to
     /// `out` (each frame's once all the context it takes is in).
     pub fn push(&mut self, rows: &[[f32; NB]], out: &mut Vec<f32>) {
+        #[cfg(target_os = "linux")]
+        if let Some(f) = self.fpga.as_mut() {
+            let mut hs = Vec::new();
+            for row in rows {
+                if let Some(h) = f.push(row) {
+                    hs.push(h.iter().map(|&v| v as i32).collect::<Vec<i32>>());
+                }
+            }
+            for h in hs {
+                self.feed(0, h, out);
+                self.front_done += 1;
+            }
+            return;
+        }
         self.rows.extend_from_slice(rows);
         let end = self.rows_at + self.rows.len();
         // the front: frames with 3 rows after them (and 3 before, or the start)
@@ -617,11 +750,11 @@ impl Stream {
             let (s, e) = (self.front_done, end - 3);
             let lo = s.saturating_sub(3).max(self.rows_at);
             let win = &self.rows[lo - self.rows_at..end - self.rows_at];
-            let h = self.net.front(win);
+            let h = self.net.front_q(win);
             let t = win.len();
             let c1 = self.net.c1;
             for f in s..e {
-                let v: Vec<i32> = (0..c1).map(|c| (h[c * t + (f - lo)] * AQ).round() as i32).collect();
+                let v: Vec<i32> = (0..c1).map(|c| h[c * t + (f - lo)]).collect();
                 self.feed(0, v, out);
             }
             self.front_done = e;
@@ -749,6 +882,9 @@ mod tests {
         let want = net.forward(&rows);
         let reach = net.reach();
         let mut st = Stream::new(Net::builtin());
+        eprintln!("front on the FPGA: {}", st.on_fpga());
+        // RSNN_EXPECT_FPGA=1: on a board with the engine
+        assert!(st.on_fpga() || std::env::var_os("RSNN_EXPECT_FPGA").is_none());
         let mut got = Vec::new();
         let mut at = 0;
         let mut n = 1;
@@ -763,6 +899,57 @@ mod tests {
         assert!(got.len() >= upto - 10, "{} of {upto}", got.len());
         let bad = (0..upto.min(got.len())).find(|&i| got[i] != want[i]);
         assert!(bad.is_none(), "first difference at frame {bad:?}: {} vs {}", got[bad.unwrap()], want[bad.unwrap()]);
+    }
+
+    /// Vectors for the FPGA front (maia-hdl test_rsnn_front.py):
+    /// RSNN_FRONT_VEC=<file.json> (RSNN_WEIGHTS: the network).
+    #[test]
+    #[ignore]
+    fn rsnn_front_vectors() {
+        // RSNN_FRONT_SMALL=1: a small random network (c2 4, c1 8), quick
+        // to simulate; else RSNN_WEIGHTS or the built-in one.
+        let net = if std::env::var_os("RSNN_FRONT_SMALL").is_some() {
+            let (c2, c1) = (4usize, 8usize);
+            let n = c2 * 15 + c2 + c2 * c2 * 15 + c2 + c2 * c2 * 9 + c2 + c2 + 1 + c1 * 2 * c2 + c1 + c1 * c1 * 5 + c1 + c1 + 1;
+            let mut r = 5u32;
+            let mut rnd = || {
+                r ^= r << 13;
+                r ^= r >> 17;
+                r ^= r << 5;
+                (r % 2001) as f32 / 1000.0 - 1.0
+            };
+            let mut b = b"RSN3".to_vec();
+            for v in [128u32, c2 as u32, c1 as u32, 1, 1, n as u32] {
+                b.extend(v.to_le_bytes());
+            }
+            for _ in 0..n {
+                b.extend((rnd() * 0.6).to_le_bytes());
+            }
+            Net::from_bytes(&b).unwrap()
+        } else {
+            Net::builtin()
+        };
+        let t = 24;
+        let mut x = 11u32;
+        let rows: Vec<[f32; NB]> = (0..t)
+            .map(|_| {
+                std::array::from_fn(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    ((x % 1800) as f32 / 100.0 - 6.0) * 0.7
+                })
+            })
+            .collect();
+        let h = net.front_q(&rows);
+        let (c2, c1) = net.channels();
+        // frames with all 3 rows after them (the stream's outputs)
+        let expect: Vec<Vec<i32>> = (0..t - 3).map(|k| (0..c1).map(|c| h[c * t + k]).collect()).collect();
+        let rq: Vec<Vec<i16>> = rows.iter().map(|r| r.iter().map(|v| (v * AQ).round() as i16).collect()).collect();
+        let (w, b) = net.fpga_image();
+        let j = serde_json::json!({"c2": c2, "c1": c1, "w": w, "b": b, "rows": rq, "h": expect});
+        std::fs::write(std::env::var("RSNN_FRONT_VEC").expect("RSNN_FRONT_VEC"), j.to_string()).unwrap();
+        eprintln!("front vectors: c2 {c2} c1 {c1}, {} weights, {} biases, {t} rows", w.len(), b.len());
     }
 
     /// The network's time a frame (run on the board: `trxd-test rsnn_speed
@@ -785,12 +972,26 @@ mod tests {
         let mut st = Stream::new(net);
         let long: Vec<[f32; NB]> = (0..2000).map(|i| x[i % x.len()]).collect();
         let mut out = Vec::new();
-        let t0 = std::time::Instant::now();
+        let cpu = || {
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            // SAFETY: a valid timespec out-pointer.
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+            ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
+        };
+        let (t0, c0) = (std::time::Instant::now(), cpu());
         for c in long.chunks(8) {
             st.push(c, &mut out);
         }
-        let per = t0.elapsed().as_secs_f64() / long.len() as f64;
-        eprintln!("{w} weights: streaming {:.2} ms a frame: {:.1} % of a core ({} out)", per * 1e3, 100.0 * per * 12_000.0 / hop as f64, out.len());
+        let per = (cpu() - c0) / long.len() as f64;
+        let wall = t0.elapsed().as_secs_f64() / long.len() as f64;
+        eprintln!(
+            "{w} weights: streaming {:.2} ms CPU ({:.2} ms wall) a frame: {:.1} % of a core ({} out, front on the FPGA: {})",
+            per * 1e3,
+            wall * 1e3,
+            100.0 * per * 12_000.0 / hop as f64,
+            out.len(),
+            st.on_fpga()
+        );
     }
 
     /// Against PyTorch: RSNN_VEC=<testvec.bin> (export.py, the same weights

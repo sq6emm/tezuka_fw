@@ -97,6 +97,26 @@ against the shipped network's 30. The cost on the A9 (streaming): about
 23.5 % of a core for 132 k (6 % shipped): the case for running it in the
 FPGA.
 
+### The front end in the FPGA
+
+Most of the larger networks' work is the front (the three 2-D layers:
+450 k of the 161 k network's 600 k multiplies a frame). maia-sdr
+`rsnn_front.py` (0x43C50000, id RSF1) does it: `Net::front_q` bit for bit
+(fixed point all through, softmax from an exp table with one reciprocal a
+frame), one multiply a cycle at the CPU clock, 4.6 ms a frame for the 161 k
+network (a frame is 10.7 ms), up to c2 24 / c1 64. A feature row in, the
+1x1's outputs for the frame three rows back out; the rings (the frames the
+time kernels take) and the weights (in BRAM, loaded once) stay in the FPGA.
+rsnn_fpga.rs drives it: `Stream` takes it when the bitstream has one and
+nobody else holds it, else the CPU (TRXD_NO_RSNN_FPGA=1: always the CPU).
+The temporal layers stay on the ARM.
+
+Tests: maia-hdl `test_rsnn_front.py` against `rsnn_front_vectors`
+(`cargo test rsnn_front_vectors -- --ignored`, RSNN_FRONT_VEC=<json>,
+RSNN_FRONT_SMALL=1 for the quick small network; RSNN_FRONT_VEC and
+RSNN_FRONT_ROWS on the test side for the full-size one); on a board
+`stream_matches_batch` runs the FPGA front against the CPU's batch pass.
+
 ## Not done
 
 - A language model (callsign structure, repeated calls combined): the

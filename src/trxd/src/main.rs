@@ -9,6 +9,8 @@
 
 mod rscw;
 mod rsnn;
+#[cfg(target_os = "linux")]
+mod rsnn_fpga;
 mod beacon;
 mod config;
 mod cwlive;
