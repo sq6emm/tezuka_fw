@@ -1550,6 +1550,23 @@ window.__rc28 = RC28; // for tests
 // WebCodecs for H.264 and Opus. The board muxes (MPEG-TS) and modulates.
 // Up: [4][key][i64 us][H.264 Annex B], [5][i64 us][Opus].
 // Down: [6][key][i64 us][H.264], [7][i64 us][Opus], [8][i8 re, i8 im]... constellation.
+// DVB service information the receiver read (SDT, NIT, EIT, TDT): off the
+// air, so escaped.
+const escHtml = (t) => String(t).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+function siHtml(si) {
+  if (!si) return "";
+  const hm = (u) => new Date(u * 1000).toISOString().slice(11, 16);
+  const lines = [];
+  if (si.service) lines.push(`<b>${escHtml(si.service)}</b>` + (si.provider ? ` (${escHtml(si.provider)})` : "") + (si.network ? ` · ${escHtml(si.network)}` : ""));
+  if (si.event && si.event.name) lines.push(`now: ${escHtml(si.event.name)}` + (si.event.text ? ` · ${escHtml(si.event.text)}` : "")
+    + (si.event.start ? ` (${hm(si.event.start)}-${hm(si.event.start + si.event.duration)} UTC)` : ""));
+  if (si.tx_utc) {
+    const d = si.tx_utc - Date.now() / 1000;
+    lines.push(`transmitter clock ${new Date(si.tx_utc * 1000).toISOString().slice(11, 19)} UTC` + (Math.abs(d) < 3600 ? ` (${d >= 0 ? "+" : ""}${d.toFixed(1)} s vs this computer)` : ""));
+  }
+  return lines.length ? "<br>" + lines.join("<br>") : "";
+}
+
 const DATV = (() => {
   let W = 320, H = 240;
   // TS payload bits per short PLFRAME (Kbch - 80), per QPSK rate.
@@ -1560,12 +1577,13 @@ const DATV = (() => {
   const LONG = { "L-QPSK-1/2": [32128, 33282], "L-QPSK-3/4": [48328, 33282], "L-8PSK-3/4": [48328, 22194] };
   // DVB-T2 (2K, GI 1/8, PP2, 190 data symbols, 9 QPSK or 18 16QAM FEC
   // blocks a frame of 458240 elementary samples): [elementary sample rate,
-  // TS bits per frame].
+  // TS bits per frame, frame samples if not 458240]. 1.35 MHz: 145 data
+  // symbols and 7 blocks (frames within T2's 250 ms).
   const T2 = { "T2-1.7-QPSK-1/2": [131e6 / 71, 289152], "T2-1.7-QPSK-3/4": [131e6 / 71, 434952],
-               "T2-2.0-QPSK-1/2": [16e6 / 7, 289152], "T2-1.35-QPSK-1/2": [1.35e6 * 8 / 7, 289152],
+               "T2-2.0-QPSK-1/2": [16e6 / 7, 289152], "T2-1.35-QPSK-1/2": [1.35e6 * 8 / 7, 224896, 354560],
                "T2-1.7-16QAM-1/2": [131e6 / 71, 578304], "T2-1.7-16QAM-3/4": [131e6 / 71, 869904],
                "T2-2.0-16QAM-1/2": [16e6 / 7, 578304] };
-  const tsRate = (sr, fec, pilots) => T2[fec] ? T2[fec][0] * T2[fec][1] / 458240
+  const tsRate = (sr, fec, pilots) => T2[fec] ? T2[fec][0] * T2[fec][1] / (T2[fec][2] || 458240)
     : LONG[fec] ? sr * LONG[fec][0] / LONG[fec][1] : sr * PAYLOAD[fec] / (pilots ? 8370 : 8190);
   const occupied = (sr, fec) => T2[fec] ? T2[fec][0] * 1705 / 2048 : sr * 1.35;
   // Long frames always carry pilots (the FPGA transmitter sends them, the
@@ -1793,7 +1811,7 @@ const DATV = (() => {
     keyframe() { forceKey = true; },
     meter(d, r) {
       if (rxOn && r && r.auto && !r.rx) { $("datv-rxstat").innerHTML = `<b>AUTO</b> ${r.auto}`; }
-      else if (rxOn && r) $("datv-rxstat").innerHTML = (r.auto ? `auto: ${r.auto}<br>` : "") + `<b>${r.locked ? "LOCK" : "searching"}</b><br>MER ${r.mer.toFixed(1)} dB · Es/N0 ${r.esn0.toFixed(1)} dB<br>carrier ${r.freq >= 0 ? "+" : ""}${r.freq} Hz<br>frames ${r.frames - r.bad}/${r.frames} · shown ${rxFrames}<br>dropped: IQ ${r.dropped}, frames ${r.busy}<br>CPU: demod ${r.demod_pct} %, FEC ${r.fec_pct} %${S.st && S.st.datv_rx && S.st.datv_rx.fpga ? " · front end: FPGA" : ""}`;
+      else if (rxOn && r) $("datv-rxstat").innerHTML = (r.auto ? `auto: ${r.auto}<br>` : "") + `<b>${r.locked ? "LOCK" : "searching"}</b><br>MER ${r.mer.toFixed(1)} dB · Es/N0 ${r.esn0.toFixed(1)} dB<br>carrier ${r.freq >= 0 ? "+" : ""}${r.freq} Hz<br>frames ${r.frames - r.bad}/${r.frames} · shown ${rxFrames}<br>dropped: IQ ${r.dropped}, frames ${r.busy}<br>CPU: demod ${r.demod_pct} %, FEC ${r.fec_pct} %${S.st && S.st.datv_rx && S.st.datv_rx.fpga ? " · front end: FPGA" : ""}` + siHtml(r.si);
       if (!on || !cfg) return;
       $("datv-stat").textContent = `${cfg.width}x${cfg.height} ${cfg.fps} fps · video ${(cfg.video_bps / 1000).toFixed(0)}k · audio ${(cfg.audio_bps / 1000).toFixed(0)}k` +
         (d ? ` · queue ${d.backlog.toFixed(1)} s · dropped ${d.dropped}` : "") + ` · sent ${(sent / 1024).toFixed(0)} KiB` +

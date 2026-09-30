@@ -179,9 +179,9 @@ DAC DMA -> datv_split --(DAC GPIO bit 1)--> async FIFO -> ORI dvb_fpga encoder
     1/2 long: 32/32 frames with every LDPC parity bit and the BBHEADER
     CRC right, MER 36-37 dB.
   - The TS carries service SQ6EMM / SQTRX with H.264 and Opus.
-- Not checked on air yet: QPSK 3/4 and 8PSK 3/4 (same encoder path), and
-  exactly 250 kS/s (the DDC needs whole ratios; the interpolator is
-  verified in simulation).
+- On air 2026-09-30 (Libre 1 -> Libre 2, 2330 MHz, 250 kS/s): QPSK 3/4
+  563/597 frames (one 10 s dropout on the path, MER 23 dB otherwise),
+  8PSK 3/4 970/971.
 - Libre 2 to Libre 1 at 256 kS/s arrives at about 2 dB MER: 6 dB below the
   64 kS/s link, around the QPSK 1/2 threshold.
 

@@ -104,6 +104,28 @@ mod tests {
         }
     }
 
+    /// Every mode: a frame within T2's 250 ms, the FEC blocks within its
+    /// cells; the 1.35 MHz one (145 data symbols) through the loop.
+    #[test]
+    fn t2_modes_fit_and_short_frames_decode() {
+        for bw in ["1.7", "2.0", "1.35"] {
+            for c in ["QPSK", "16QAM"] {
+                for r in ["1/2", "3/4"] {
+                    let m = super::super::tx::Mode::parse(&format!("T2-{bw}-{c}-{r}")).unwrap();
+                    let frame_s = m.p.frame_samples() as f64 / m.fs();
+                    assert!(frame_s <= 0.250, "T2-{bw}-{c}-{r}: {frame_s} s");
+                    // data cells: the frame's, less L1 in P2 and the frame
+                    // closing symbol's unused cells (as FrameMapper counts)
+                    let (_, n_fc, c_fc) = m.p.data_cells();
+                    let data = m.p.frame_cells() - (1840 + super::super::l1::post_cells() + n_fc - c_fc);
+                    assert!(m.p.fec_blocks * m.p.cells() <= data, "T2-{bw}-{c}-{r}: {} blocks in {data} cells", m.p.fec_blocks);
+                }
+            }
+        }
+        let m = super::super::tx::Mode::parse("T2-1.35-QPSK-1/2").unwrap();
+        loopback(m.p, 15.0, false);
+    }
+
     /// Joining mid-frame, a sample clock 20 ppm off (the timing drifts
     /// about 9 samples a frame) and a carrier 2 kHz off: every frame after
     /// the first P1 found, P1 tracked frame to frame.

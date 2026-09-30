@@ -65,6 +65,13 @@ impl Mode {
         p.constellation = constellation;
         // 190 data symbols hold 9 QPSK FEC blocks (32400 cells) or 18 16QAM.
         p.fec_blocks = 9 * constellation.bits() / 2;
+        if bw_hz == 1_350_000.0 {
+            // At 1.35 MHz (1.543 MS/s) 190 data symbols make a 297 ms frame,
+            // over T2's 250 ms: 145 hold 7 QPSK blocks (14 16QAM) in 230 ms,
+            // with fewer dummy cells (978 kbit/s instead of 974).
+            p.data_symbols = 145;
+            p.fec_blocks = 7 * constellation.bits() / 2;
+        }
         // Rotated QPSK (29 degrees, Q a cell later): free robustness against
         // fading, as T2 intends; receivers read it from L1-post.
         p.rotation = true;

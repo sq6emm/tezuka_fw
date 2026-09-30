@@ -34,19 +34,44 @@ Symbol rates are those with whole samples per symbol at 384 kS/s: 32, 48, 64,
 
 | Symbol rate, code rate | TS kbit/s | Profile (board picks it from the TS rate) |
 |---|---|---|
-| 64 kS/s, 1/4 | 22.9 | 160x120, 2 fps, video ~9.6 k, Opus 6 k in 800 ms PES, PSI every 2 s |
+| 64 kS/s, 1/4 | 22.9 | 160x120, 2 fps, video ~6 k, Opus 6 k in 800 ms PES, PSI every 1 s |
 | 32 kS/s, 1/2 | 26.6 | same |
 | 64 kS/s, 1/2 | 53.2 | 320x240, 5 fps, video ~24.5 k, Opus 12 k in 200 ms PES |
 | 128 kS/s, 2/3 | 161.4 | 320x240, 10 fps, video ~104 k, Opus 16 k |
 
 At these rates the 188-byte TS packet is the unit of cost: one 20 ms Opus frame
-per PES would cost 50 packets a second. The mux packs audio into long PES,
-sends PSI rarely, stamps PCRs exactly when the modulator pulls a packet, and
-fills idle slots with PCR-only or null packets. With over 1 s of video queued
+per PES would cost 50 packets a second. The mux packs audio into long PES and
+stamps PCRs exactly when the modulator pulls a packet.
+
+Repetition follows ISO/IEC 13818-1 and ETSI TR 101 290 (since 2026-09-30):
+PAT and PMT every 0.5 s, the SDT within 2 s, a PCR within 100 ms (90 ms
+below 200 kbit/s) and every 40 ms from 200 kbit/s up. Every video packet
+reserves an 8-byte adaptation field that takes the PCR when one is due; a
+PCR-only packet goes first when audio or tables hold the queue. The lean
+profile below 40 kbit/s is a deliberate exception (tables every second, a
+PCR every 0.5 s): the standard rates would leave its picture about 4
+kbit/s, and only MiniTiouner-class receivers work there anyway.
+`repetition_meets_tr101290` checks the intervals at five rates with video
+at its budget; TSDuck (`tsp -P continuity -P pcrverify -P analyze`, image
+tsduck:1) finds no continuity errors, every PCR within 27 us of the constant
+rate, service type 0x16 and network id 0xFF01. With over 1 s of video queued
 it drops non-key frames and asks the browser for a keyframe; over 3 s it
 flushes.
 
-The TS carries an SDT: service name = the callsign from SET, provider SQTRX.
+The TS carries an SDT: service name = the callsign from SET, provider SQTRX,
+service type 0x16 (H.264 SD television), original network id 0xFF01 (the
+private range; 0x0001 is a registered satellite network). The DVB SI
+tables EN 300 468 asks for go out too: NIT actual (network "SQTRX DATV",
+this TS and its service) every 9.5 s, EIT present/following actual (the
+present event "DATV <call>", "Amateur television", the current hour,
+running; no following event) every 1.7 s, TDT (UTC from the board's clock)
+every 25 s; the PAT names the NIT's PID and the SDT flags the EIT. trxd's
+own receiver reads the SDT, NIT, EIT and TDT back (`ts::Si`) and the DATV
+panel shows them: service and provider, network, the event on air, and the
+transmitter's clock against the browser's. TSDuck's `tstables` decodes all
+of them. Opus is not a
+DVB broadcast codec (TS 101 154): TVs and set-top boxes show the picture
+without sound; players and DATV receivers decode it.
 Opus in TS follows ffmpeg (registration descriptor "Opus", control header per
 access unit); ffprobe, ffmpeg and VLC read it.
 

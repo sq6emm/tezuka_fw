@@ -6,10 +6,10 @@ DVB-T2 option's profile, received by the Ryde, the Knucker and the Lynx
 
 | | |
 |---|---|
-| Channel | 1.7 MHz (standard, 131/71 MS/s), or 2.0 / 1.35 MHz (sample rate 8/7 x bandwidth) |
+| Channel | 1.7 MHz (standard, 131/71 MS/s), or 2.0 / 1.35 MHz (amateur, not in EN 302 755: sample rate 8/7 x bandwidth, receivers must be set to that clock) |
 | OFDM | 2K, normal carriers, guard 1/8, pilot pattern PP2, SISO |
-| Frame | P1, 8 P2 symbols, 190 data symbols (about 248 ms at 1.7 MHz), 2 frames a super-frame |
-| PLP | one, TS, normal FEC frames (64800), QPSK or 16QAM, 1/2 or 3/4, rotated constellation (29 / 16.8 degrees), one TI block, 9 (QPSK) or 18 (16QAM) FEC blocks a frame |
+| Frame | P1, 8 P2 symbols, 190 data symbols (248 ms at 1.7 MHz, 200 ms at 2.0 MHz); 1.35 MHz: 145 data symbols, 7 QPSK / 14 16QAM blocks (230 ms: 190 made 297 ms, over T2's 250 ms); 2 frames a super-frame |
+| PLP | one, TS, normal FEC frames (64800), QPSK or 16QAM, 1/2 or 3/4, rotated constellation (29 / 16.8 degrees), one TI block, 9 (QPSK) or 18 (16QAM) FEC blocks a frame (1.35 MHz: 7 / 14) |
 | L1 | L1-pre BPSK, L1-post QPSK 1/2 (16K LDPC), version 1.1.1 |
 | TS rate at 1.7 MHz | QPSK 1.164 (1/2) / 1.751 (3/4) Mbit/s, 16QAM 2.328 / 3.502 Mbit/s |
 
@@ -314,6 +314,42 @@ bugs, not the link:
 | both fixes, receiver beside the sender | 98.7 % (Libre 1's own: 36 bad of 12 204, at the start) |
 
 QPSK 1/2 after both: 2718 of 2718 blocks in 90 s.
+
+## Every mode on air (2026-09-30)
+
+Libre 1 -> Libre 2 at 2330 MHz, 90 s each, all through the FPGA path:
+
+| Mode | Blocks decoded |
+|---|---|
+| 1.7 MHz QPSK 1/2 | 2718/2718 |
+| 1.7 MHz QPSK 3/4 | 2234/2376 (one 15 s dropout) |
+| 1.7 MHz 16QAM 1/2 | 98.7 % (3 min) |
+| 1.7 MHz 16QAM 3/4 | 5552/5796 |
+| 2.0 MHz QPSK 1/2 | 2895/3258 |
+| 2.0 MHz 16QAM 1/2 | 6298/6534 |
+| 1.35 MHz QPSK 1/2 | 2465/2502 |
+
+The dropouts were on the path or Libre 2's receive side: Libre 1's own
+receiver beside the transmitter lost nothing at those moments.
+
+## Compliance with EN 302 755 (reviewed 2026-09-30)
+
+The 1.7 MHz modes follow the standard in every field and table checked:
+L1-pre (200 bits) and L1-post, mode adaptation (normal mode, TS, CCM), BCH
+and LDPC, the 16QAM bit interleaver, rotation and Q delay, cell, time and
+frequency interleavers, frame builder, pilots (PP2, continual, edge, P2),
+P1, the frame closing symbol GI 1/8 + PP2 requires; gr-dtv agrees bit for
+bit (`t2_matches_gr_dtv`: QPSK 1/2 and 3/4, rotated, 16QAM 1/2).
+
+Outside the standard: the 2.0 and 1.35 MHz channels (amateur: the clock
+scaled, not signalled in L1). The 1.35 MHz frame was 297 ms, over the
+250 ms limit; it now has 145 data symbols (230 ms). The FPGA's transmit
+IFFT takes frames of any length up to 198 symbols (a sync word where the
+next symbol would start ends the frame; `test_short_frames`), and
+`t2_modes_fit_and_short_frames_decode` checks every mode's frame length and
+capacity and decodes a 1.35 MHz frame. Not yet confirmed by an independent
+receiver: the spectrum's orientation on air (a Libre-to-Libre link would
+not notice an inversion).
 
 ## Not done
 

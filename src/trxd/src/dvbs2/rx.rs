@@ -923,6 +923,8 @@ pub struct RxShared {
     pub stats: Stats,
     /// Browser messages ([`super::ts::Demux`]), oldest first.
     pub msgs: VecDeque<Vec<u8>>,
+    /// DVB service information read so far (SDT, NIT, EIT p/f, TDT).
+    pub si: super::ts::Si,
 }
 
 /// [`Receiver`] and [`super::ts::Demux`] on their own thread, off the
@@ -1094,6 +1096,7 @@ fn spawn_fec<B: FecBlock>(
                 }
                 *fs2.lock().unwrap() = st;
                 let mut s = sh.lock().unwrap();
+                s.si = dmx.si.clone();
                 s.msgs.extend(msgs.drain(..));
                 let excess = s.msgs.len().saturating_sub(300);
                 s.msgs.drain(..excess);
@@ -1472,6 +1475,11 @@ impl RxThread {
         if self.tx.try_send((iq.to_vec(), center_hz)).is_err() {
             self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// The DVB service information received so far.
+    pub fn si(&self) -> super::ts::Si {
+        self.shared.lock().unwrap().si.clone()
     }
 
     /// Statistics (demodulator and decoder merged) and the messages decoded

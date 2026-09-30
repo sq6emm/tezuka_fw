@@ -2202,7 +2202,8 @@ impl Trx {
                 "mer": (s.data_esn0_db * 10.0).round() / 10.0,
                 "freq": s.freq_hz.round(), "frames": s.frames, "bad": s.frames_bad, "packets": s.packets,
                 "dropped": s.blocks_dropped, "skipped": s.frames_skipped, "busy": s.frames_fec_busy,
-                "demod_pct": (100.0 * s.other_s / s.wall_s.max(1e-9)).round(), "fec_pct": (100.0 * s.ldpc_s / s.wall_s.max(1e-9)).round()}));
+                "demod_pct": (100.0 * s.other_s / s.wall_s.max(1e-9)).round(), "fec_pct": (100.0 * s.ldpc_s / s.wall_s.max(1e-9)).round(),
+                "si": self.datv_rx.as_ref().map(|r| r.si().json())}));
             w.send_json(&serde_json::json!({"type": "meter", "s_dbfs": self.s_dbfs, "tx": tx, "rx_gain_db": self.hw_gain_db, "cw": cw, "datv": datv, "datv_rx": datv_rx, "txm": txm,
                 "dbm": (dbm * 10.0).round() / 10.0, "s": crate::settings::s_units(self.rx_eff(), dbm),
                 "reading": (self.reading_db * 10.0).round() / 10.0, "sq": self.squelch_open}));
