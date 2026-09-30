@@ -33,6 +33,16 @@ const NIT_EVERY_S: f64 = 9.5;
 const EIT_EVERY_S: f64 = 1.7;
 const TDT_EVERY_S: f64 = 25.0;
 const NETWORK_NAME: &[u8] = b"SQTRX DATV";
+/// Index of each table's version in [`Mux::versions`].
+const T_PAT: usize = 0;
+const T_PMT: usize = 1;
+const T_SDT: usize = 2;
+const T_NIT: usize = 3;
+const T_EIT: usize = 4;
+/// Every PES must be in by its PTS (T-STD); this much to spare.
+const PTS_MARGIN_S: f64 = 0.05;
+/// A keyframe at least this often (the browser is asked for one).
+const KEY_EVERY_S: f64 = 2.0;
 pub const PID_VIDEO: u16 = 0x0100;
 pub const PID_AUDIO: u16 = 0x0101;
 /// 27 MHz system clock.
@@ -171,7 +181,10 @@ pub struct Mux {
     /// Packets pulled so far: the mux clock.
     sent: u64,
     cc: [u8; 8],
+    /// Video packets waiting (and, in `aqueue`, audio: it goes first, its
+    /// PES are few and small and must be in by their PTS).
     queue: VecDeque<Queued>,
+    aqueue: VecDeque<Queued>,
     next_psi: u64,
     /// Position in the PAT, PMT (, SDT) burst, and bursts sent.
     psi_step: u8,
@@ -185,6 +198,16 @@ pub struct Mux {
     eit_step: u8,
     /// Wall clock (Unix seconds) at packet 0: the TDT and EIT times.
     start_unix: f64,
+    /// PAT, PMT, SDT, NIT, EIT: version_number and a hash of the content it
+    /// was given for (13818-1 / EN 300 468: the version changes with it).
+    versions: [(u8, Option<u64>); 5],
+    /// Last PTS given, video and audio: never back.
+    last_pts: [Option<u64>; 2],
+    /// The latest SPS and PPS (Annex B, start codes included): put before
+    /// a keyframe that comes without them.
+    sps_pps: Vec<u8>,
+    /// Packet index of the last keyframe queued.
+    last_key: Option<u64>,
     /// Media time `ts_us` that maps to 90 kHz clock `pts90`.
     anchor: Option<(i64, u64)>,
     audio: Vec<(i64, Vec<u8>)>,
@@ -205,6 +228,7 @@ impl Mux {
             sent: 0,
             cc: [0; 8],
             queue: VecDeque::new(),
+            aqueue: VecDeque::new(),
             next_psi: 0,
             psi_step: 0,
             psi_round: 0,
@@ -213,6 +237,10 @@ impl Mux {
             next_eit: 0,
             next_tdt: 0,
             eit_step: 0,
+            versions: [(0, None); 5],
+            last_pts: [None; 2],
+            sps_pps: Vec::new(),
+            last_key: None,
             start_unix: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64()),
             anchor: None,
             audio: Vec::new(),
@@ -247,6 +275,37 @@ impl Mux {
         now90 + delay90
     }
 
+    /// A stream's PTS, never before the last one given (a re-anchored
+    /// clock would otherwise step it back): 1/90000 s later at least.
+    fn monotonic(&mut self, k: usize, pts: u64) -> u64 {
+        let p = self.last_pts[k].map_or(pts, |l| pts.max(l + 1));
+        self.last_pts[k] = Some(p);
+        p
+    }
+
+    /// When everything queued now has gone out, on the 90 kHz clock (the
+    /// PCR and table packets between counted with a tenth to spare).
+    fn done_at_90(&self) -> u64 {
+        let n = self.sent as f64 + (self.queue.len() + self.aqueue.len()) as f64 * 1.1;
+        (n / self.pps * 90_000.0) as u64
+    }
+
+    /// Would the queue's last PES come in after `pts` (with the margin)?
+    fn late(&self, pts: u64) -> bool {
+        self.done_at_90() + (PTS_MARGIN_S * 90_000.0) as u64 > pts
+    }
+
+    /// Should the browser send a keyframe? After a dropped frame, or when
+    /// none came for KEY_EVERY_S (decoders start and recover at
+    /// keyframes). Asking resets both, so it is asked once.
+    pub fn take_key_request(&mut self) -> bool {
+        let overdue = self.last_key.is_some_and(|k| (self.sent - k) as f64 > KEY_EVERY_S * self.pps);
+        if overdue {
+            self.last_key = Some(self.sent);
+        }
+        std::mem::take(&mut self.want_key) || overdue
+    }
+
     pub fn push(&mut self, m: Media) {
         match m {
             Media::Video { ts_us, key, data } => {
@@ -263,13 +322,58 @@ impl Mux {
                     return;
                 }
                 let pts = self.pts90(ts_us);
+                let pts = self.monotonic(0, pts);
                 let mut es = Vec::with_capacity(data.len() + 6);
                 // Access unit delimiter first, unless the encoder put one there.
                 if !data.windows(5).take(1).any(|w| w == [0, 0, 0, 1, 0x09]) {
                     es.extend_from_slice(&[0, 0, 0, 1, 0x09, 0xF0]);
                 }
+                // A keyframe starts decoding: it needs the SPS and PPS with it.
+                let sets = parameter_sets(&data);
+                if !sets.is_empty() {
+                    self.sps_pps = sets;
+                } else if key && !self.sps_pps.is_empty() {
+                    es.extend_from_slice(&self.sps_pps.clone());
+                }
                 es.extend_from_slice(&data);
+                let before = self.queue.len();
                 self.queue_pes(PID_VIDEO, 0xE0, pts, &es, true);
+                // T-STD: the whole PES in before its PTS. Late: a non-key
+                // frame goes (a keyframe asked for); a keyframe makes room by
+                // dropping the video queued before it, and if even so late
+                // takes a later PTS (the timeline moves on, never back).
+                if self.late(pts) {
+                    if !key {
+                        self.queue.truncate(before);
+                        self.video_dropping = true;
+                        self.want_key = true;
+                        self.dropped_frames += 1;
+                        return;
+                    }
+                    let mine: Vec<Queued> = self.queue.drain(before..).collect();
+                    let dropped = self.queue.iter().filter(|q| q.pid == PID_VIDEO).count();
+                    self.queue.retain(|q| q.pid != PID_VIDEO);
+                    self.queue.extend(mine);
+                    if dropped > 0 {
+                        self.dropped_frames += 1;
+                    }
+                    if self.late(pts) {
+                        let need = self.done_at_90() + (PTS_MARGIN_S * 90_000.0) as u64;
+                        // re-stamp: a new anchor so this and what follows are in time
+                        let shift = need - pts;
+                        if let Some((t0, p0)) = self.anchor {
+                            self.anchor = Some((t0, p0 + shift));
+                        }
+                        let first = self.queue.iter().position(|q| q.pid == PID_VIDEO).unwrap_or(0);
+                        let new_pts = pts + shift;
+                        let pkt = restamp(&self.queue[first].pkt, new_pts);
+                        self.queue[first].pkt = pkt;
+                        self.last_pts[0] = Some(new_pts);
+                    }
+                }
+                if key {
+                    self.last_key = Some(self.sent);
+                }
             }
             Media::Audio { ts_us, data } => {
                 self.audio.push((ts_us, data));
@@ -284,6 +388,7 @@ impl Mux {
         let frames = std::mem::take(&mut self.audio);
         let Some(&(ts, _)) = frames.first() else { return };
         let pts = self.pts90(ts);
+        let pts = self.monotonic(1, pts);
         let mut es = Vec::new();
         for (_, f) in &frames {
             // Opus control header (the Opus-in-MPEG-TS mapping, as ffmpeg writes it).
@@ -339,7 +444,12 @@ impl Mux {
             pkt[payload_at..payload_at + n].copy_from_slice(&rest[..n]);
             debug_assert_eq!(payload_at + n, TS_LEN);
             rest = &rest[n..];
-            self.queue.push_back(Queued { pid, pkt, pcr: af_pcr });
+            let q = Queued { pid, pkt, pcr: af_pcr };
+            if pid == PID_AUDIO {
+                self.aqueue.push_back(q);
+            } else {
+                self.queue.push_back(q);
+            }
             first = false;
         }
     }
@@ -369,7 +479,7 @@ impl Mux {
         // (the first tables go before anything: a receiver learns the PIDs)
         let pcr_due = self.psi_round > 0 && self.last_pcr.is_none_or(|l| (n + 1 - l) as f64 >= every);
         if pcr_due {
-            if self.queue.front().is_some_and(|q| q.pcr) {
+            if self.aqueue.is_empty() && self.queue.front().is_some_and(|q| q.pcr) {
                 // a video packet: its reserved adaptation field takes the PCR
                 let mut q = self.queue.pop_front().expect("front");
                 q.pkt[5] |= 0x10;
@@ -395,9 +505,18 @@ impl Mux {
                 self.next_psi = n + ((self.profile.psi_every_s * self.pps).floor() as u64).saturating_sub(2).max(1);
             }
             let pkt = match self.psi_step {
-                0 => self.section(0, &self.pat()),
-                1 => self.section(PID_PMT, &self.pmt()),
-                _ => self.section(PID_SDT, &self.sdt()),
+                0 => {
+                    let sec = self.versioned(T_PAT, self.pat(), true);
+                    self.section(0, &sec)
+                }
+                1 => {
+                    let sec = self.versioned(T_PMT, self.pmt(), true);
+                    self.section(PID_PMT, &sec)
+                }
+                _ => {
+                    let sec = self.versioned(T_SDT, self.sdt(), true);
+                    self.section(PID_SDT, &sec)
+                }
             };
             self.psi_step += 1;
             // (the rest of the burst goes in the next slots)
@@ -412,13 +531,15 @@ impl Mux {
             if self.eit_step == 0 {
                 self.next_eit = n + (EIT_EVERY_S * self.pps) as u64;
             }
+            // (both sections share the table's version; the present one sets it)
             let sec = self.eit(self.eit_step, n);
+            let sec = self.versioned(T_EIT, sec, self.eit_step == 0);
             self.eit_step = (self.eit_step + 1) % 2;
             return self.section(PID_EIT, &sec);
         }
         if n >= self.next_nit {
             self.next_nit = n + (NIT_EVERY_S * self.pps) as u64;
-            let sec = self.nit();
+            let sec = self.versioned(T_NIT, self.nit(), true);
             return self.section(PID_NIT, &sec);
         }
         if n >= self.next_tdt {
@@ -426,10 +547,34 @@ impl Mux {
             let sec = tdt(self.unix(n));
             return self.section(PID_TDT, &sec);
         }
-        if let Some(q) = self.queue.pop_front() {
+        if let Some(q) = self.aqueue.pop_front().or_else(|| self.queue.pop_front()) {
             return self.stamp(q);
         }
         null_packet()
+    }
+
+    /// A finished section with this table's version_number, bumped when the
+    /// content (all but the version and the CRC) differs from last time
+    /// (`track`: this section decides; else it takes the current version).
+    fn versioned(&mut self, t: usize, mut sec: Vec<u8>, track: bool) -> Vec<u8> {
+        use std::hash::{Hash, Hasher};
+        let n = sec.len();
+        let (ver, last) = &mut self.versions[t];
+        if track {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            sec[..5].hash(&mut h);
+            sec[6..n - 4].hash(&mut h);
+            let hv = h.finish();
+            if last.is_some_and(|l| l != hv) {
+                *ver = (*ver + 1) & 0x1F;
+            }
+            *last = Some(hv);
+        }
+        sec[5] = (sec[5] & 0xC1) | (*ver << 1);
+        sec.truncate(n - 4);
+        let c = crc32(&sec);
+        sec.extend_from_slice(&c.to_be_bytes());
+        sec
     }
 
     /// Wall clock at packet `n`, Unix seconds.
@@ -838,6 +983,41 @@ pub fn mux_cli(input: &str, output: &str, rest: &[String]) -> Result<(), String>
 }
 
 /// Fill in section_length and append the CRC.
+/// A PES's first packet with a new PTS (the header after the adaptation
+/// field: 00 00 01 id len(2) flags(2) hdr_len, then the PTS).
+fn restamp(p: &[u8; TS_LEN], pts: u64) -> [u8; TS_LEN] {
+    let mut q = *p;
+    let at = if q[3] & 0x20 != 0 { 5 + q[4] as usize } else { 4 };
+    if at + 14 <= TS_LEN && q[at..at + 3] == [0, 0, 1] {
+        q[at + 9..at + 14].copy_from_slice(&pts_bytes(pts));
+    }
+    q
+}
+
+/// The SPS and PPS NAL units of an Annex B access unit (start codes
+/// included), in order; empty when it has none.
+fn parameter_sets(au: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 3 <= au.len() {
+        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
+            let s0 = if i > 0 && au[i - 1] == 0 { i - 1 } else { i };
+            starts.push((s0, i + 3));
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    for (k, &(s0, h)) in starts.iter().enumerate() {
+        let end = starts.get(k + 1).map_or(au.len(), |&(n0, _)| n0);
+        if h < au.len() && matches!(au[h] & 0x1F, 7 | 8) {
+            out.extend_from_slice(&au[s0..end]);
+        }
+    }
+    out
+}
+
 /// UTC as DVB SI writes it: 16-bit Modified Julian Date and hh:mm:ss in BCD.
 fn mjd_utc(unix: f64) -> [u8; 5] {
     let t = unix.max(0.0) as u64;
@@ -980,6 +1160,24 @@ mod tests {
             assert!(pat <= psi_max + 1e-9 && pmt <= psi_max + 1e-9, "rate {rate}: PAT {pat} PMT {pmt}");
             assert!(sdt <= 2.0, "rate {rate}: SDT {sdt}");
             assert!(dropped * 20 < vi, "rate {rate}: the video budget overflows ({dropped} of {vi} dropped)");
+            // T-STD: each PES in whole before its PTS, and PTS never back
+            for want in [PID_VIDEO, PID_AUDIO] {
+                let starts: Vec<usize> = out.iter().enumerate().filter(|(_, p)| pid(p) == want && start(p)).map(|(i, _)| i).collect();
+                let mut last = 0u64;
+                for (k, &i) in starts.iter().enumerate() {
+                    let p = &out[i];
+                    let at = if p[3] & 0x20 != 0 { 5 + p[4] as usize } else { 4 };
+                    let b = &p[at + 9..at + 14];
+                    let pts = ((b[0] as u64 >> 1) & 7) << 30 | (b[1] as u64) << 22 | ((b[2] as u64) >> 1) << 15 | (b[3] as u64) << 7 | (b[4] as u64) >> 1;
+                    assert!(pts > last || k == 0, "rate {rate}: pid {want:#x} PTS went back");
+                    last = pts;
+                    // the PES's last packet: before the next start on its PID
+                    let Some(&next) = starts.get(k + 1) else { break };
+                    let end = (i..next).rev().find(|&j| pid(&out[j]) == want && out[j][3] & 0x10 != 0).unwrap();
+                    let in_by = (end + 1) as f64 / pps;
+                    assert!(in_by <= pts as f64 / 90_000.0, "rate {rate}: pid {want:#x} PES {k} in at {in_by:.3} s, PTS {:.3} s", pts as f64 / 90_000.0);
+                }
+            }
             // service_type and original_network_id in the SDT
             let sdt_pkt = out.iter().find(|p| pid(p) == PID_SDT && start(p)).unwrap();
             let sec = &sdt_pkt[5..];
@@ -1013,6 +1211,56 @@ mod tests {
         assert_eq!(start, ((m.start_unix / 3600.0).floor() * 3600.0));
         let (tdt, _) = si.tdt.unwrap();
         assert!((tdt - (m.start_unix + 25.0)).abs() <= 1.0, "{tdt}");
+    }
+
+    /// A table's version_number follows its content: the EIT's present
+    /// event moves at the hour, PAT/PMT/SDT/NIT stay.
+    #[test]
+    fn versions_follow_the_content() {
+        let mut m = Mux::new(300_000.0, "SQ6EMM");
+        m.start_unix = 1_790_002_800.0 - 5.0; // 5 s before a full hour
+        let pid = |p: &[u8; TS_LEN]| ((p[1] as u16 & 0x1F) << 8) | p[2] as u16;
+        let mut seen: std::collections::HashMap<u16, std::collections::BTreeSet<u8>> = Default::default();
+        for _ in 0..(12.0 * m.pps) as usize {
+            let p = m.next();
+            if p[1] & 0x40 != 0 && matches!(pid(&p), 0 | PID_PMT | PID_SDT | PID_NIT | PID_EIT) {
+                seen.entry(pid(&p)).or_default().insert((p[5 + 5] >> 1) & 0x1F);
+            }
+        }
+        assert_eq!(seen[&PID_EIT].len(), 2, "EIT versions {:?}", seen[&PID_EIT]);
+        for k in [0, PID_PMT, PID_SDT, PID_NIT] {
+            assert_eq!(seen[&k].len(), 1, "pid {k:#x}: {:?}", seen[&k]);
+        }
+    }
+
+    /// A keyframe without SPS/PPS gets the last ones; a keyframe is asked
+    /// for after KEY_EVERY_S without one.
+    #[test]
+    fn keyframes_carry_parameter_sets_and_come_often() {
+        let mut m = Mux::new(300_000.0, "SQ6EMM");
+        let sps_pps = [0u8, 0, 0, 1, 0x67, 1, 2, 3, 0, 0, 0, 1, 0x68, 4, 5];
+        let key1 = [&sps_pps[..], &[0, 0, 0, 1, 0x65, 9, 9]].concat();
+        m.push(Media::Video { ts_us: 0, key: true, data: key1 });
+        m.push(Media::Video { ts_us: 100_000, key: true, data: vec![0, 0, 0, 1, 0x65, 7, 7] });
+        let mut dmx = Demux::default();
+        let mut msgs = Vec::new();
+        let half = (0.5 * m.pps) as usize;
+        for _ in 0..half {
+            dmx.push(&m.next(), &mut msgs);
+        }
+        assert!(!m.take_key_request(), "asked for a keyframe with one just sent");
+        m.push(Media::Video { ts_us: 200_000, key: false, data: vec![0, 0, 0, 1, 0x41, 1] });
+        for _ in 0..half {
+            dmx.push(&m.next(), &mut msgs);
+        }
+        let video: Vec<&Vec<u8>> = msgs.iter().filter(|m| m[0] == 6).collect();
+        assert!(video.len() >= 2);
+        assert!(video[1].windows(sps_pps.len()).any(|w| w == sps_pps), "second keyframe without SPS/PPS");
+        for _ in 0..(KEY_EVERY_S * m.pps) as usize {
+            m.next();
+        }
+        assert!(m.take_key_request(), "no keyframe asked for");
+        assert!(!m.take_key_request(), "asked twice");
     }
 
     #[test]

@@ -124,6 +124,10 @@ pub struct Params {
     pub fec_blocks: usize,
     /// T2 frames per super-frame.
     pub t2_frames: usize,
+    /// L1-pre NETWORK_ID (the NIT's network_id: our transport stream says
+    /// 0xFF01) and T2_SYSTEM_ID (unique within that network).
+    pub network_id: u16,
+    pub t2_system_id: u16,
 }
 
 impl Params {
@@ -140,6 +144,8 @@ impl Params {
             data_symbols: 190,
             fec_blocks: 9,
             t2_frames: 2,
+            network_id: 0xFF01,
+            t2_system_id: 0x0001,
         }
     }
 

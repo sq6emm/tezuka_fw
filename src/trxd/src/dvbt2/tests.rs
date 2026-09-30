@@ -27,6 +27,9 @@ fn t2_matches_gr_dtv() {
     let mut pkts = ts.chunks_exact(TS_LEN).map(|c| <[u8; TS_LEN]>::try_from(c).unwrap());
     let mut next = || pkts.next().expect("out of TS");
     let mut p = Params::amateur();
+    // gr-dtv's framemapper writes these fixed
+    p.network_id = 0x3085;
+    p.t2_system_id = 0x8001;
     // T2RATE=34: a reference made with C3_4.
     if std::env::var("T2RATE").is_ok_and(|v| v == "34") {
         p.rate = crate::dvbs2::ldpc_fpga::LongRate::R3_4;

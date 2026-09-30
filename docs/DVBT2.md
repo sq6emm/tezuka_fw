@@ -339,7 +339,10 @@ L1-pre (200 bits) and L1-post, mode adaptation (normal mode, TS, CCM), BCH
 and LDPC, the 16QAM bit interleaver, rotation and Q delay, cell, time and
 frequency interleavers, frame builder, pilots (PP2, continual, edge, P2),
 P1, the frame closing symbol GI 1/8 + PP2 requires; gr-dtv agrees bit for
-bit (`t2_matches_gr_dtv`: QPSK 1/2 and 3/4, rotated, 16QAM 1/2).
+bit (`t2_matches_gr_dtv`: QPSK 1/2 and 3/4, rotated, 16QAM 1/2, and
+rotated 16QAM 3/4 since 2026-09-30, reference o1634r). L1-pre NETWORK_ID is
+the transport stream's network (0xFF01) and T2_SYSTEM_ID 0x0001 (Params;
+the gr-dtv comparison sets gr-dtv's fixed 0x3085 / 0x8001).
 
 Outside the standard: the 2.0 and 1.35 MHz channels (amateur: the clock
 scaled, not signalled in L1). The 1.35 MHz frame was 297 ms, over the

@@ -54,7 +54,20 @@ kbit/s, and only MiniTiouner-class receivers work there anyway.
 `repetition_meets_tr101290` checks the intervals at five rates with video
 at its budget; TSDuck (`tsp -P continuity -P pcrverify -P analyze`, image
 tsduck:1) finds no continuity errors, every PCR within 27 us of the constant
-rate, service type 0x16 and network id 0xFF01. With over 1 s of video queued
+rate, service type 0x16 and network id 0xFF01.
+
+Each table's version_number changes when its content does (the EIT's at the
+hour, as its present event moves): receivers cache by version.
+T-STD timing: every PES is in whole before its PTS, and a stream's PTS
+never steps back. Audio has its own queue and goes before video (its PES
+are few and small). A video frame that would come in after its PTS is
+dropped (a keyframe asked for); a late keyframe drops the video queued
+before it, and if still late takes a later PTS (the timeline moves on).
+Keyframes: the browser sends one every 2 s; the mux asks for one if none
+came for 2 s, and puts the last SPS/PPS in front of a keyframe that comes
+without them. `repetition_meets_tr101290` checks PES arrival against PTS
+and PTS order at five rates, `versions_follow_the_content` and
+`keyframes_carry_parameter_sets_and_come_often` the rest. With over 1 s of video queued
 it drops non-key frames and asks the browser for a keyframe; over 3 s it
 flushes.
 
@@ -82,6 +95,12 @@ access unit); ffprobe, ffmpeg and VLC read it.
 - LDPC tables for those rates checked equal between leansdr and GNU Radio
   gr-dtv (leansdr's short 2/5 and 3/4 tables have rows with a wrong entry
   count; not used here).
+- Short 3/4 (2026-09-30): our table equals gr-dtv's ldpc_tab_3_4S, and a
+  frame from `--dvbs2-mod` checks against it independently
+  (datv-ref/harness/check_short34.py: PL descrambling, demapping, parity
+  recomputed from the information bits): 0 of 4320 parity bits wrong.
+  leandvbtx's short 3/4 gets 2198 wrong, from its broken table, so it is
+  no reference for that rate.
 - leandvb decodes the modulator's output back to the identical TS.
 - Browser path (Chrome 153, fake camera and microphone, headless) through
   trxd --sim: DVB-S2 frames 319/319, about 5 fps shown, about 0.85 s end to end.

@@ -1838,8 +1838,7 @@ impl Trx {
                                 d.last_media = Instant::now();
                             }
                         }
-                        if d.mux.want_key {
-                            d.mux.want_key = false;
+                        if d.mux.take_key_request() {
                             w.send_json_to(client, &serde_json::json!({"type": "datv_key"}));
                         }
                     }

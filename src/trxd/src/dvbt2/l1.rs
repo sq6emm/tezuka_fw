@@ -171,8 +171,8 @@ pub fn pre(p: &Params) -> Vec<Cell> {
     b.put(p.pilots as u64, 4);
     b.put(0, 8); // TX_ID_AVAILABILITY
     b.put(0, 16); // CELL_ID
-    b.put(0x3085, 16); // NETWORK_ID
-    b.put(0x8001, 16); // T2_SYSTEM_ID
+    b.put(p.network_id as u64, 16); // NETWORK_ID
+    b.put(p.t2_system_id as u64, 16); // T2_SYSTEM_ID
     b.put(p.t2_frames as u64, 8);
     b.put(p.data_symbols as u64, 12);
     b.put(0, 3); // REGEN_FLAG
