@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use num_complex::Complex32;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::radio::{RxStream, TxStream};
 
@@ -18,6 +18,18 @@ use crate::radio::{RxStream, TxStream};
 /// (the simulator on a PC) it quietly stays at the default.
 pub fn realtime_thread() {
     thread_nice(-10);
+}
+
+/// The calling thread under SCHED_FIFO (priority `prio`), if allowed (root
+/// on the board; elsewhere it stays as it is). For a thread that mostly
+/// sleeps in a blocking write: the DAC feeder. With both cores busy (a
+/// DVB-T2 transmitter and a receiver beside it) a nice value alone left it
+/// waiting long enough for the kernel's TX buffers to run dry.
+pub fn fifo_thread(prio: i32) -> bool {
+    let p = libc::sched_param { sched_priority: prio };
+    // SAFETY: sched_setscheduler on the calling thread (0) with a valid
+    // param struct.
+    unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &p) == 0 }
 }
 
 /// Set the calling thread's nice value (lower runs first).
@@ -146,6 +158,9 @@ pub fn spawn_tx(mut tx: Box<dyn TxStream>, block: usize) -> Sender<TxBlock> {
         .name("tx".into())
         .spawn(move || {
             realtime_thread();
+            if !fifo_thread(10) {
+                debug!("tx thread: no SCHED_FIFO (not root?)");
+            }
             let silence = vec![Complex32::default(); block];
             for _ in 0..TX_PREFILL_BLOCKS {
                 if let Err(e) = tx.write(&silence) {

@@ -8,8 +8,11 @@
 # not be running (its S80trxd loop calls this between runs), the drivers of
 # the PL devices are unbound first and bound again after (the AD936x phy
 # too: it tunes the digital interface into the new fabric), and on LibreSDR
-# the GPSDO script is stopped and started again through S22gpsdo (the
-# reload resets vctcxo_lock; the script re-acquires as at boot).
+# the GPSDO script is stopped and started again through S22gpsdo; the
+# vctcxo_lock registers (control, set point / manual DAC code, reference
+# source) are read before the reload and written back after it, so the
+# VCTCXO keeps its setting: the reset values made the script's warm-start
+# check (error 0: "already locked") adopt the reset DAC code, 12 ppm off.
 #
 # /run/fpga-mode holds the loaded mode ("boot": the one U-Boot loaded).
 
@@ -70,6 +73,10 @@ gpsdo=
 
 log "$cur -> $want"
 [ -n "$gpsdo" ] && { /etc/init.d/S22gpsdo stop >/dev/null 2>&1; sleep 1; }
+if [ -n "$gpsdo" ]; then
+	vc_ctrl=$(devmem 0x43C00000 32); vc_set=$(devmem 0x43C00004 32); vc_ref=$(devmem 0x43C0000C 32)
+	log "vctcxo_lock ctrl $vc_ctrl set $vc_set ref $vc_ref"
+fi
 unbind_all
 echo 0 > $MGR/flags
 if echo "fpga-$want.bin" > $MGR/firmware && [ "$(cat $MGR/state)" = operating ]; then
@@ -79,6 +86,9 @@ else
 	log "load of fpga-$want.bin failed (state $(cat $MGR/state))"
 	echo unknown > $STATE
 	r=1
+fi
+if [ -n "$gpsdo" ] && [ -n "$vc_ctrl" ]; then
+	devmem 0x43C00004 32 $vc_set; devmem 0x43C0000C 32 $vc_ref; devmem 0x43C00000 32 $vc_ctrl
 fi
 bind_all || { log "rebinding failed"; r=1; }
 [ -n "$gpsdo" ] && /etc/init.d/S22gpsdo start >/dev/null 2>&1

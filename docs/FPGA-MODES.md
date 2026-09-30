@@ -38,6 +38,28 @@ the same addresses, so the device tree is the same for all.
    reconnects without a new login. From the click to the feature running:
    about 4 s (the DeepCW model now loads in the background).
 
+While it switches every open page shows a banner ("Loading the FPGA image
+for DATV (DVB-S2/T2): the radio restarts, back in a few seconds", with the
+seconds counting), turning to "loaded" once trxd is back (web message
+`fpga_switch`). A setting changed while trxd restarts (a DATV code rate
+picked right after entering DATV mode) never reaches it: once the switch
+is done the page compares the receiver trxd resumed with its own choice
+and sends its settings again if they differ (`DATV.resync`). Before that
+a DVB-T2 receive started from the voice bitstream could run with the
+default DVB-S2 settings and never lock. START pressed while the board
+restarts waits for it (up to 30 s) instead of the command being lost and
+a "did not start" alert. The saved state carries the levels too (TX
+attenuation, drive, RX gain mode, AGC): a TX attenuation set before
+entering DATV mode used to be lost with the restart, and the first DATV
+transmission went out 20 dB down (the receiver across the room saw MER
+-6 dB, the board's own receiver beside it could not lock).
+
+The vctcxo_lock registers (control, set point / manual DAC code, reference
+source) are saved before the reload and written back after it: with the
+reset values the GPSDO script's warm-start check (error 0: "already
+locked") took the reset DAC code, 12 ppm off, and DVB-T2 between the boards
+never found a P1 (DVB-S2 tolerated it).
+
 Nothing touches the PL while it is reloaded: trxd is not running, the
 drivers are unbound, the GPSDO script is stopped. A hang would stop the CPU
 and the 5 s hardware watchdog would reset the board into its slot.

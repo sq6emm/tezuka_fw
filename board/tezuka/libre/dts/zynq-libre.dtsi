@@ -73,6 +73,22 @@
 			no-map;
 			reg = <0x16200000 0x100000>;
 		};
+
+		/* LDPC decoder (datv bitstream, ldpc_dma): the LLR words in at
+		 * +0 and the packed decisions out at +64 KiB, written and read by
+		 * trxd through /dev/mem. */
+		ldpc_buffers: ldpc_buffers@16300000 {
+			no-map;
+			reg = <0x16300000 0x100000>;
+		};
+
+		/* DVB-T2 cell router (datv bitstream, t2router): its destination
+		 * table (trxd writes it) and four frame buffers of cells in FEC
+		 * block order (the router writes, the LDPC decoder reads). */
+		t2router_buffers: t2router_buffers@16400000 {
+			no-map;
+			reg = <0x16400000 0x400000>;
+		};
 	};
 };
 

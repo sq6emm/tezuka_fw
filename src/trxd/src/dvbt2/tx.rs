@@ -270,6 +270,8 @@ fn run_fpga(p: Params, codes_in: Receiver<Vec<Cell>>, sink: Sender<TxBlock>, blo
     drop(o);
     let fb = ff.frame_bytes();
     let (mut frames, mut fill_s, mut starved) = (0u64, 0f64, 0f64);
+    // the TX queue's lowest depth (0: the DAC may have run dry)
+    let mut min_q = usize::MAX;
     let mut cur: Option<Vec<Cell>> = None;
     let mut at = 0;
     loop {
@@ -297,10 +299,13 @@ fn run_fpga(p: Params, codes_in: Receiver<Vec<Cell>>, sink: Sender<TxBlock>, blo
                 frames += 1;
                 if frames % 40 == 0 {
                     let ms = |s: f64| (s / 40.0 * 1e3).round();
-                    tracing::info!(frames, fill_ms = ms(fill_s), starved_ms = ms(starved), fpga_ifft = true, "DVB-T2 OFDM");
-                    (fill_s, starved) = (0.0, 0.0);
+                    tracing::info!(frames, fill_ms = ms(fill_s), starved_ms = ms(starved), min_queue = min_q, fpga_ifft = true, "DVB-T2 OFDM");
+                    (fill_s, starved, min_q) = (0.0, 0.0, usize::MAX);
                 }
             }
+        }
+        if frames > 4 {
+            min_q = min_q.min(sink.len());
         }
         if stop.load(Ordering::Relaxed) || sink.send(TxBlock::Raw(blk)).is_err() {
             return;

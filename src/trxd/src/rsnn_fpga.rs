@@ -303,3 +303,39 @@ impl Drop for FpgaFront {
         TAKEN.store(false, Ordering::Release);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// On a board: how fast the CPU writes / reads the reserved DDR through
+    /// /dev/mem (O_SYNC mapping, as trxd uses it), against the AXI-Lite
+    /// LLR writes into the LDPC decoder (3.5 ms for 16200 words).
+    /// `trxd-test ddr_bench --ignored --nocapture` (CW-RS off).
+    #[test]
+    #[ignore]
+    fn ddr_bench() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let mem = std::fs::OpenOptions::new().read(true).write(true).custom_flags(libc::O_SYNC).open("/dev/mem").unwrap();
+        // SAFETY: the reserved rsnn_weights memory (1 MB), mapped and unmapped here.
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), super::W_BYTES, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, mem.as_raw_fd(), super::W_PHYS as libc::off_t) };
+        assert!(p != libc::MAP_FAILED);
+        let src: Vec<u32> = (0..16200u32).map(|i| i.wrapping_mul(2654435761)).collect();
+        let mut back = vec![0u32; 16200];
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            // SAFETY: inside the mapping.
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), p.cast::<u32>(), src.len()) };
+            let w = t.elapsed();
+            let t = std::time::Instant::now();
+            // SAFETY: inside the mapping.
+            unsafe { std::ptr::copy_nonoverlapping(p.cast::<u32>(), back.as_mut_ptr(), 2025) };
+            let r = t.elapsed();
+            eprintln!("write 16200 words {:.3} ms, read 2025 words {:.3} ms", w.as_secs_f64() * 1e3, r.as_secs_f64() * 1e3);
+        }
+        // SAFETY: inside the mapping.
+        unsafe { std::ptr::copy_nonoverlapping(p.cast::<u32>(), back.as_mut_ptr(), 16200) };
+        assert_eq!(back, src);
+        // SAFETY: unmapping.
+        unsafe { libc::munmap(p, super::W_BYTES) };
+    }
+}

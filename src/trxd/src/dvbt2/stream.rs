@@ -55,7 +55,13 @@ pub struct Stats {
     pub blocks: u64,
     /// Places the input had words missing (the ring reader was behind).
     pub gaps: u64,
+    /// Front end: frames moved to where P1 really was, NCO retunes.
+    pub resched: u64,
+    pub retunes: u64,
 }
+
+/// With the cell router: the MER from every 4th data symbol's pilots.
+const MER_EVERY: usize = 4;
 
 pub const PROF_NAMES: [&str; 6] = ["p1", "fft", "equalize", "deinterleave", "llr", "input"];
 
@@ -66,7 +72,118 @@ enum State {
     Frame { start: u64, coarse: f64, sym: usize },
 }
 
+/// A FEC block from the demodulator: its LLRs, or (the FPGA's LDPC decoder
+/// making them itself: maia-sdr ldpc_dma.py) its QPSK cells after the
+/// deinterleavers with what the LLRs take.
+pub enum T2Block {
+    Llr(Vec<i8>),
+    Cells(Vec<[i8; 2]>, CellParams),
+    /// The block's cells already in DDR (the FPGA's cell router put them
+    /// there): their physical address.
+    Ddr(u32, CellParams),
+}
+
+/// The LLRs' parameters (a frame's): rotated (word j: I of cell j, Q of
+/// cell j + 1, rotated back by c14, s14 in Q14), the scale kq (Q10); 16QAM
+/// (its code rate, for the bit deinterleaver): the inner / outer level a14.
+#[derive(Clone, Copy, Debug)]
+pub struct CellParams {
+    pub rot: bool,
+    pub kq: i32,
+    pub c14: i32,
+    pub s14: i32,
+    pub qam16: Option<crate::dvbs2::ldpc_fpga::LongRate>,
+    pub a14: i32,
+}
+
+/// A block's LLRs in codeword order (QPSK: [`qpsk_llrs`]; 16QAM: four a
+/// cell, max-log per axis, through the bit deinterleaver), bit for bit as
+/// the FPGA's engine makes them.
+pub fn cell_llrs(blk: &[[i8; 2]], p: &CellParams) -> Vec<i8> {
+    let Some(rate) = p.qam16 else {
+        let mut v = vec![0i8; 2 * blk.len()];
+        qpsk_llrs(blk, p, &mut v);
+        return v;
+    };
+    let q = |z14: i32| -> i8 {
+        let v = ((z14 >> 7) * p.kq + (1 << 16)) >> 17;
+        (if v > 31 { 31 } else if v < -31 { -31 } else { v }) as i8
+    };
+    let n = blk.len();
+    let mut llr = vec![0i8; 4 * n];
+    for j in 0..n {
+        let c = blk[j];
+        let (zr, zi) = if p.rot {
+            let d = blk[if j + 1 == n { 0 } else { j + 1 }];
+            let (re, im) = (c[0] as i32, d[1] as i32);
+            (re * p.c14 - im * p.s14, re * p.s14 + im * p.c14)
+        } else {
+            (c[0] as i32 * 16384, c[1] as i32 * 16384)
+        };
+        llr[4 * j] = q(zr);
+        llr[4 * j + 1] = q(zi);
+        llr[4 * j + 2] = q(zr.abs() - p.a14);
+        llr[4 * j + 3] = q(zi.abs() - p.a14);
+    }
+    static BI: [std::sync::OnceLock<BitInterleaver>; 2] = [const { std::sync::OnceLock::new() }; 2];
+    let r = (rate == crate::dvbs2::ldpc_fpga::LongRate::R3_4) as usize;
+    let bi = BI[r].get_or_init(|| BitInterleaver::new(&Params { constellation: Constellation::Qam16, rate, ..Params::amateur() }));
+    bi.deinterleave_llr(&llr)
+}
+
+/// The QPSK LLRs of a block's cells straight into the LDPC decoder's 6 bits
+/// (the FPGA's engine does the same, bit for bit).
+pub fn qpsk_llrs(blk: &[[i8; 2]], p: &CellParams, llr: &mut [i8]) {
+    let kq = p.kq;
+    let q = |z14: i32| -> i8 {
+        let v = ((z14 >> 7) * kq + (1 << 16)) >> 17;
+        (if v > 31 { 31 } else if v < -31 { -31 } else { v }) as i8
+    };
+    let n = blk.len();
+    for j in 0..n {
+        let c = blk[j];
+        let (zr, zi) = if p.rot {
+            let d = blk[if j + 1 == n { 0 } else { j + 1 }];
+            let (re, im) = (c[0] as i32, d[1] as i32);
+            (re * p.c14 - im * p.s14, re * p.s14 + im * p.c14)
+        } else {
+            (c[0] as i32 * 16384, c[1] as i32 * 16384)
+        };
+        llr[2 * j] = q(zr);
+        llr[2 * j + 1] = q(zi);
+    }
+}
+
+impl T2Block {
+    /// The LLRs (made here for cells).
+    pub fn llrs(&self) -> std::borrow::Cow<'_, [i8]> {
+        match self {
+            T2Block::Llr(v) => std::borrow::Cow::Borrowed(v),
+            T2Block::Cells(c, p) => std::borrow::Cow::Owned(cell_llrs(c, p)),
+            // (in DDR only: not read back here)
+            T2Block::Ddr(..) => std::borrow::Cow::Owned(Vec::new()),
+        }
+    }
+}
+
 pub struct Demod {
+    /// QPSK blocks go out as cells ([`T2Block::Cells`]): the FPGA's LDPC
+    /// decoder makes the LLRs.
+    pub cells_out: bool,
+    /// 16QAM blocks as cells too (the FPGA's engine deinterleaves the bits).
+    pub cells16_out: bool,
+    /// The FPGA's cell router ([`Self::enable_router`]): equalized symbols'
+    /// data cells go straight to DDR; blocks out as [`T2Block::Ddr`].
+    router: Option<super::router::Router>,
+    /// The P2 symbols' data cells: (place in `cells`, place in the frame's
+    /// FEC blocks), written to DDR by the A9.
+    p2_dests: Vec<(u32, u32)>,
+    /// The frame being finished (its start).
+    frame_f: u64,
+    /// Some data cells of the last symbols (the browser's constellation).
+    router_const: Vec<[i8; 2]>,
+    /// Frames the router did not complete (lost).
+    pub router_missed: u64,
     p: Params,
     fs: f64,
     bi: BitInterleaver,
@@ -233,6 +350,13 @@ impl Demod {
             scatter,
             cells: vec![[0; 2]; ncells],
             blk: Vec::new(),
+            cells_out: false,
+            cells16_out: false,
+            router: None,
+            p2_dests: Vec::new(),
+            frame_f: 0,
+            router_const: Vec::new(),
+            router_missed: 0,
             ci,
             buf: Vec::new(),
             base: 0,
@@ -292,7 +416,7 @@ impl Demod {
 
     /// Samples in; the FEC blocks of every frame completed, as LLRs
     /// (positive = 0, 64800 each), onto `out`.
-    pub fn push(&mut self, x: &[Complex32], out: &mut Vec<Vec<i8>>) {
+    pub fn push(&mut self, x: &[Complex32], out: &mut Vec<T2Block>) {
         let t_in = std::time::Instant::now();
         self.buf.extend_from_slice(x);
         self.prof[5] += t_in.elapsed().as_secs_f64();
@@ -634,7 +758,60 @@ impl Demod {
     }
 
     /// The frame's cells are all in: MER, FEC blocks' LLRs.
-    fn finish(&mut self, out: &mut Vec<Vec<i8>>) {
+    /// Hand the equalized symbols' data cells to the FPGA's cell router
+    /// (QPSK with the LDPC decoder's cells path): the table made here (the
+    /// time and cell deinterleavers in one), the P2 cells' places kept.
+    pub fn enable_router(&mut self) -> bool {
+        use super::router::{Router, ROW, SKIP};
+        if !self.cells_for(self.p.constellation) {
+            return false;
+        }
+        let Some(mut rt) = Router::open() else { return false };
+        let nsym = self.p.symbols();
+        let mut table = vec![SKIP; nsym * ROW];
+        self.p2_dests.clear();
+        for j in 0..nsym {
+            for (idx, &k) in self.data[j].iter().enumerate() {
+                let g = self.scatter[self.data_at[j] + idx];
+                if g == u32::MAX {
+                    continue;
+                }
+                let d = self.ci.deinterleaved_index(g as usize) as u32;
+                if j < N_P2 {
+                    self.p2_dests.push((g, d));
+                } else {
+                    table[j * ROW + k] = d;
+                }
+            }
+        }
+        if !rt.start(&table, nsym, N_P2, self.cells.len() * 2) {
+            return false;
+        }
+        self.router = Some(rt);
+        true
+    }
+
+    /// Do blocks of this constellation go out as cells?
+    fn cells_for(&self, c: Constellation) -> bool {
+        match c {
+            Constellation::Qpsk => self.cells_out,
+            Constellation::Qam16 => self.cells_out && self.cells16_out,
+        }
+    }
+
+    /// TRXD_T2ROUTER_CHECK=1: the A9 scatters the cells too, and the first
+    /// frames' blocks are compared with the router's.
+    fn router_check(&self) -> bool {
+        static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CHECK.get_or_init(|| std::env::var_os("TRXD_T2ROUTER_CHECK").is_some())
+    }
+
+    /// The router's counters (frames, symbols, words lost), if it runs.
+    pub fn router_counters(&self) -> Option<(u32, u32, u32)> {
+        self.router.as_ref().map(|r| r.counters())
+    }
+
+    fn finish(&mut self, out: &mut Vec<T2Block>) {
         let t0 = std::time::Instant::now();
         let p = self.p;
         let flat = &self.flat;
@@ -715,8 +892,56 @@ impl Demod {
             let v = ((z14 >> 7) * kq + (1 << 16)) >> 17;
             (if v > 31 { 31 } else if v < -31 { -31 } else { v }) as i8
         };
+        let cp = CellParams { rot, kq, c14, s14, qam16: (p.constellation == Constellation::Qam16).then_some(p.rate), a14 };
+        if let Some(rt) = self.router.as_ref() {
+            // the equalized symbols' cells are in DDR already (once the
+            // router has the whole frame); the P2 symbols' go there now
+            self.constellation = self.router_const.clone();
+            match rt.frame_buffer(self.frame_f as u32, std::time::Duration::from_millis(40)) {
+                Some(b) => {
+                    for &(g, d) in &self.p2_dests {
+                        rt.write_cell(b, d as usize, self.cells[g as usize]);
+                    }
+                    if self.router_check() && self.stats.frames <= 4 {
+                        // TRXD_T2ROUTER_CHECK=1: the A9's own blocks (it
+                        // scattered the cells too) against the router's
+                        let (mut bad, mut first) = (0usize, None);
+                        let mut blk = Vec::new();
+                        for (r, ti) in self.cells.chunks(n).enumerate() {
+                            self.ci.block_gather(r, ti, &mut blk);
+                            for (q, &c) in blk.iter().enumerate() {
+                                if rt.read_cell(b, r * n + q) != c {
+                                    bad += 1;
+                                    first.get_or_insert((r, q, c, rt.read_cell(b, r * n + q)));
+                                }
+                            }
+                        }
+                        tracing::info!(frame = self.stats.frames, buffer = b, bad, ?first, "DVB-T2 cell router check");
+                    }
+                    for r in 0..p.fec_blocks {
+                        out.push(T2Block::Ddr(rt.addr(b, r * n), cp));
+                    }
+                    self.stats.blocks += p.fec_blocks as u64;
+                }
+                None => self.router_missed += 1,
+            }
+            self.prof[4] += t0.elapsed().as_secs_f64();
+            return;
+        }
         for (r, ti) in self.cells.chunks(n).enumerate() {
             self.ci.block_gather(r, ti, &mut self.blk);
+            if self.cells_for(p.constellation) {
+                out.push(T2Block::Cells(self.blk.clone(), cp));
+                self.stats.blocks += 1;
+                continue;
+            }
+            if p.constellation == Constellation::Qpsk {
+                let mut llr = vec![0i8; n * bits];
+                qpsk_llrs(&self.blk, &cp, &mut llr);
+                out.push(T2Block::Llr(llr));
+                self.stats.blocks += 1;
+                continue;
+            }
             let blk = &self.blk;
             let mut llr = vec![0i8; n * bits];
             for j in 0..n {
@@ -744,10 +969,10 @@ impl Demod {
                     }
                 }
             }
-            out.push(match p.constellation {
+            out.push(T2Block::Llr(match p.constellation {
                 Constellation::Qpsk => llr,
                 Constellation::Qam16 => self.bi.deinterleave_llr(&llr),
-            });
+            }));
             self.stats.blocks += 1;
         }
         self.prof[4] += t0.elapsed().as_secs_f64();
@@ -838,6 +1063,10 @@ struct FeState {
     misses: u32,
     /// The next frame's P1, to be checked once its raw samples are in.
     p1_check: Option<u64>,
+    /// A large P1 offset seen once (moved only when the next check agrees).
+    p1_big: Option<i64>,
+    /// The frame was just moved: the next check still sees the old timing.
+    p1_skip: bool,
     /// Every sample raw asked for: carrier words still queued from before
     /// are not a schedule to join, until a long raw run shows it took.
     raw_all_asked: bool,
@@ -848,7 +1077,7 @@ struct FeState {
 impl Demod {
     /// Words from the FPGA's OFDM front end ([`super::fe`]) in; FEC blocks
     /// out as from [`Self::push`]; `ctl` gets what the front end must do.
-    pub fn push_words(&mut self, words: &[u32], out: &mut Vec<Vec<i8>>, ctl: &mut Vec<super::fe::Ctl>) {
+    pub fn push_words(&mut self, words: &[u32], out: &mut Vec<T2Block>, ctl: &mut Vec<super::fe::Ctl>) {
         use super::fe::{decode, extend, Word};
         let mut fe = self.fe.take().unwrap_or_else(|| {
             Box::new(FeState {
@@ -867,6 +1096,8 @@ impl Demod {
                 jumps: 0,
                 misses: 0,
                 p1_check: None,
+                p1_big: None,
+                p1_skip: false,
                 raw_all_asked: false,
                 run_len: 0,
             })
@@ -884,7 +1115,9 @@ impl Demod {
             if w & 0x0001_0001 == 0x0001_0000 && fe.car.is_some() && fe.car_pos < limit {
                 let run = &words[i - 1..(i - 1 + limit - fe.car_pos).min(words.len())];
                 let n = run.iter().position(|&x| x & 0x0001_0001 != 0x0001_0000).unwrap_or(run.len());
-                if fe.car_eq {
+                if fe.car_eq && self.eq_skip(fe.car.map_or(0, |c| c.0)) {
+                    // the router has this symbol's cells: nothing to copy
+                } else if fe.car_eq {
                     for (p, &x) in run[..n].iter().enumerate() {
                         let c = super::fe::eq_cells(x);
                         let at = 2 * (fe.car_pos + p);
@@ -1079,6 +1312,8 @@ impl Demod {
         fe.misses = 0;
         fe.frame = None;
         fe.p1_check = None;
+        fe.p1_big = None;
+        fe.p1_skip = false;
         fe.runs.clear();
         fe.raw_next = None;
         self.stats.locked = true;
@@ -1113,20 +1348,30 @@ impl Demod {
     }
 
     /// A symbol the FPGA equalized (t2eq): its cells as they are.
-    fn fe_symbol_eq(&mut self, fe: &mut FeState, j: usize, f: u64, out: &mut Vec<Vec<i8>>, ctl: &mut Vec<super::fe::Ctl>) {
+    fn fe_symbol_eq(&mut self, fe: &mut FeState, j: usize, f: u64, out: &mut Vec<T2Block>, ctl: &mut Vec<super::fe::Ctl>) {
         let nsym = self.p.symbols();
         if !Self::fe_frame_ok(fe, j, f) || j < N_P2 {
             return;
         }
         let t0 = std::time::Instant::now();
-        let cells = std::mem::take(&mut fe.eq_cells);
-        self.eq_symbol(j, &cells);
-        fe.eq_cells = cells;
+        if !self.eq_skip(j) {
+            let cells = std::mem::take(&mut fe.eq_cells);
+            self.eq_symbol(j, &cells);
+            fe.eq_cells = cells;
+        }
         self.prof[2] += t0.elapsed().as_secs_f64();
         if j == nsym - 1 {
+            self.frame_f = f;
             self.finish(out);
             self.fe_track(fe, f, ctl);
         }
+    }
+
+    /// With the cell router the A9 only needs the pilots (the MER) and a few
+    /// cells for the browser: one data symbol in [`MER_EVERY`] is enough, the
+    /// others' words are skipped unread.
+    fn eq_skip(&self, j: usize) -> bool {
+        self.router.is_some() && !self.router_check() && self.sym_err.is_none() && j >= N_P2 && j % MER_EVERY != 0
     }
 
     /// Symbol `j`'s cells from the FPGA (unit EQ_UNIT, carrier order): the
@@ -1145,6 +1390,16 @@ impl Demod {
         if self.sym_err.is_some() {
             self.sym_err_frame[j].0 += e;
             self.sym_err_frame[j].1 += n;
+        }
+        if self.router.is_some() && !self.router_check() {
+            // the router has the data cells; a few for the browser
+            for &k in self.data[j].iter().step_by(97) {
+                let c = cells[k];
+                self.router_const.push([c[0] << 1, c[1] << 1]);
+            }
+            let over = self.router_const.len().saturating_sub(256);
+            self.router_const.drain(..over);
+            return;
         }
         // (CELL_SCALE is twice EQ_UNIT)
         let (lo, hi) = (self.data_at[j], self.data_at[j + 1]);
@@ -1174,7 +1429,7 @@ impl Demod {
         super::fe::Ctl::EqTable { g, gshift }
     }
 
-    fn fe_symbol(&mut self, fe: &mut FeState, j: usize, f: u64, out: &mut Vec<Vec<i8>>, ctl: &mut Vec<super::fe::Ctl>) {
+    fn fe_symbol(&mut self, fe: &mut FeState, j: usize, f: u64, out: &mut Vec<T2Block>, ctl: &mut Vec<super::fe::Ctl>) {
         let nsym = self.p.symbols();
         if !Self::fe_frame_ok(fe, j, f) {
             return;
@@ -1241,6 +1496,7 @@ impl Demod {
             if (fnew - fe.nco_hz).abs() > 2.0 {
                 fe.nco_hz = fnew;
                 ctl.push(Ctl::Freq(freq_word(fnew, self.fs)));
+                self.stats.retunes += 1;
             }
         }
         fe.p1_check = Some(f + self.p.frame_samples() as u64);
@@ -1261,13 +1517,28 @@ impl Demod {
         self.prof[0] += t0.elapsed().as_secs_f64();
         // Where it should be, within a few samples: a lower bar than the
         // search's (noise alone reaches about 0.1 here).
+        // The check right after a move measured a frame still on the old
+        // timing (the move takes a frame to reach the front end): moving
+        // again by the same offset doubled every move.
+        if std::mem::take(&mut fe.p1_skip) {
+            return;
+        }
         match found.filter(|v| v.2 >= P1_TRACK_OK) {
             Some((s, _, _)) => {
                 fe.misses = 0;
                 // Off by more than a couple of samples: move the frame after
-                // it, while it is still ahead of the front end.
-                if s.abs_diff(next) > 2 && fe.now + ((self.fs * 0.03) as u64) < next + frame {
+                // it, while it is still ahead of the front end. The clocks'
+                // drift moves it a few samples at a time; a large offset
+                // (a false peak in a fade: 42, 63 samples) only when the
+                // next frame's P1 agrees, else it cost the frames after it.
+                let off = s as i64 - next as i64;
+                let agreed = off.abs() <= 8 || fe.p1_big.is_some_and(|b| (b - off).abs() <= 2);
+                fe.p1_big = if agreed { None } else { Some(off) };
+                if agreed && off.abs() > 2 && fe.now + ((self.fs * 0.03) as u64) < next + frame {
                     ctl.push(Ctl::Schedule { start: s + frame, freq: freq_word(fe.nco_hz, self.fs) });
+                    fe.p1_skip = true;
+                    self.stats.resched += 1;
+                    tracing::info!(off, "DVB-T2 front end: frame moved to its P1");
                 }
             }
             None => {

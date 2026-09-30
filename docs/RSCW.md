@@ -136,6 +136,16 @@ trxd as a whole in CW-RS mode: about 18 % of a core more than idle USB
 (31.5 -> 49.8 %), almost all of it the features and the character
 Viterbi banks now.
 
+The banks (nine speeds, 12 749 states, 94 frames a second) then took 11 %
+of a core on the A9 (`rscw_banks_speed`, trxd-test on a board): memory
+bound, the f64 scores (200 KB) do not stay in its caches. Now 5.7 %, with
+the same text on every recording (`rscw_nnstream`, compared line by
+line): f32 scores, the best score taken off as each is read instead of a
+pass over all of them, chains wholly outside the beam skipped (from each
+chain's maximum), successors and log counts precomputed per chain, the
+oldest frame's back pointers reused. `rscw_nnstream` also prints the time
+in the network and in the banks.
+
 Tests: maia-hdl `test_rsnn_front.py` against `rsnn_front_vectors`
 (`cargo test rsnn_front_vectors -- --ignored`, RSNN_FRONT_VEC=<json>,
 RSNN_FRONT_SMALL=1 for the quick small network; RSNN_FRONT_VEC and

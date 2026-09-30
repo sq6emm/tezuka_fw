@@ -18,7 +18,15 @@ pub struct Report {
 }
 
 pub fn receive(p: Params, x: &[Complex32], fs: f64) -> Report {
+    receive_as(p, x, fs, false)
+}
+
+/// `cells`: the blocks go out as cells ([`super::stream::T2Block::Cells`],
+/// what the FPGA's LDPC engine takes; their LLRs made here the same way).
+pub fn receive_as(p: Params, x: &[Complex32], fs: f64, cells: bool) -> Report {
     let mut d = super::stream::Demod::new(p, fs);
+    d.cells_out = cells;
+    d.cells16_out = cells;
     let mut fec = crate::dvbs2::rx::Fec::new(crate::dvbs2::FrameSpec::long(match p.rate {
         crate::dvbs2::ldpc_fpga::LongRate::R1_2 => crate::dvbs2::fpga_tx::LongMode::Qpsk12,
         crate::dvbs2::ldpc_fpga::LongRate::R3_4 => crate::dvbs2::fpga_tx::LongMode::Qpsk34,
@@ -34,7 +42,7 @@ pub fn receive(p: Params, x: &[Complex32], fs: f64) -> Report {
             report.mer_db.push(d.stats.mer_db);
         }
         for llr in blocks.drain(..) {
-            fec.frame_q(&llr, &mut stats, &mut report.packets);
+            fec.frame_q(&llr.llrs(), &mut stats, &mut report.packets);
         }
     }
     if let Some(se) = &d.sym_err {
@@ -66,7 +74,7 @@ mod tests {
         for rotation in [false, true] {
             let mut p = Params::amateur();
             p.rotation = rotation;
-            loopback(p, 15.0);
+            loopback(p, 15.0, false);
         }
     }
 
@@ -77,7 +85,22 @@ mod tests {
             p.constellation = super::super::Constellation::Qam16;
             p.fec_blocks = 18;
             p.rotation = rotation;
-            loopback(p, 22.0);
+            loopback(p, 22.0, false);
+        }
+    }
+
+    /// The same with the blocks as cells (QPSK and 16QAM, rotated): their
+    /// LLRs from [`super::super::stream::cell_llrs`], the FPGA engine's model.
+    #[test]
+    fn t2_loopback_cells() {
+        for qam16 in [false, true] {
+            let mut p = Params::amateur();
+            p.rotation = true;
+            if qam16 {
+                p.constellation = super::super::Constellation::Qam16;
+                p.fec_blocks = 18;
+            }
+            loopback(p, if qam16 { 22.0 } else { 15.0 }, true);
         }
     }
 
@@ -198,7 +221,7 @@ mod tests {
             d.push_words(&words, &mut blocks, &mut ctl);
             late.extend(ctl.drain(..).map(|cmd| (i + 2, cmd)));
             for llr in blocks.drain(..) {
-                fec.frame_q(&llr, &mut stats, &mut packets);
+                fec.frame_q(&llr.llrs(), &mut stats, &mut packets);
             }
         }
         eprintln!("frames {}, blocks {}, packets {}, MER {:.1} dB, freq {:.0} Hz, P1 missed {}, LDPC failures {}", d.stats.frames, d.stats.blocks, packets.len(), d.stats.mer_db, d.stats.freq_hz, d.stats.p1_missed, stats.ldpc_fail);
@@ -239,7 +262,7 @@ mod tests {
                 eprintln!("ctl {cmd:?}");
             }
             for llr in blocks.drain(..) {
-                fec.frame_q(&llr, &mut stats, &mut packets);
+                fec.frame_q(&llr.llrs(), &mut stats, &mut packets);
             }
         }
         if let Some(se) = &d.sym_err {
@@ -577,6 +600,8 @@ mod tests {
         }
         blocks.clear();
         let mut d = super::super::stream::Demod::new(p, fs);
+        // T2CELLS=1: QPSK blocks out as cells (the FPGA decoder's LLRs)
+        d.cells_out = std::env::var_os("T2CELLS").is_some();
         let t = std::time::Instant::now();
         // Steady state: from the end of the first frame decoded.
         let (mut t1, mut prof1, mut f1) = (None, [0.0; 6], 0u64);
@@ -623,7 +648,7 @@ mod tests {
         }
     }
 
-    fn loopback(p: Params, snr_db: f32) {
+    fn loopback(p: Params, snr_db: f32, cells: bool) {
         let mut m = Modulator::new(p);
         let mut n = 0u32;
         let mut next = || {
@@ -659,7 +684,7 @@ mod tests {
             let ph = std::f64::consts::TAU * off * k as f64 / fs;
             *z = *z * Complex32::new(ph.cos() as f32, ph.sin() as f32) + Complex32::new(sigma * g(), sigma * g());
         }
-        let r = receive(p, &x, fs);
+        let r = receive_as(p, &x, fs, cells);
         eprintln!("frames {}, packets {}, MER {:?}, freq {:.0} Hz, LDPC failures {}", r.frames, r.packets.len(), r.mer_db, r.freq_hz, r.ldpc_fail);
         if let Some(path) = std::env::var_os("T2DUMP") {
             // The first FEC block's hard decisions against what was sent.

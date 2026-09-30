@@ -47,8 +47,10 @@ sdroxide-deepcw = { git = "https://github.com/sq6emm/sdroxide", rev = "77c8ee3dd
 
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 4
+# fat LTO, one codegen unit: 1.25 MB smaller (110 KB of the flash slot,
+# docs/FLASH.md)
+lto = "fat"
+codegen-units = 1
 panic = "abort"
 strip = true
 

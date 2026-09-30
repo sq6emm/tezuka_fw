@@ -117,6 +117,17 @@ fn main() -> ExitCode {
                     }
                 };
             }
+            "--pack-rsnn" => {
+                let (Some(i), Some(o)) = (args.next(), args.next()) else { usage() };
+                let r = std::fs::read(&i).map_err(|e| e.to_string()).and_then(|b| rsnn::pack_rsq3(&b)).and_then(|q| std::fs::write(&o, q).map_err(|e| e.to_string()));
+                return match r {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("trxd --pack-rsnn: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
             "--bit2bin" => {
                 return match fpgamode::bit2bin_cli() {
                     Ok(()) => ExitCode::SUCCESS,

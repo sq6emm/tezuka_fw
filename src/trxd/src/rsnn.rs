@@ -33,6 +33,9 @@ const NB2: usize = (NB + 4 - 5) / 2 + 1;
 /// Streaming features: audio in, feature rows out.
 pub struct Features {
     hop: usize,
+    /// Common mode out: each row less its 25 % quantile across bins (the
+    /// networks trained so: weight-file flag, [`Net::cmn`]).
+    cmn: bool,
     eta: f32,
     fft: Arc<dyn Fft<f32>>,
     window: Vec<f32>,
@@ -44,9 +47,10 @@ pub struct Features {
 }
 
 impl Features {
-    pub fn new(hop: usize) -> Features {
+    pub fn new(hop: usize, cmn: bool) -> Features {
         Features {
             hop,
+            cmn,
             // the same tracking per second at any hop
             eta: 0.01 * hop as f32 / 64.0,
             fft: FftPlanner::new().plan_fft_forward(N),
@@ -116,7 +120,19 @@ impl Features {
     fn feature(&self, lp: &[f32; NB]) -> [f32; NB] {
         let mut o = [0f32; NB];
         for k in 0..NB {
-            o[k] = (lp[k] - self.floor[k]).clamp(-6.0, 12.0);
+            o[k] = lp[k] - self.floor[k];
+        }
+        if self.cmn {
+            // numpy's quantile: (NB - 1) x 0.25 = 15 falls on a sample
+            let mut v = o;
+            v.sort_by(|a, b| a.total_cmp(b));
+            let q = v[(NB - 1) / 4];
+            for x in o.iter_mut() {
+                *x -= q;
+            }
+        }
+        for x in o.iter_mut() {
+            *x = x.clamp(-6.0, 12.0);
         }
         o
     }
@@ -142,6 +158,8 @@ pub fn exp_table() -> Vec<i32> {
 pub struct Net {
     /// Samples between frames.
     pub hop: usize,
+    /// Features with the common mode out (the header's hop, bit 16).
+    pub cmn: bool,
     /// The 2-D layers' channels.
     c2: usize,
     /// The temporal layers' channels and dilations.
@@ -168,6 +186,79 @@ pub struct Net {
     float: bool,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    /// a weight (i16 x WQ in RSQ3)
+    W,
+    /// a bias (i32 x AQ WQ)
+    B,
+    /// kept as f32 (the last 1x1, done in floating point)
+    F,
+}
+
+/// The tensors of an RSN3 file in order: (length, kind).
+fn tensor_kinds(c2: usize, c1: usize, layers: usize) -> Vec<(usize, Kind)> {
+    let mut v = vec![
+        (c2 * 15, Kind::W),
+        (c2, Kind::B),
+        (c2 * c2 * 15, Kind::W),
+        (c2, Kind::B),
+        (c2 * c2 * 9, Kind::W),
+        (c2, Kind::B),
+        (c2, Kind::W),
+        (1, Kind::B),
+        (c1 * 2 * c2, Kind::W),
+        (c1, Kind::B),
+    ];
+    for _ in 0..layers {
+        v.push((c1 * c1 * 5, Kind::W));
+        v.push((c1, Kind::B));
+    }
+    v.push((c1, Kind::F));
+    v.push((1, Kind::F));
+    v
+}
+
+/// RSN3 -> RSQ3 (`trxd --pack-rsnn IN OUT`): half the size; the fixed-point
+/// path (the FPGA's and the A9's) gives the same outputs bit for bit.
+pub fn pack_rsq3(b: &[u8]) -> Result<Vec<u8>, String> {
+    if !b.starts_with(b"RSN3") {
+        return Err("not an RSN3 file".into());
+    }
+    let u = |i: usize| b.get(i..i + 4).map_or(0, |x| u32::from_le_bytes(x.try_into().unwrap()) as usize);
+    let (c2, c1, nl) = (u(8), u(12), u(16));
+    let start = 20 + 4 * nl;
+    let n = u(start);
+    if b.len() != start + 4 + 4 * n {
+        return Err(format!("{} bytes for {n} weights", b.len()));
+    }
+    let all: Vec<f32> = b[start + 4..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    let mut out = b"RSQ3".to_vec();
+    out.extend(&b[4..start + 4]);
+    let mut at = 0;
+    for (len, k) in tensor_kinds(c2, c1, nl) {
+        for &v in &all[at..at + len] {
+            match k {
+                Kind::W => out.extend(((v * WQ).round().clamp(-32767.0, 32767.0) as i16).to_le_bytes()),
+                Kind::B => {
+                    let q = (v * AQ * WQ).round();
+                    // back to f32 and quantized again it must give the same
+                    if q.abs() >= (1 << 24) as f32 {
+                        return Err(format!("bias {v} does not fit"));
+                    }
+                    out.extend((q as i32).to_le_bytes());
+                }
+                Kind::F => out.extend(v.to_le_bytes()),
+            }
+        }
+        at += len;
+    }
+    if at != n {
+        return Err(format!("{n} values, {at} in the tensors"));
+    }
+    Ok(out)
+}
+
 /// The trained weights shipped with trxd.
 static WEIGHTS: &[u8] = include_bytes!("../rsnn.bin");
 
@@ -186,25 +277,60 @@ impl Net {
 
     /// RSN2: hop, 2-D channels, count, weights (32 temporal channels,
     /// dilations 1, 2, 4, 8); RSN3: hop, 2-D channels, temporal channels,
-    /// layers, their dilations, count, weights.
+    /// layers, their dilations, count, weights. The hop's bit 16: features
+    /// with the common mode out.
     pub fn from_bytes(b: &[u8]) -> Result<Net, String> {
         let u = |i: usize| b.get(i..i + 4).map_or(0, |x| u32::from_le_bytes(x.try_into().unwrap()) as usize);
         let (hop, c2, c1, dils, start) = match b.get(..4) {
             Some(b"RSN2") => (u(4), u(8), 32, vec![1, 2, 4, 8], 12),
-            Some(b"RSN3") => {
+            Some(b"RSN3") | Some(b"RSQ3") => {
                 let nl = u(16);
                 if nl == 0 || nl > 16 {
                     return Err(format!("{nl} temporal layers"));
                 }
                 (u(4), u(8), u(12), (0..nl).map(|i| u(20 + 4 * i)).collect(), 20 + 4 * nl)
             }
-            _ => return Err("not an RSN2/RSN3 weight file".into()),
+            _ => return Err("not an RSN2/RSN3/RSQ3 weight file".into()),
         };
         let n = u(start);
-        if b.len() != start + 4 + 4 * n {
-            return Err(format!("{} bytes for {n} weights", b.len()));
-        }
-        let all: Vec<f32> = b[start + 4..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let all: Vec<f32> = if b.starts_with(b"RSQ3") {
+            // weights i16 (x WQ), biases i32 (x AQ WQ), the last 1x1 f32:
+            // exactly what the fixed-point path makes of the floats
+            let kinds = tensor_kinds(c2, c1, dils.len());
+            let mut all = Vec::with_capacity(n);
+            let mut at = start + 4;
+            for (len, k) in kinds {
+                for _ in 0..len {
+                    let v = match k {
+                        Kind::W => {
+                            let q = b.get(at..at + 2).ok_or("RSQ3: short")?;
+                            at += 2;
+                            i16::from_le_bytes(q.try_into().unwrap()) as f32 / WQ
+                        }
+                        Kind::B => {
+                            let q = b.get(at..at + 4).ok_or("RSQ3: short")?;
+                            at += 4;
+                            i32::from_le_bytes(q.try_into().unwrap()) as f32 / (AQ * WQ)
+                        }
+                        Kind::F => {
+                            let q = b.get(at..at + 4).ok_or("RSQ3: short")?;
+                            at += 4;
+                            f32::from_le_bytes(q.try_into().unwrap())
+                        }
+                    };
+                    all.push(v);
+                }
+            }
+            if at != b.len() || all.len() != n {
+                return Err(format!("RSQ3: {} bytes, {n} values", b.len()));
+            }
+            all
+        } else {
+            if b.len() != start + 4 + 4 * n {
+                return Err(format!("{} bytes for {n} weights", b.len()));
+            }
+            b[start + 4..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+        };
         #[allow(non_snake_case)]
         let C1 = c1;
         let mut at = 0;
@@ -238,7 +364,8 @@ impl Net {
         let (c1q, c2q, c3q) = (q(&c1w), q(&c2w), q(&c3w));
         let twq = tw.iter().map(|v| q(v)).collect();
         let float = std::env::var_os("RSNN_FLOAT").is_some();
-        Ok(Net { hop, c2, c1, dils, c1w, c1b, c2w, c2b, c3w, c3b, attw, attb, inpw, inpb, tw, tb, outw, outb, c1q, c2q, c3q, twq, float })
+        let (cmn, hop) = (hop & 0x1_0000 != 0, hop & 0xFFFF);
+        Ok(Net { hop, cmn, c2, c1, dils, c1w, c1b, c2w, c2b, c3w, c3b, attw, attb, inpw, inpb, tw, tb, outw, outb, c1q, c2q, c3q, twq, float })
     }
 
     /// The front's parameters as the FPGA engine (maia-hdl rsnn_front.py)
@@ -871,7 +998,7 @@ pub struct RsNn {
 impl RsNn {
     pub fn new() -> RsNn {
         let net = Net::builtin();
-        RsNn { feat: Features::new(net.hop), stream: Stream::new(net), rows: Vec::new(), lg: Vec::new(), prior: (0.45f32 / 0.55).ln() }
+        RsNn { feat: Features::new(net.hop, net.cmn), stream: Stream::new(net), rows: Vec::new(), lg: Vec::new(), prior: (0.45f32 / 0.55).ln() }
     }
 
     /// Samples between the frames (and LLRs) given out.
@@ -939,6 +1066,28 @@ mod tests {
         assert!(got.len() >= upto - 10, "{} of {upto}", got.len());
         let bad = (0..upto.min(got.len())).find(|&i| got[i] != want[i]);
         assert!(bad.is_none(), "first difference at frame {bad:?}: {} vs {}", got[bad.unwrap()], want[bad.unwrap()]);
+    }
+
+    /// RSQ3 (the packed weights) against the RSN3 they came from: the
+    /// same logits, bit for bit (RSNN_WEIGHTS: an RSN3 file; else skipped).
+    #[test]
+    fn rsq3_matches_rsn3() {
+        let Some(b) = std::env::var_os("RSNN_WEIGHTS").and_then(|p| std::fs::read(p).ok()).filter(|b| b.starts_with(b"RSN3")) else {
+            return;
+        };
+        let (a, q) = (Net::from_bytes(&b).unwrap(), Net::from_bytes(&pack_rsq3(&b).unwrap()).unwrap());
+        let mut x = 3u32;
+        let rows: Vec<[f32; NB]> = (0..300)
+            .map(|_| {
+                std::array::from_fn(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    (x % 1800) as f32 / 100.0 - 6.0
+                })
+            })
+            .collect();
+        assert_eq!(a.forward(&rows), q.forward(&rows));
     }
 
     /// Vectors for the FPGA front (maia-hdl test_rsnn_front.py):
@@ -1064,7 +1213,7 @@ mod tests {
         let want = &f[t * NB..t * NB + t];
         let audio = &f[t * NB + t..];
         let net = Net::builtin();
-        let mut fe = Features::new(net.hop);
+        let mut fe = Features::new(net.hop, net.cmn);
         let mut rows = Vec::new();
         fe.process(audio, &mut rows);
         let fd = rows.iter().zip(&feat).flat_map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).abs())).fold(0f32, f32::max);

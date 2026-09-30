@@ -23,14 +23,27 @@ environment has no A/B scripts therefore still boots slot A.
 | Part | Size |
 |---|---|
 | Kernel, `Image.lzma` | ~4.6 MB |
-| Bitstream, gzip | ~0.5 MB |
-| Rootfs, xz (incl. trxd ~2 MB and web UI) | ~6 MB |
-| **FIT total** | **must be ≤ 12.25 MB**; the build fails if not |
+| Bitstream (LibreSDR: the `trx` mode's), gzip | ~0.7 MB |
+| Rootfs, xz with the ARM filter (trxd ~2.6 MB with the web UI and the CW-RS network; the `datv` bitstream 1.1 MB) | ~6.5 MB |
+| **FIT total** | **must be ≤ 12.25 MB**; the build fails if not. LibreSDR 2026-09-29: 11.85 MB (990 KB free) |
 
 This fits because of three cuts:
 - **DeepCW model:** moved to its own partition and bf16-rounded, 13.4 MB → 5.3 MB compressed. The accuracy matrix is unchanged.
 - **Kernel:** shipped as lzma instead of zImage, saving 1.6 MB and avoiding tezuka's zImage corruption bug #450.
 - **Rootfs:** trimmed of Wi-Fi drivers and firmware, DRM, the Fortran/OpenMP/C++ runtimes, CA certificates, libiio/iiod and the gpsd client tools.
+
+2026-09-29, 730 KB more without dropping anything (FPGA mode bitstreams and
+the larger CW-RS network had left 265 KB):
+- the rootfs compressed again with xz's ARM branch filter
+  (`postimage-qspi.sh`; the kernel's XZ decoder has it): 250 KB;
+- trxd with fat LTO and one codegen unit: 110 KB (and a little faster);
+- the CW-RS network as RSQ3 (`trxd --pack-rsnn`: 16-bit weights, 32-bit
+  biases, the fixed-point path's own values, so the outputs are the same
+  bit for bit): 386 KB;
+- the boot bitstream once only: fpga-mode takes it out of the running
+  slot's FIT (docs/FPGA-MODES.md).
+Left if more is needed: NFS client (about 130 KB), USB host network and HID
+drivers (about 140 KB): both optional features today.
 
 ## Updating: `tools/fw-push.sh`
 

@@ -2240,6 +2240,19 @@ impl Trx {
         if let (Some(lo), Some(hi)) = (r["filter"][0].as_f64(), r["filter"][1].as_f64()) {
             self.apply_web(0, &json!({"cmd": "filter", "lo": lo, "hi": hi}));
         }
+        for k in ["txatt", "drive"] {
+            if let Some(v) = r[k].as_f64() {
+                self.apply_web(0, &json!({"cmd": k, "value": v}));
+            }
+        }
+        if let Some(g) = r["rxgain"].as_object() {
+            let mut c = serde_json::Value::Object(g.clone());
+            c["cmd"] = json!("rxgain");
+            self.apply_web(0, &c);
+        }
+        if let Some(a) = r["agc"].as_str() {
+            self.apply_web(0, &json!({"cmd": "agc", "mode": a}));
+        }
         for c in r["cmds"].as_array().into_iter().flatten() {
             self.apply_web(0, c);
         }
@@ -2258,14 +2271,24 @@ impl Trx {
         };
         if let Some(want) = part.and_then(crate::fpgamode::switch_for) {
             if self.tx_on.is_none() {
+                // every page shows it (the switch restarts trxd: all of them
+                // lose the connection for a few seconds)
                 if let Some(w) = &self.web {
-                    let msg = format!("loading the FPGA image for this ({want}): back in a few seconds");
-                    w.send_json_to(client, &serde_json::json!({"type": "datv_error", "msg": msg}));
+                    w.send_json(&serde_json::json!({"type": "fpga_switch", "mode": want}));
                 }
                 let resume = serde_json::json!({
                     "vfo_a": self.vfo_a, "vfo_b": self.vfo_b, "active_b": self.active == Vfo::B,
                     "split": self.split, "mode": mode_name(self.mode),
                     "filter": [self.filter.0, self.filter.1], "cmds": [m],
+                    // the levels too: a TX attenuation set before entering
+                    // DATV mode was lost and DATV went out 20 dB down
+                    "txatt": self.tx_att_db, "drive": (self.drive * 100.0).round(),
+                    "rxgain": match self.rx_gain_mode {
+                        GainMode::Manual => serde_json::json!({"mode": "manual", "db": self.rx_gain_db}),
+                        GainMode::FastAttack => serde_json::json!({"mode": "fast"}),
+                        _ => serde_json::json!({"mode": "slow"}),
+                    },
+                    "agc": match self.agc_mode { AgcMode::Off => "off", AgcMode::Slow => "slow", AgcMode::Fast => "fast", _ => "med" },
                 });
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 crate::fpgamode::request(want, &resume);

@@ -21,6 +21,7 @@ pub mod l1;
 pub mod ofdm;
 pub mod resamp;
 pub mod stream;
+pub mod router;
 pub mod tables;
 pub mod tx;
 #[cfg(test)]
@@ -631,6 +632,17 @@ impl CellInterleaver {
             let x = x + shift;
             ti[if x >= cells { x - cells } else { x }]
         }));
+    }
+
+    /// Where the cell at time-deinterleaver position `g` (FEC block
+    /// g / cells, cell-interleaved) ends up after the cell deinterleaver:
+    /// block r's `block_gather` output index, as r cells + q (the FPGA's
+    /// cell router writes cells straight there).
+    pub fn deinterleaved_index(&self, g: usize) -> usize {
+        let cells = self.cells;
+        let (r, t) = (g / cells, g % cells);
+        let x = (t + cells - self.shifts[r]) % cells;
+        r * cells + self.inv[x] as usize
     }
 
     /// The reverse (receive): a frame's data cells back to FEC blocks.

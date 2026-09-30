@@ -168,6 +168,20 @@ impl Fec {
         self.after_decode(ok, t0, stats, out)
     }
 
+    /// A DVB-T2 QPSK block in DDR (the FPGA's cell router put it there).
+    pub fn frame_ddr(&mut self, addr: u32, p: &crate::dvbt2::stream::CellParams, stats: &mut Stats, out: &mut Vec<[u8; TS_LEN]>) -> bool {
+        let t0 = std::time::Instant::now();
+        let ok = self.dec.decode_ddr(addr, p, &mut self.bits);
+        self.after_decode(ok, t0, stats, out)
+    }
+
+    /// A DVB-T2 QPSK block as cells (the FPGA decoder makes the LLRs).
+    pub fn frame_cells(&mut self, cells: &[[i8; 2]], p: &crate::dvbt2::stream::CellParams, stats: &mut Stats, out: &mut Vec<[u8; TS_LEN]>) -> bool {
+        let t0 = std::time::Instant::now();
+        let ok = self.dec.decode_cells(cells, p, &mut self.bits);
+        self.after_decode(ok, t0, stats, out)
+    }
+
     fn after_decode(&mut self, ok: Option<usize>, t0: std::time::Instant, stats: &mut Stats, out: &mut Vec<[u8; TS_LEN]>) -> bool {
         let t_dec = std::time::Instant::now();
         // BCH cleans up what LDPC left (or falsely converged on); it also
@@ -970,6 +984,26 @@ impl FecBlock for Vec<f32> {
     }
 }
 
+impl FecBlock for crate::dvbt2::stream::T2Block {
+    fn is_empty(&self) -> bool {
+        match self {
+            crate::dvbt2::stream::T2Block::Llr(v) => v.is_empty(),
+            crate::dvbt2::stream::T2Block::Cells(c, _) => c.is_empty(),
+            crate::dvbt2::stream::T2Block::Ddr(..) => false,
+        }
+    }
+    fn decode(&self, fec: &mut Fec, st: &mut Stats, ts: &mut Vec<[u8; TS_LEN]>) -> bool {
+        match self {
+            crate::dvbt2::stream::T2Block::Llr(v) => fec.frame_q(v, st, ts),
+            crate::dvbt2::stream::T2Block::Cells(c, p) => fec.frame_cells(c, p, st, ts),
+            crate::dvbt2::stream::T2Block::Ddr(a, p) => fec.frame_ddr(*a, p, st, ts),
+        }
+    }
+    fn dump(&self) -> Vec<u8> {
+        self.llrs().iter().flat_map(|&v| (v as f32 / super::fpga_ldpc::LLR_SCALE).to_le_bytes()).collect()
+    }
+}
+
 impl FecBlock for Vec<i8> {
     fn is_empty(&self) -> bool {
         self.as_slice().is_empty()
@@ -1221,7 +1255,7 @@ impl RxThread {
         });
         let (tx, rx) = crossbeam_channel::bounded::<(Vec<Complex32>, f64)>(1);
         // Two frames of FEC blocks (18 a frame at 16QAM).
-        let (ftx, frx) = crossbeam_channel::bounded::<Vec<i8>>(40);
+        let (ftx, frx) = crossbeam_channel::bounded::<crate::dvbt2::stream::T2Block>(40);
         let fails = Arc::new(AtomicU32::new(0));
         let shared = Arc::new(Mutex::new(RxShared::default()));
         let fec_stats = Arc::new(Mutex::new(Stats::default()));
@@ -1339,8 +1373,15 @@ impl RxThread {
                 tracing::info!(fs, t2_fe, mode = %label_log(&mode), "DVB-T2 receive through the FPGA resampler");
                 let mut ctl = Vec::new();
                 let mut d = crate::dvbt2::stream::Demod::new(mode.p, fs);
+                // QPSK cells straight to the FPGA's LDPC decoder, which
+                // makes the LLRs (LDP5 with its DDR buffers)
+                d.cells_out = super::fpga_ldpc::cells_available();
+                d.cells16_out = super::fpga_ldpc::cells16_available();
+                let router = d.enable_router();
+                tracing::info!(cells = d.cells_out, qam16 = d.cells16_out, router, "DVB-T2 LLRs in the FPGA");
                 let (mut blocks, mut seen) = (Vec::new(), 0u64);
                 let (mut busy_s, mut t_log) = (0f64, std::time::Instant::now());
+                let mut prof_f0 = 0u64;
                 'run: loop {
                     loop {
                         match rx.try_recv() {
@@ -1368,14 +1409,19 @@ impl RxThread {
                                     busy += 1;
                                 }
                             }
-                            busy_s += t0.elapsed().as_secs_f64();
+                            let dt = t0.elapsed().as_secs_f64();
+                            busy_s += dt;
                             if t_log.elapsed() > std::time::Duration::from_secs(30) {
-                                tracing::info!(demod_cpu = format!("{:.1} %", 100.0 * busy_s / t_log.elapsed().as_secs_f64()), mer_db = d.stats.mer_db, freq_hz = d.stats.freq_hz, frames = d.stats.frames, gaps = d.stats.gaps, p1_missed = d.stats.p1_missed, "DVB-T2 demodulator");
+                                tracing::info!(demod_cpu = format!("{:.1} %", 100.0 * busy_s / t_log.elapsed().as_secs_f64()), mer_db = d.stats.mer_db, freq_hz = d.stats.freq_hz, frames = d.stats.frames, gaps = d.stats.gaps, p1_missed = d.stats.p1_missed, resched = d.stats.resched, retunes = d.stats.retunes, router = ?d.router_counters(), router_missed = d.router_missed, prof_ms = ?d.prof.map(|x| (x * 1e3 / (d.stats.frames - prof_f0).max(1) as f64 * 10.0).round() / 10.0), "DVB-T2 demodulator");
                                 (busy_s, t_log) = (0.0, std::time::Instant::now());
+                                d.prof = [0.0; 6];
+                                prof_f0 = d.stats.frames;
                             }
                             let mut s = sh.lock().unwrap();
                             s.stats.frames = d.stats.blocks;
                             s.stats.frames_fec_busy += busy;
+                            // (the web UI's demod CPU)
+                            s.stats.other_s += dt;
                             s.stats.locked = d.stats.locked;
                             s.stats.esn0_db = d.stats.mer_db;
                             s.stats.data_esn0_db = d.stats.mer_db;

@@ -21,6 +21,14 @@ QSPIDIR="$BIN_DIR/flash"
 SDIMGDIR="$BIN_DIR/sdimg"
 JTAGDIR="$QSPIDIR/jtag"
 
+# The rootfs again with xz's ARM branch filter (the kernel's XZ decoder has
+# it: CONFIG_XZ_DEC_ARM): about 250 KB less flash than Buildroot's plain xz
+# (docs/FLASH.md). The SD image's uramdisk takes the same file.
+if [ -f "$BIN_DIR/rootfs.cpio" ]; then
+	xz --check=crc32 --arm --lzma2=preset=9e -c "$BIN_DIR/rootfs.cpio" > "$BIN_DIR/rootfs.cpio.xz.tmp"
+	mv "$BIN_DIR/rootfs.cpio.xz.tmp" "$BIN_DIR/rootfs.cpio.xz"
+fi
+
 echo "generating FIT image (pluto.itb)"
 cp "$BOARD_DIR/plutomaia.its" "$BIN_DIR/plutomaia.its"
 gzip -9 -n -c "$BIN_DIR/system_top.bit" > "$BIN_DIR/system_top.bit.gz"   # fpga@1 in the FIT

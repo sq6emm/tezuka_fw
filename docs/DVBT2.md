@@ -193,13 +193,129 @@ core, the FEC about 31 ms a block (FPGA LDPC 22 ms of it).
   armv7 code, about 40 ns each. Demodulator 155 -> 63 ms a frame over the
   day; the receive board's trxd about 90 % of a core while receiving T2.
 
+## LLRs and the LDPC decoder's input in the FPGA (2026-09-29)
+
+The FEC thread spent 3.5 ms a block writing LLR words into the decoder
+through its AXI4-Lite window and 1.3 ms reading the decisions back. The
+decoder (maia-sdr `ldpc_dma.py`, id "LDP5") now takes them from DDR: trxd
+writes into a reserved 1 MB (device tree `ldpc_buffers`, 0x16300000) in
+0.2 ms, the decoder loads them over an AXI3 master (HP0), decodes and
+writes the decisions back packed 32 to a word. For QPSK the demodulator
+does not make LLRs at all any more: it hands over the block's cells (after
+the deinterleavers, `T2Block::Cells`) and the decoder's engine makes the
+LLRs itself, bit for bit trxd's fixed-point formula (rotation back by
+c14/s14, the cyclic Q delay, x kq, rounding, +-31; `qpsk_llrs` is the one
+copy in trxd, for the software fallback), writing each into the decoder's
+RAM layout (the parity banked). 16QAM too (id "LDP6", 0xFF20 bit 3, the
+level a14 at 0xFF2C): four LLRs a cell (I, Q, |I| - a, |Q| - a, max-log)
+and the bit deinterleaver on the way into the RAM: a row pair's 8 LLRs
+through the demux to the 8 columns, each column a counter with the column
+twist's start (i = row - twist mod 8100), the parity columns as t, s (the
+parity interleaver and the decoder's banked layout cancel: word K/4 + 90 t
++ s/4). trxd's model is `stream::cell_llrs` (with `BitInterleaver`).
+
+Checked: HDL against the model (`test_ldpc_dma.py`: DMA decode, cells
+decode, every RAM word of rotated cells, QPSK and 16QAM at both rates;
+`t2_loopback_cells` for trxd's side); on Libre 2 `cells_vs_llr`
+(trxd-test) decodes the same noisy block both ways on the FPGA: the same
+decisions and iterations. Over the air Libre 1 -> Libre 2 at 2330 MHz,
+QPSK 1/2: decoded with video; A/B runs with TRXD_NO_LDPC_CELLS=1 are within
+the indoor link's swing (no skipped or FEC-busy blocks either way).
+
+| FEC thread, a block | before | DMA | + LLRs in the FPGA |
+|---|---|---|---|
+| LLRs in | 3.46 ms | 1.24 ms | 0.38 ms |
+| decisions out | 1.30 ms | 0.41 ms | 0.39 ms |
+| FEC thread (web UI) | 33 % | 23 % | 14-30 % (with the MER) |
+
+Knobs: TRXD_NO_LDPC_DMA=1 (the window as before), TRXD_NO_LDPC_CELLS=1
+(LLRs on the A9, into DDR).
+
+Libre 2 -> Libre 1 at 2330 MHz does not lock (the known weak direction,
+about 13 dB down); each board receives its own T2 at MER 29 dB.
+
+## Cell router: the data cells never reach the A9 (2026-09-29 night)
+
+With the LLRs in the FPGA the demodulator's heaviest work was moving cells:
+the time-deinterleaver scatter as each symbol came (17.6 ms a frame) and
+the cell-deinterleaver gather per block (10 ms), both random access over a
+580 KB frame (47 ms a frame in all, `t2_fe_speed` T2EQ=1 on Libre 2). The
+datv bitstream's cell router (maia-sdr `t2router.py`, 0x43C60000, "T2R1")
+takes the equalizer's words (tapped out of the Maia core, t2_eq_data)
+across into the CPU clock and writes every data cell of an equalized
+symbol straight to its place in its FEC block in DDR, from a table trxd
+makes once (`Demod::enable_router`: entry (symbol, carrier) = the time and
+cell deinterleavers in one, `CellInterleaver::deinterleaved_index`,
+checked against `block_gather` in `deinterleaved_index_matches_gather`).
+Four frame buffers (device tree `t2router_buffers`, 4 MB at 0x16400000:
+the table, then the buffers), a new one at each frame start; a buffer is
+complete once every data symbol went out and was answered. The A9 writes
+only the P2 symbols' data cells (its own equalizer's) and hands the FEC
+thread `T2Block::Ddr` (the block's address); the LDPC engine reads the
+cells from there and makes the LLRs.
+
+With the router the A9 needs only the pilots (the MER) and a few cells
+for the browser: it reads one data symbol in four (`MER_EVERY`) and skips
+the other symbols' words unread (demodulator 17 -> 10-16 % of a core with
+16QAM). The demodulator's log line carries `prof_ms` (per frame: p1, fft,
+equalize, deinterleave, llr, input).
+
+TRXD_NO_T2ROUTER=1: the A9 path; TRXD_T2ROUTER_CHECK=1: the A9 scatters and
+gathers too and compares the first frames' blocks with the router's.
+
+Checked on the Libres: the check found no cell different in any frame
+(291 600 a frame, P2's included); Libre 2 receiving itself 1773/1773
+frames; Libre 1 -> Libre 2 at 2330 MHz 1458/1584 frames (the link), one
+frame missed by the router at the start (acquisition). The receive
+board's demodulator: about 13 % of a core (30-35 % with the A9's
+deinterleavers), the FEC thread about 10 %.
+
+| DVB-T2 receive (QPSK 1/2, 1.7 MHz) | demodulator | FEC thread |
+|---|---|---|
+| 2026-09-28 (equalizer in the FPGA) | 30-35 % | 33 % |
+| + LLRs and the decoder's input in the FPGA | 30 % | 14-25 % |
+| + cell router | 13 % | ~10 % |
+
+16QAM with the router and the LDPC engine's 16QAM cells (LDP6, both
+Libres flashed 2026-09-29 evening): on Libre 2 `cells16_vs_llr` gives the
+same decisions from cells as from trxd's LLRs at 1/2 and 3/4. Over the air
+Libre 1 -> Libre 2 at 2330 MHz, 16QAM 1/2 rotated: 72 FEC blocks a second,
+none skipped or FEC-busy (before: about half dropped for time); the LDPC
+decoder 6 ms a block (budget 13.8), the demodulator 17-18 % of a core;
+the blocks lost are the indoor link's (MER swinging 4-16 dB: 95 % of the
+blocks at MER 12, fewer below). 20 minutes through the FPGA switch path
+(the receiver started from the voice bitstream): 71 355 of 81 684 blocks,
+memory flat.
+
+Those losses (bursts of 8 frames every 10-40 s) turned out to be two
+bugs, not the link:
+
+- Receiver: the front end's P1 tracking moved the frame timing to false
+  peaks in a fade (42 or 63 samples, the edge of its window), and every
+  move was made twice (the check after a move still measured a frame on
+  the old timing). Now a large offset (over 8 samples) must be seen by two
+  checks in a row, and the check after a move is skipped; the clocks'
+  drift (3 samples every 8-10 s between the Libres) is followed as before.
+  Each move is logged ("frame moved to its P1"), the demodulator line
+  counts `resched` and `retunes`.
+- Sender: with a receiver beside the transmitter (full duplex, the page's
+  own receiver) both cores ran about 92 % busy and the thread feeding the
+  DAC (nice -10 only) waited long enough for the kernel's two TX buffers
+  to run dry: Libre 1 receiving itself at MER 29 lost the same bursts as
+  Libre 2. The feeder now runs SCHED_FIFO (`stream::fifo_thread`; it
+  sleeps in its blocking write). The writer's log line carries the TX
+  queue's lowest depth (`min_queue`, always full: the loss was below it).
+
+| Libre 1 -> Libre 2, 2330 MHz, 16QAM 1/2, 3 min | blocks decoded |
+|---|---|
+| before | 85-89 % |
+| P1 tracking fixed | 92.8 % |
+| Libre 1 sending alone (TRXD_TX_ALONE=1) | 99.0 % |
+| both fixes, receiver beside the sender | 98.7 % (Libre 1's own: 36 bad of 12 204, at the start) |
+
+QPSK 1/2 after both: 2718 of 2718 blocks in 90 s.
+
 ## Not done
 
 - 64QAM/256QAM, other FFT sizes, PAPR reduction.
-- 16QAM live: decoded over the air at 2330 MHz (MER about 10 dB, video
-  shown), but its 72 FEC blocks a second are twice what the A9 and the
-  FPGA's LDPC decoder get through: about half are dropped.
-- The receiver's A9 load: LLRs (about 17 ms a frame) could move into the
-  FPGA; the deinterleavers need a frame of cells (DDR, not block RAM).
-  LLRs to the LDPC decoder by DMA.
 - A check with an independent T2 receiver (TV HAT / Ryde).

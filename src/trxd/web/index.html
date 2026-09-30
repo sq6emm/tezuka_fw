@@ -173,9 +173,16 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
   #deck { grid-template-columns: 1fr; }
   #app { grid-template-rows: auto auto auto minmax(260px, 1fr) auto; overflow: auto; height: auto; min-height: 100%; }
 }
+/* the FPGA bitstream switch (trxd restarts for a few seconds) */
+#fpgabanner { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 1000;
+  display: none; max-width: calc(100vw - 32px); padding: 10px 16px; border-radius: var(--r);
+  background: var(--panel); border: 1px solid var(--amber); color: var(--amber);
+  font-size: 14px; box-shadow: 0 4px 16px rgba(0, 0, 0, .5); }
+#fpgabanner.done { border-color: var(--green); color: var(--green); }
 </style>
 </head>
 <body>
+<div id="fpgabanner" role="status" aria-live="polite"></div>
 
 <div id="login" class="hidden">
   <form method="post" action="/login">
@@ -494,12 +501,12 @@ async function boot() {
   requestAnimationFrame(frame);
 }
 
-let ws = null;
+let ws = null, wsEpoch = 0;
 function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 function connect() {
   ws = new WebSocket(`wss://${location.host}/ws`);
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => { $("d-ws").className = "dot ok"; };
+  ws.onopen = () => { $("d-ws").className = "dot ok"; wsEpoch++; };
   ws.onclose = () => {
     $("d-ws").className = "dot bad";
     setTimeout(async () => {
@@ -542,7 +549,43 @@ function onJson(m) {
   else if (m.type === "cw") renderCw(m);
   else if (m.type === "datv_key") DATV.keyframe();
   else if (m.type === "datv_error") DATV.refused(m.msg);
+  else if (m.type === "fpga_switch") FPGA.start(m.mode);
+  // back from a bitstream switch: settings picked meanwhile were lost
+  if (m.type === "state" && FPGA.state()) DATV.resync(m);
 }
+// The FPGA bitstream switch: trxd loads the image a feature needs and
+// restarts (the page reconnects on its own); say so meanwhile.
+const FPGA = (() => {
+  const names = { datv: "DATV (DVB-S2/T2)", trx: "voice, CW and the CW-RS network", all: "everything" };
+  let at = 0, epoch = -1, timer = null;
+  const b = () => $("fpgabanner");
+  function text() {
+    const s = Math.round((Date.now() - at) / 1000);
+    return `Loading the FPGA image for ${FPGA.mode}: the radio restarts, back in a few seconds (${s} s)` +
+      (s > 25 ? ". Taking longer than usual; the page keeps trying." : "");
+  }
+  return {
+    mode: "",
+    // a switch under way (trxd restarting)
+    get busy() { return !!at; },
+    start(mode) {
+      this.mode = names[mode] || mode;
+      at = Date.now(); epoch = wsEpoch;
+      b().className = ""; b().textContent = text(); b().style.display = "block";
+      clearInterval(timer);
+      timer = setInterval(() => { if (at) b().textContent = text(); }, 1000);
+    },
+    // fresh state over a new connection: trxd is back
+    // (true: a switch just finished)
+    state() {
+      if (!at || wsEpoch === epoch) return false;
+      clearInterval(timer); at = 0;
+      b().className = "done"; b().textContent = `FPGA image for ${this.mode} loaded`;
+      setTimeout(() => { if (!at) b().style.display = "none"; }, 3000);
+      return true;
+    },
+  };
+})();
 function renderCw(m) {
   const box = $("cwbox"), atEnd = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
   $("cw-text").textContent = m.text;
@@ -1570,8 +1613,18 @@ const DATV = (() => {
     } catch (e) { starting = false; render(); alert("Camera/microphone: " + e.message); return; }
     const v = $("datv-preview"); v.srcObject = stream; v.play().catch(() => {});
     refusal = null;
+    // Not while the board restarts (an FPGA switch: entering DATV mode
+    // loads its image): the command would be lost. Up to 30 s for it to be
+    // back, then 3 s of it being there for the answer.
+    const up = () => !FPGA.busy && ws && ws.readyState === 1;
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    for (let t = 0; t < 30000 && !up(); t += 200) await sleep(200);
+    DATV.resync(S.st, true);   // the receiver beside it, if the switch lost its settings
     send({ cmd: "datv", on: true, ...settings() });
-    for (let i = 0; i < 30 && !(S.st && S.st.datv) && !refusal; i++) await new Promise((r) => setTimeout(r, 100));
+    for (let t = 0, quiet = 0; t < 30000 && quiet < 3000 && !(S.st && S.st.datv) && !refusal; t += 100) {
+      await sleep(100);
+      quiet = up() ? quiet + 100 : 0;
+    }
     if (!(S.st && S.st.datv)) { stop(false); alert("The board did not start DATV: " + (refusal || "already transmitting, TX not allowed, or a receive-only transverter") + "."); return; }
     cfg = S.st.datv; on = true; starting = false; frames = 0; sent = 0; aSamples = 0; aT0 = 0; micIn = 0; micOut = 0; micErr = "";
     W = cfg.width || 320; H = cfg.height || 240;
@@ -1719,6 +1772,13 @@ const DATV = (() => {
       info();
     },
     enter,
+    // After an FPGA switch trxd resumes with the settings it was asked for
+    // then; a code rate picked while it restarted never reached it.
+    resync(st, starting_too) {
+      if (!st || !st.datv_mode || on || (starting && !starting_too)) return;
+      const s = settings(), r = st.datv_rx;
+      if (!r || r.rate !== s.rate || (!s.rate.startsWith("T2-") && r.sr !== s.sr)) send({ cmd: "datv_rx", on: true, ...s });
+    },
     // The board's state: DATV mode, receiver, sender.
     state(st) {
       document.body.classList.toggle("datv-mode", !!st.datv_mode);

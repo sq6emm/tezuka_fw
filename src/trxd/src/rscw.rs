@@ -910,6 +910,10 @@ struct CharModel {
     /// boundaries' choices make short characters cheap (noise decodes as E
     /// and T); `len_bonus` per element evens that out.
     end_bonus: Vec<f64>,
+    /// Per chain: its successors (first state, key down, a gap: takes the
+    /// end bonus) and the log of their count, for [`CharBank::step`].
+    succ: Vec<Vec<(usize, bool, bool)>>,
+    ln_nouts: Vec<f64>,
 }
 
 struct Chain {
@@ -984,7 +988,9 @@ impl CharModel {
         }
         let lb: f64 = std::env::var("RSCW_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
         let end_bonus = chains.iter().map(|c| if c.kind == 0 { lb * tr.depth[c.node] as f64 } else { 0.0 }).collect();
-        CharModel { chains, ns: base, chain_of, wg, ch: tr.ch, end_bonus }
+        let succ = chains.iter().map(|c| c.outs.iter().map(|&o| (chains[o].base, chains[o].on, chains[o].kind >= 2)).collect()).collect();
+        let ln_nouts = chains.iter().map(|c| (c.outs.len() as f64).ln()).collect();
+        CharModel { chains, ns: base, chain_of, wg, ch: tr.ch, end_bonus, succ, ln_nouts }
     }
 
     /// Text from consecutive frames' chains: a character where a mark ends
@@ -1013,8 +1019,9 @@ impl CharModel {
 /// `hist` frames' back pointers (all of them when `hist` is 0).
 struct CharBank {
     m: CharModel,
-    score: Vec<f64>,
-    next: Vec<f64>,
+    // (f32: the A9 is memory bound here; scores are relative to the best)
+    score: Vec<f32>,
+    next: Vec<f32>,
     back: std::collections::VecDeque<Vec<u16>>,
     hist: usize,
     /// Recent log-likelihood a frame (how well this speed explains the input).
@@ -1022,6 +1029,12 @@ struct CharBank {
     /// Sum of what was taken off the scores (the whole path's likelihood).
     total: f64,
     beam: f64,
+    /// The best score of the last frame: taken off each score as it is read
+    /// (instead of a pass over all of them).
+    off: f32,
+    /// Chains with a state within the beam (the others are skipped whole).
+    live: Vec<bool>,
+    cmax: Vec<f32>,
 }
 
 impl CharBank {
@@ -1030,21 +1043,33 @@ impl CharBank {
         let mut score = vec![-1e30; m.ns];
         score[m.chains[m.wg].base] = 0.0;
         let beam = std::env::var("RSCW_BEAM").ok().and_then(|v| v.parse().ok()).unwrap_or(if hist > 0 { 30.0 } else { 1e29 });
-        CharBank { next: vec![-1e30; m.ns], score, back: Default::default(), hist, fit: 0.0, total: 0.0, m, beam }
+        CharBank { next: vec![-1e30; m.ns], score, back: Default::default(), hist, fit: 0.0, total: 0.0, beam, off: 0.0, live: vec![true; m.chains.len()], cmax: Vec::new(), m }
     }
 
     fn step(&mut self, l: f32) {
         // states further than BEAM below the best are dropped
-        let neg: f64 = -self.beam;
-        let ln_half = (0.5f64).ln();
-        let (e_on, e_off) = (l as f64 / 2.0, -l as f64 / 2.0);
-        let mut bp = vec![u16::MAX; self.m.ns];
+        let neg = -self.beam as f32;
+        let ln_half = (0.5f32).ln();
+        let (e_on, e_off) = (l / 2.0, -l / 2.0);
+        // (the oldest frame's back pointers, when they go, are reused)
+        let mut bp = match self.back.front() {
+            Some(_) if self.hist > 0 && self.back.len() >= self.hist => {
+                let mut v = self.back.pop_front().unwrap_or_default();
+                v.fill(u16::MAX);
+                v
+            }
+            _ => vec![u16::MAX; self.m.ns],
+        };
         self.next.iter_mut().for_each(|v| *v = -1e30);
-        for c in &self.m.chains {
+        for (ci, c) in self.m.chains.iter().enumerate() {
+            if !self.live[ci] {
+                continue;
+            }
             let e = if c.on { e_on } else { e_off };
+            let (succ, eb) = (&self.m.succ[ci], self.m.end_bonus[ci] as f32);
             for pos in 0..c.hi {
                 let s = c.base + pos;
-                let sc = self.score[s];
+                let sc = self.score[s] - self.off;
                 if sc < neg {
                     continue;
                 }
@@ -1063,13 +1088,11 @@ impl CharBank {
                         bp[s] = s as u16;
                     }
                 }
-                if can_end && !c.outs.is_empty() {
-                    let ln_out = if last { 0.0 } else { ln_half } - (c.outs.len() as f64).ln();
-                    let ci = self.m.chain_of[s] as usize;
-                    for &o in &c.outs {
-                        let t = self.m.chains[o].base;
-                        let bonus = if self.m.chains[o].kind >= 2 { self.m.end_bonus[ci] } else { 0.0 };
-                        let v = sc + ln_out + bonus + if self.m.chains[o].on { e_on } else { e_off };
+                if can_end && !succ.is_empty() {
+                    let ln_out = if last { 0.0 } else { ln_half } - self.m.ln_nouts[ci] as f32;
+                    for &(t, on, gap) in succ {
+                        let bonus = if gap { eb } else { 0.0 };
+                        let v = sc + ln_out + bonus + if on { e_on } else { e_off };
                         if v > self.next[t] {
                             self.next[t] = v;
                             bp[t] = s as u16;
@@ -1079,8 +1102,17 @@ impl CharBank {
             }
         }
         std::mem::swap(&mut self.score, &mut self.next);
-        let best = self.score.iter().cloned().fold(f64::MIN, f64::max);
-        self.score.iter_mut().for_each(|v| *v -= best);
+        // the best score, and each chain's (whether any of it is in the beam)
+        let mut cmax = std::mem::take(&mut self.cmax);
+        cmax.clear();
+        cmax.extend(self.m.chains.iter().map(|c| self.score[c.base..c.base + c.hi].iter().cloned().fold(f32::MIN, f32::max)));
+        let best = cmax.iter().cloned().fold(f32::MIN, f32::max);
+        for (l, &m) in self.live.iter_mut().zip(&cmax) {
+            *l = !(m - best < neg);
+        }
+        self.cmax = cmax;
+        self.off = best;
+        let best = best as f64;
         self.total += best;
         self.fit += 0.003 * (best - self.fit);
         self.back.push_back(bp);
@@ -1154,6 +1186,8 @@ pub struct RsNnStream {
     sure: f32,
     pub text: String,
     fresh: String,
+    /// Seconds in the network (features included) and in the banks.
+    pub prof: (f64, f64),
 }
 
 impl RsNnStream {
@@ -1188,6 +1222,7 @@ impl RsNnStream {
             sure: std::env::var("RSCW_SURE").ok().and_then(|v| v.parse().ok()).unwrap_or(5.0),
             text: String::new(),
             fresh: String::new(),
+            prof: (0.0, 0.0),
         }
     }
 
@@ -1203,7 +1238,10 @@ impl RsNnStream {
     pub fn process(&mut self, audio: &[f32]) {
         self.llr.clear();
         let mut llr = std::mem::take(&mut self.llr);
+        let t0 = std::time::Instant::now();
         self.nn.process(audio, &mut llr);
+        let t1 = std::time::Instant::now();
+        self.prof.0 += (t1 - t0).as_secs_f64();
         for &l0 in &llr {
             self.acc = (self.acc.0 + l0, self.acc.1 + 1);
             if self.acc.1 < self.dec {
@@ -1238,6 +1276,7 @@ impl RsNnStream {
             }
         }
         self.llr = llr;
+        self.prof.1 += t1.elapsed().as_secs_f64();
     }
 
     fn commit(&mut self, n: usize) {
@@ -1678,6 +1717,41 @@ mod tests {
     /// The network + character-level streaming decoder on every recording.
     #[test]
     #[ignore]
+    fn rscw_banks_speed() {
+        // The streaming decoder's nine speed banks on a keyed test signal
+        // (PARIS at 15 WPM, LLR +-6 with noise), as trxd runs them.
+        let fps = 12000.0 / 128.0;
+        let dots = [9.5f32, 11.0, 12.5, 14.0, 15.5, 17.5, 20.0, 23.0, 27.0].map(|w| 1.2 * fps / w);
+        let mut banks: Vec<CharBank> = dots.iter().map(|&d| CharBank::new(d, (6.0 * fps) as usize)).collect();
+        let key = ".--. .- .-. .. ...  ";
+        let dot = (1.2 * fps / 15.0) as usize;
+        let mut llr = Vec::new();
+        let mut x = 1u32;
+        for _ in 0..40 {
+            for c in key.chars() {
+                let (on, n) = match c { '.' => (true, 1), '-' => (true, 3), _ => (false, 2) };
+                for _ in 0..n * dot {
+                    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                    llr.push(if on { 6.0 } else { -6.0 } + (x % 1000) as f32 / 100.0 - 5.0);
+                }
+                for _ in 0..dot {
+                    llr.push(-6.0);
+                }
+            }
+        }
+        let t0 = std::time::Instant::now();
+        for &l in &llr {
+            for b in &mut banks {
+                b.step(l);
+            }
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        let ns: usize = banks.iter().map(|b| b.m.ns).sum();
+        eprintln!("{} frames x 9 banks ({ns} states): {:.1} us a frame, {:.1} % of a core at {fps:.0} frames/s; best fit {:.3}", llr.len(), dt / llr.len() as f64 * 1e6, dt / llr.len() as f64 * fps as f64 * 100.0, banks.iter().map(|b| b.fit).fold(f64::MIN, f64::max));
+    }
+
+    #[test]
+    #[ignore]
     fn rscw_nnstream() {
         let dir = std::env::var("RSCW_DIR").expect("RSCW_DIR");
         let (mut got, mut all) = (0, 0);
@@ -1685,6 +1759,7 @@ mod tests {
         files.sort();
         let t0 = std::time::Instant::now();
         let mut audio_s = 0.0;
+        let mut prof = (0.0, 0.0);
         for f in files {
             let name = f.file_name().unwrap().to_string_lossy().replace("rsonly__", "");
             let (x, rate) = read_wav(f.to_str().unwrap());
@@ -1694,6 +1769,7 @@ mod tests {
                 d.process(c);
             }
             d.finish();
+            prof = (prof.0 + d.prof.0, prof.1 + d.prof.1);
             let flat: String = d.text.chars().filter(|c| *c != ' ').collect();
             let mut mark = String::new();
             if let Some((_, toks)) = TRUTH.iter().find(|(k, _)| name.contains(k)) {
@@ -1704,7 +1780,7 @@ mod tests {
             }
             eprintln!("{:36} {:4.0} WPM {mark:6} | {}", &name[..name.len().min(36)], d.wpm(), d.text.trim());
         }
-        eprintln!("nn stream score: {got} of {all}; {:.2} s of CPU for {:.0} s of audio", t0.elapsed().as_secs_f64(), audio_s);
+        eprintln!("nn stream score: {got} of {all}; {:.2} s of CPU for {:.0} s of audio (network {:.1} s, banks {:.1} s)", t0.elapsed().as_secs_f64(), audio_s, prof.0, prof.1);
     }
 
     /// The classic narrowband decoder (sdroxide CwRx, as trxd's live CW

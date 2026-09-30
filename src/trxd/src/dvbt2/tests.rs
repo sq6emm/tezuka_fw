@@ -485,3 +485,27 @@ fn tmp_eq_bench() {
     let loads = t.elapsed().as_secs_f64() * 1e3 / 10.0;
     eprintln!("per frame (190 symbols): full {full:.1} ms, sequential stores {seq:.1} ms, loads only {loads:.1} ms");
 }
+
+/// The cell router's mapping (`deinterleaved_index`) against the receiver's
+/// per-block gather: every time-deinterleaved position lands where
+/// `block_gather` puts it.
+#[test]
+fn deinterleaved_index_matches_gather() {
+    for p in [Params::amateur(), {
+        let mut q = Params::amateur();
+        q.constellation = Constellation::Qam16;
+        q.fec_blocks = 18;
+        q
+    }] {
+        let ci = CellInterleaver::new(&p);
+        let n = p.cells();
+        let ti: Vec<u32> = (0..(n * p.fec_blocks) as u32).collect();
+        let mut out = Vec::new();
+        for (r, blk) in ti.chunks(n).enumerate() {
+            ci.block_gather(r, blk, &mut out);
+            for (q, &g) in out.iter().enumerate() {
+                assert_eq!(ci.deinterleaved_index(g as usize), r * n + q, "block {r} cell {q}");
+            }
+        }
+    }
+}
