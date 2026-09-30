@@ -1715,6 +1715,84 @@ mod tests {
     }
 
     /// The network + character-level streaming decoder on every recording.
+    /// Repeat combining (beacons send the same text again and again): the
+    /// period from the LLRs' autocorrelation, the repetitions summed, the
+    /// folded message decoded; tokens from the plain and folded text.
+    #[test]
+    #[ignore]
+    fn rscw_fold() {
+        let dir = std::env::var("RSCW_DIR").expect("RSCW_DIR");
+        let min_r: f64 = std::env::var("RSCW_FOLD_R").ok().and_then(|v| v.parse().ok()).unwrap_or(0.15);
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        files.sort();
+        let (mut got_plain, mut got_both, mut all) = (0, 0, 0);
+        for f in files {
+            let name = f.file_name().unwrap().to_string_lossy().replace("rsonly__", "");
+            let (x, rate) = read_wav(f.to_str().unwrap());
+            let mut d = RsNnStream::new(rate);
+            let mut nn = crate::rsnn::RsNn::new();
+            let dec = (128 / nn.hop()).max(1);
+            let mut raw = Vec::new();
+            for c in x.chunks(1200) {
+                d.process(c);
+                nn.process(c, &mut raw);
+            }
+            d.finish();
+            let llr: Vec<f32> = raw.chunks_exact(dec).map(|c| c.iter().sum()).collect();
+            let fps = rate / nn.hop() as f32 / dec as f32;
+            // the period: normalized autocorrelation, 8 s .. 150 s (at
+            // least two whole repetitions)
+            let xs: Vec<f64> = llr.iter().map(|&v| (v as f64).clamp(-10.0, 10.0)).collect();
+            let m = xs.iter().sum::<f64>() / xs.len().max(1) as f64;
+            let xs: Vec<f64> = xs.iter().map(|v| v - m).collect();
+            let (lo, hi) = ((8.0 * fps) as usize, ((150.0 * fps) as usize).min(xs.len() / 2));
+            let mut best = (0usize, 0f64);
+            for lag in lo..hi {
+                let (mut sxy, mut sxx, mut syy) = (0f64, 0f64, 0f64);
+                for i in 0..xs.len() - lag {
+                    sxy += xs[i] * xs[i + lag];
+                    sxx += xs[i] * xs[i];
+                    syy += xs[i + lag] * xs[i + lag];
+                }
+                let r = sxy / (sxx * syy).sqrt().max(1e-9);
+                if r > best.1 {
+                    best = (lag, r);
+                }
+            }
+            let mut folded = String::new();
+            if best.0 > 0 && best.1 >= min_r {
+                let p = best.0;
+                let mut sum = vec![0f32; p];
+                for (i, &v) in llr.iter().enumerate() {
+                    sum[i % p] += v;
+                }
+                let twice: Vec<f32> = sum.iter().chain(sum.iter()).cloned().collect();
+                let wpms = [9.5f32, 11.0, 12.5, 14.0, 15.5, 17.5, 20.0, 23.0, 27.0];
+                let mut bestv = (f64::MIN, String::new());
+                for w in wpms {
+                    let (t, fit) = viterbi_chars(&twice, 1.2 * fps / w);
+                    if fit > bestv.0 {
+                        bestv = (fit, t);
+                    }
+                }
+                folded = bestv.1;
+            }
+            let flat: String = d.text.chars().filter(|c| *c != ' ').collect();
+            let fflat: String = folded.chars().filter(|c| *c != ' ').collect();
+            let mut mark = String::new();
+            if let Some((_, toks)) = TRUTH.iter().find(|(k, _)| name.contains(k)) {
+                all += toks.len();
+                let g1 = toks.iter().filter(|t| flat.contains(*t)).count();
+                let g2 = toks.iter().filter(|t| flat.contains(*t) || fflat.contains(*t)).count();
+                got_plain += g1;
+                got_both += g2;
+                mark = format!("[{g1}->{g2}/{}]", toks.len());
+            }
+            eprintln!("{:34} period {:5.1} s r {:.2} {mark:10} | {}", &name[..name.len().min(34)], best.0 as f32 / fps, best.1, &folded.trim()[..folded.trim().len().min(150)]);
+        }
+        eprintln!("fold score: plain {got_plain}, with folding {got_both} of {all}");
+    }
+
     #[test]
     #[ignore]
     fn rscw_banks_speed() {

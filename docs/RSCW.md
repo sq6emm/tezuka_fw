@@ -152,6 +152,22 @@ RSNN_FRONT_SMALL=1 for the quick small network; RSNN_FRONT_VEC and
 RSNN_FRONT_ROWS on the test side for the full-size one); on a board
 `stream_matches_batch` runs the FPGA front against the CPU's batch pass.
 
+### Tried 2026-09-30, no gain
+
+- Repeat combining (`rscw_fold`): the repetition period from the LLRs'
+  autocorrelation (8-150 s), the repetitions summed, the folded message
+  decoded. The period only stands out (r 0.5-0.9) on recordings that
+  decode anyway; on the weak beacons r is 0.1-0.2 and the folded text is
+  noise. The score stays 34 (plain or folded, either counted).
+- Weight averages of b2 and its fine-tunes (c2, c3, d1, the 6000-step
+  checkpoint): 32-35. The best (b2 + c2, 35) wins two tokens and loses
+  one, with the text changing on most recordings: noise at 55 tokens,
+  not shipped.
+
+The misses left: weak beacons with no keying the network finds
+(SR6NCI, OE5XBM, S51ZO, S56BD, SR6KBL, IW5DHN), single-element slips
+(SP6GW6, OK1TES, E0FGB for DB0FGB), and SSB-only recordings.
+
 ## Not done
 
 - A language model (callsign structure, repeated calls combined): the
