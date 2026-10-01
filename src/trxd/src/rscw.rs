@@ -1253,11 +1253,14 @@ pub struct RsNnStream {
     /// A character is shown only if its mean agreement per network frame
     /// is at least this (RSCW_CHARCONF; -inf: every character).
     char_conf: f32,
-    /// Every shown character (and word gap) with its time in seconds.
+    /// Every shown character (and word gap) with its time in seconds
+    /// (only while `log` is set: a live decoder runs for days).
     pub timed: Vec<(f32, char)>,
+    /// Keep `timed` and `morse_log` (tests, recordings).
+    pub log: bool,
     /// A word of at most this many characters, all of the shortest codes
-    /// (E T I A N M: what noise decodes as), is not shown (RSCW_JUNK; 0:
-    /// off). Only such a word's start waits, until a longer or another
+    /// (E T I A N M: what noise decodes as), is not shown (RSCW_JUNK,
+    /// default 3; 0: off). Only such a word's start waits, until a longer or another
     /// letter shows it is real.
     junk_len: usize,
     hold: Vec<(usize, char)>,
@@ -1269,8 +1272,15 @@ pub struct RsNnStream {
     /// (-inf: off).
     pub morse: f32,
     morse_min: f32,
-    /// Each commit's rhythm score with its time (while the test is on).
+    /// Each commit's rhythm score with its time (while `log` is set).
     pub morse_log: Vec<(f32, f32)>,
+    /// The rhythm scores of the last few seconds: (the frame their
+    /// window ended at, score). Characters are judged by the windows that
+    /// hold them, not by the newest one: that is up to the lag (2 s) later
+    /// and, at a transmission's end, mostly silence.
+    scores: std::collections::VecDeque<(usize, f32)>,
+    /// Whether the last commit passed the rhythm test (for finish()).
+    last_ok: bool,
 }
 
 impl RsNnStream {
@@ -1310,19 +1320,23 @@ impl RsNnStream {
             recent: std::collections::VecDeque::new(),
             span: (0.0, 0),
             // (the gates tuned on half of 62 fragments operators labelled,
-            // 2026-10-01: with the rhythm test the character gate could
-            // ease from 5 to 4; text on voice and noise 88 % -> 6 %)
-            char_conf: std::env::var("RSCW_CHARCONF").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0),
+            // 2026-10-01, for the self-trained network st3-s5, surer than
+            // b2: 6 and 0.55, inside the region where no seed of it showed
+            // text on the fragments without Morse; b2 had 4 and 0.45)
+            char_conf: std::env::var("RSCW_CHARCONF").ok().and_then(|v| v.parse().ok()).unwrap_or(6.0),
             timed: Vec::new(),
-            junk_len: std::env::var("RSCW_JUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(2),
+            log: false,
+            // (3 since the gate judges characters by the windows holding
+            // them: an EEE on a fragment without Morse came through at 2)
+            junk_len: std::env::var("RSCW_JUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
             hold: Vec::new(),
             word_ok: false,
             window: std::collections::VecDeque::new(),
             morse: 0.0,
             morse_log: Vec::new(),
-            // just above every fragment without Morse in the tuning half
-            // (their highest: 0.42; Morse mostly 0.65-0.96)
-            morse_min: std::env::var("RSCW_MORSE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.45),
+            scores: std::collections::VecDeque::new(),
+            last_ok: false,
+            morse_min: std::env::var("RSCW_MORSE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.55),
         }
     }
 
@@ -1367,6 +1381,14 @@ impl RsNnStream {
                     self.prev = 0;
                     self.recent.clear();
                     self.span = (0.0, 0);
+                    self.scores.clear();
+                    // the word is over: nothing held carries into the next
+                    // transmission, and the next one starts a new word
+                    self.hold.clear();
+                    self.word_ok = false;
+                    if !self.text.is_empty() && !self.text.ends_with(' ') {
+                        self.put(self.frames, ' ');
+                    }
                     self.idle = true;
                 }
                 continue;
@@ -1422,16 +1444,24 @@ impl RsNnStream {
         self.prev = prev;
         self.span = span;
         self.pending -= n;
-        // squelch: the network has been unsure for over 4 s
-        if self.quiet as f32 > self.squelch_s * self.fps + self.lag as f32 {
-            return;
-        }
-        // and the keying must look like Morse (speech does not)
+        // The keying must look like Morse (speech does not): the best of
+        // the rhythm scores of the windows that hold these frames (each
+        // window ends at a commit and reaches MORSE_WINDOW_S back).
+        self.last_ok = true;
         if self.morse_min > f32::NEG_INFINITY {
             let keyed: Vec<bool> = self.window.iter().map(|&l| l > 0.0).collect();
             self.morse = morse_fit(&keyed, 1.0 / self.fps);
-            self.morse_log.push((self.frames as f32 / self.fps, self.morse));
-            if self.morse < self.morse_min {
+            if self.log {
+                self.morse_log.push((self.frames as f32 / self.fps, self.morse));
+            }
+            self.scores.push_back((self.frames, self.morse));
+            while self.scores.front().is_some_and(|&(e, _)| e < start) {
+                self.scores.pop_front();
+            }
+            let reach = start + n + (MORSE_WINDOW_S * self.fps) as usize;
+            let best = self.scores.iter().filter(|&&(e, _)| e <= reach).map(|&(_, m)| m).fold(0.0f32, f32::max);
+            self.last_ok = best >= self.morse_min;
+            if !self.last_ok {
                 return;
             }
         }
@@ -1464,9 +1494,15 @@ impl RsNnStream {
     }
 
     fn put(&mut self, f: usize, x: char) {
+        // (the text is all ASCII; kept to its last 32-64 k characters)
+        if self.text.len() >= 65536 {
+            self.text.drain(..32768);
+        }
         self.text.push(x);
         self.fresh.push(x);
-        self.timed.push((f as f32 / self.fps, x));
+        if self.log {
+            self.timed.push((f as f32 / self.fps, x));
+        }
     }
 
     /// What was committed since the last call.
@@ -1492,7 +1528,7 @@ impl RsNnStream {
             return;
         }
         let c = &m.chains[self.prev as usize];
-        if c.kind <= 1 && self.span.1 > 0 && self.span.0 / (self.span.1 * self.dec) as f32 >= self.char_conf {
+        if self.last_ok && c.kind <= 1 && self.span.1 > 0 && self.span.0 / (self.span.1 * self.dec) as f32 >= self.char_conf {
             if let Some(x) = m.ch[c.node] {
                 self.span = (0.0, 0);
                 self.show(vec![(self.frames, x)]);
@@ -2103,6 +2139,7 @@ mod tests {
         for f in files {
             let (x, rate) = read_wav(f.to_str().unwrap());
             let mut d = RsNnStream::new(rate);
+            d.log = true;
             for c in x.chunks(1200) {
                 d.process(c);
             }

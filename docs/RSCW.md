@@ -220,6 +220,61 @@ half was looked at again:
 The one left: a "T" in an FM voice fragment. The 55-token score with
 the defaults: 34 (as ungated).
 
+## Training on the GPU, scored on the fragments (2026-10-01)
+
+With the batch made on the GPU (rscw/nn/rsgen_gpu.py) a b2-sized network
+trains in 3-6 minutes, so recipes were compared by four seeds each on the
+tuning half of the 62 fragments, the other half kept for the end. No
+synthetic recipe beat b2: 16000 steps looked +6 on the tuning half and
+was +1 on the other (selection among six recipes on 23 fragments);
+weaker signals, realism, phone codecs and 32000 steps did not help.
+
+Self-training on real recordings did. An ensemble (b2 and eight 16000-step
+networks) labels 57 real recordings (none of the other half's): frames
+where its mean LLR is beyond 2 are labels, and 4 s windows whose keying
+fails the Morse rhythm test (0.45) are left unlabelled (labelling them key
+up instead taught the network to drop weak CW). Each training step adds
+16 such real crops to the 32 synthetic ones (16000 steps, from scratch).
+On the other half (recordings the training never heard), four seeds:
+mean 28.0 +- 1.1 % with the gates at 6 and 0.55 (b2 22 %); ungated 41 %
+(b2 31 %). These networks are surer, so the gates were retuned for them
+on the tuning half, inside the region where no seed showed text without
+Morse.
+
+Shipped: rsnn.bin = st3-s5 (the best seed on the tuning half) with the
+gates at 6 / 0.55 / 3 (`RSCW_CHARCONF`, `RSCW_MORSE`, `RSCW_JUNK`), after
+an independent review of method and code (2026-10-01):
+
+- No leakage: no other-half recording is in the self-training pool, by
+  name and by audio fingerprint (two other-half recordings share 16 s of
+  audio, so that half holds about 21 independent CW fragments, not 22).
+- The gain is modest and rests on few fragments: per fragment against b2
+  on the other half, +6 to 9 points mean (95 % interval roughly +1 to
+  +17), better on 4 to 6 fragments and worse on none; every seed is at
+  least as good as b2. Text on fragments without Morse is unchanged
+  within noise (one or none of 8): the gates do that, not the network.
+- The other half has been looked at several times during this work
+  (the rhythm test, the choice of st3 and the retuned gates followed
+  looks at it): treat it as half-tuning now. A clean verdict needs new
+  labelled fragments the pipeline has never touched.
+
+The code review found that the rhythm gate scored the newest 4 s while
+the characters it let through were 2-2.5 s older, so a transmission's
+last characters were dropped as its window filled with silence. Now
+each half second's window score is kept with its frame, and characters
+pass on the best score of the windows that hold them. Also: the junk
+filter's state is cleared (and the word closed) at the squelch reset;
+the timed character and score logs are kept only on request (`log`; a
+live decoder runs for days) and the text is capped; the word filter
+covers three letters (an EEE came through at two).
+
+With these, other half: st3-s5 at 6 / 0.55 / 3 mean 33 %, half+ 32 %,
+80 %+ 27 %; b2 at its old gates 4 / 0.45 / 2 mean 25 %, 23 %, 18 %; each
+shows text on one of 8 fragments without Morse (st3-s5: RRDE on one an
+operator called too weak to read; b2: T TEM O on voice). The 55-token
+score: 33 (b2 34). On the board the network runs on the FPGA front and
+temporal layers, bit-exact with the batch forward pass.
+
 ## Not done
 
 - A language model (callsign structure, repeated calls combined): the
