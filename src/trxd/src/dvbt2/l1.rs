@@ -152,8 +152,8 @@ pub fn post_cells() -> usize {
     post_sizes().0 / 2
 }
 
-/// The 1840 L1-pre cells.
-pub fn pre(p: &Params) -> Vec<Cell> {
+/// The 200 L1-pre signalling bits (CRC-32 included) for `p`.
+pub fn pre_bits(p: &Params) -> Vec<u8> {
     let mut b = Bits(Vec::with_capacity(KBCH_1_4));
     b.put(0, 8); // TYPE: TS
     b.put(0, 1); // BWT_EXT
@@ -185,20 +185,31 @@ pub fn pre(p: &Params) -> Vec<Cell> {
     b.put(0, 4); // RESERVED
     b.crc32();
     assert_eq!(b.0.len(), KSIG_PRE);
-    let mut msg = b.0;
-    msg.resize(KBCH_1_4, 0);
-    let parity = bch_parity(&msg);
-    let mut info = msg.clone();
-    info.extend_from_slice(&parity);
-    let ldpc = ldpc16k(&info, &LDPC_1_4S, 36);
-    // Puncturing: 31 whole groups and 328 of the 32nd.
-    let mut punct = vec![false; ldpc.len()];
+    b.0
+}
+
+/// L1-pre puncturing of the LDPC parity bits: 31 whole groups and 328 of
+/// the 32nd.
+fn pre_punctured() -> Vec<bool> {
+    let mut punct = vec![false; N_SHORT - NBCH_1_4];
     for (c, &g) in PRE_PUNCTURE.iter().enumerate().take(32) {
         let n = if c < 31 { 360 } else { 328 };
         for c2 in 0..n {
             punct[c2 * 36 + g] = true;
         }
     }
+    punct
+}
+
+/// The 1840 L1-pre cells.
+pub fn pre(p: &Params) -> Vec<Cell> {
+    let mut msg = pre_bits(p);
+    msg.resize(KBCH_1_4, 0);
+    let parity = bch_parity(&msg);
+    let mut info = msg.clone();
+    info.extend_from_slice(&parity);
+    let ldpc = ldpc16k(&info, &LDPC_1_4S, 36);
+    let punct = pre_punctured();
     let mut out = Vec::with_capacity(L1_PRE_CELLS);
     out.extend(msg[..KSIG_PRE].iter().map(|&x| bpsk(x)));
     out.extend(parity.iter().map(|&x| bpsk(x)));
@@ -207,8 +218,9 @@ pub fn pre(p: &Params) -> Vec<Cell> {
     out
 }
 
-/// The L1-post cells of T2 frame `frame_idx`.
-pub fn post(p: &Params, frame_idx: usize) -> Vec<Cell> {
+/// The 350 L1-post bits (configurable, dynamic, CRC-32) of T2 frame
+/// `frame_idx`.
+pub fn post_bits(p: &Params, frame_idx: usize) -> Vec<u8> {
     let mut b = Bits(Vec::with_capacity(KSIG_POST));
     // Configurable.
     b.put(1, 15); // SUB_SLICES_PER_FRAME
@@ -216,7 +228,7 @@ pub fn post(p: &Params, frame_idx: usize) -> Vec<Cell> {
     b.put(0, 4); // NUM_AUX
     b.put(0, 8); // AUX_CONFIG_RFU
     b.put(0, 3); // RF_IDX
-    b.put(729_833_333, 32); // FREQUENCY
+    b.put(p.frequency_hz as u64, 32); // FREQUENCY
     b.put(0, 8); // PLP_ID
     b.put(1, 3); // PLP_TYPE: data type 1
     b.put(3, 5); // PLP_PAYLOAD_TYPE: TS
@@ -253,16 +265,20 @@ pub fn post(p: &Params, frame_idx: usize) -> Vec<Cell> {
     b.put(0, 8); // RESERVED_2
     b.put(0, 8); // RESERVED_3
     b.crc32();
-    let bits = b.0;
-    assert_eq!(bits.len(), KSIG_POST);
+    assert_eq!(b.0.len(), KSIG_POST);
+    b.0
+}
+
+/// L1-post shortening: which of the 7032 BCH information bits are padding.
+fn post_padded() -> Vec<bool> {
     // Shortening: whole groups of 360 (group 19 has 192) padded, in the
     // standard's order, then `last` bits of the next.
     let mut pad = vec![false; KBCH_1_2];
-    let (m, last) = if bits.len() <= 360 {
-        (19, 360 - bits.len())
+    let (m, last) = if KSIG_POST <= 360 {
+        (19, 360 - KSIG_POST)
     } else {
-        let m = (KBCH_1_2 - bits.len()) / 360;
-        (m, KBCH_1_2 - bits.len() - 360 * m)
+        let m = (KBCH_1_2 - KSIG_POST) / 360;
+        (m, KBCH_1_2 - KSIG_POST - 360 * m)
     };
     for &g in &POST_PADDING_BQPSK[..m] {
         let n = if g == 19 { 192 } else { 360 };
@@ -271,6 +287,30 @@ pub fn post(p: &Params, frame_idx: usize) -> Vec<Cell> {
     let g = POST_PADDING_BQPSK[m];
     let start = if g == 19 { g * 360 + 192 - last } else { g * 360 + 360 - last };
     pad[start..start + last].fill(true);
+    pad
+}
+
+/// L1-post puncturing of the 9000 LDPC parity bits.
+fn post_punctured() -> Vec<bool> {
+    let (_, n_punc) = post_sizes();
+    let mut punct = vec![false; N_SHORT - NBCH_1_2];
+    for c in 0..n_punc / 360 {
+        let g = POST_PUNCTURE_BQPSK[c];
+        for c2 in 0..360 {
+            punct[c2 * 25 + g] = true;
+        }
+    }
+    let g = POST_PUNCTURE_BQPSK[n_punc / 360];
+    for c2 in 0..n_punc % 360 {
+        punct[c2 * 25 + g] = true;
+    }
+    punct
+}
+
+/// The L1-post cells of T2 frame `frame_idx`.
+pub fn post(p: &Params, frame_idx: usize) -> Vec<Cell> {
+    let bits = post_bits(p, frame_idx);
+    let pad = post_padded();
     let mut msg = vec![0u8; KBCH_1_2];
     let mut it = bits.iter();
     for (n, m) in msg.iter_mut().enumerate() {
@@ -282,22 +322,242 @@ pub fn post(p: &Params, frame_idx: usize) -> Vec<Cell> {
     let mut info = msg.clone();
     info.extend_from_slice(&parity);
     let ldpc = ldpc16k(&info, &LDPC_1_2S, 25);
-    let (n_post, n_punc) = post_sizes();
-    let mut punct = vec![false; ldpc.len()];
-    for c in 0..n_punc / 360 {
-        let g = POST_PUNCTURE_BQPSK[c];
-        for c2 in 0..360 {
-            punct[c2 * 25 + g] = true;
-        }
-    }
-    let g = POST_PUNCTURE_BQPSK[n_punc / 360];
-    for c2 in 0..n_punc % 360 {
-        punct[c2 * 25 + g] = true;
-    }
+    let (n_post, _) = post_sizes();
+    let punct = post_punctured();
     let mut out_bits = Vec::with_capacity(n_post);
     out_bits.extend(msg.iter().zip(&pad).filter(|(_, pd)| !**pd).map(|(&x, _)| x));
     out_bits.extend_from_slice(&parity);
     out_bits.extend(ldpc.iter().zip(&punct).filter(|(_, pu)| !**pu).map(|(&x, _)| x));
     assert_eq!(out_bits.len(), n_post);
     out_bits.chunks_exact(2).map(|c| qpsk(c[0], c[1])).collect()
+}
+
+/// What the receiver makes of a frame's L1-pre.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreOutcome {
+    /// Decoded (CRC right), as expected for these parameters.
+    Ok,
+    /// Decoded, but another configuration: the differing fields.
+    Mismatch(Vec<&'static str>),
+    /// Not decoded (BCH or CRC failed).
+    Failed,
+}
+
+/// The L1-pre fields the receiver's fixed layout depends on, (name, first
+/// bit, width). (NETWORK_ID, T2_SYSTEM_ID and the like are another
+/// station's own: not a reason to refuse it.)
+const PRE_FIELDS: [(&str, usize, usize); 10] = [
+    ("TYPE", 0, 8),
+    ("S1", 9, 3),
+    ("S2", 12, 4),
+    ("GUARD_INTERVAL", 17, 3),
+    ("PAPR", 20, 4),
+    ("L1_MOD/COD/FEC", 24, 8),
+    ("L1_POST_SIZE", 32, 18),
+    ("PILOT_PATTERN", 68, 4),
+    ("NUM_DATA_SYMBOLS", 136, 12),
+    ("T2_VERSION", 158, 4),
+];
+
+/// The same for L1-post's configurable part (one PLP, its modulation,
+/// code, rotation, blocks, time interleaving).
+const POST_FIELDS: [(&str, usize, usize); 11] = [
+    ("NUM_PLP", 15, 8),
+    ("NUM_AUX", 23, 4),
+    ("PLP_TYPE", 78, 3),
+    ("PLP_PAYLOAD_TYPE", 81, 5),
+    ("PLP_COD", 106, 3),
+    ("PLP_MOD", 109, 3),
+    ("PLP_ROTATION", 112, 1),
+    ("PLP_FEC_TYPE", 113, 2),
+    ("PLP_NUM_BLOCKS_MAX", 115, 10),
+    ("FRAME_INTERVAL/TIME_IL_LENGTH", 125, 16),
+    ("TIME_IL_TYPE", 141, 1),
+];
+
+/// Decodes an L1 block (EN 302 755 7.3): BCH on the hard decisions first
+/// (enough at any usable MER), the 16K LDPC (the DVB-S2 short code of the
+/// same rate) when that fails; then the CRC-32, and the fields the
+/// receiver's layout depends on against what `p` sends.
+struct L1Decoder {
+    want: Vec<u8>,
+    fields: &'static [(&'static str, usize, usize)],
+    ksig: usize,
+    kbch: usize,
+    /// Shortened information bits (known zeros) and punctured parity bits.
+    pad: Vec<bool>,
+    punct: Vec<bool>,
+    ldpc: crate::dvbs2::ldpc::Decoder,
+    bch: crate::dvbs2::bch::Bch,
+    llr: Vec<f32>,
+    bits: Vec<u8>,
+}
+
+impl L1Decoder {
+    /// `llr`: the block's bits as sent (positive = 0).
+    fn decode(&mut self, llr: &[f32]) -> PreOutcome {
+        let nbch = self.kbch + NBCH_PARITY;
+        let big = 64.0;
+        let mut it = llr.iter();
+        let mut next = || *it.next().unwrap_or(&0.0);
+        for n in 0..self.kbch {
+            self.llr[n] = if self.pad[n] { big } else { next() };
+        }
+        for n in self.kbch..nbch {
+            self.llr[n] = next();
+        }
+        for (j, &pu) in self.punct.iter().enumerate() {
+            self.llr[nbch + j] = if pu { 0.0 } else { next() };
+        }
+        for (b, &l) in self.bits.iter_mut().zip(&self.llr) {
+            *b = (l < 0.0) as u8;
+        }
+        if !self.check() {
+            let llr = std::mem::take(&mut self.llr);
+            let conv = self.ldpc.decode(&llr, &mut self.bits);
+            self.llr = llr;
+            if conv.is_none() || !self.check() {
+                return PreOutcome::Failed;
+            }
+        }
+        let sig: Vec<u8> = self.bits[..self.kbch].iter().zip(&self.pad).filter(|(_, p)| !**p).map(|(&b, _)| b).take(self.ksig).collect();
+        let differ: Vec<&'static str> = self.fields.iter().filter(|(_, at, n)| sig[*at..at + n] != self.want[*at..at + n]).map(|(name, ..)| *name).collect();
+        if differ.is_empty() { PreOutcome::Ok } else { PreOutcome::Mismatch(differ) }
+    }
+
+    /// BCH corrects (or finds clean), and the signalling's CRC-32 holds.
+    fn check(&mut self) -> bool {
+        let nbch = self.kbch + NBCH_PARITY;
+        if matches!(self.bch.decode(&mut self.bits[..nbch]), crate::dvbs2::bch::Outcome::Failed) {
+            return false;
+        }
+        let sig: Vec<u8> = self.bits[..self.kbch].iter().zip(&self.pad).filter(|(_, p)| !**p).map(|(&b, _)| b).take(self.ksig).collect();
+        let mut b = Bits(sig[..self.ksig - 32].to_vec());
+        b.crc32();
+        b.0[self.ksig - 32..] == sig[self.ksig - 32..]
+    }
+}
+
+/// L1-pre from its 1840 BPSK cells' LLRs.
+pub struct PreDecoder(L1Decoder);
+
+impl PreDecoder {
+    pub fn new(p: &Params) -> Self {
+        let mut pad = vec![false; KBCH_1_4];
+        pad[KSIG_PRE..].fill(true);
+        PreDecoder(L1Decoder {
+            want: pre_bits(p),
+            fields: &PRE_FIELDS,
+            ksig: KSIG_PRE,
+            kbch: KBCH_1_4,
+            pad,
+            punct: pre_punctured(),
+            ldpc: crate::dvbs2::ldpc::Decoder::from_table(&LDPC_1_4S, N_SHORT, NBCH_1_4),
+            bch: crate::dvbs2::bch::Bch::short(),
+            llr: vec![0.0; N_SHORT],
+            bits: vec![0; N_SHORT],
+        })
+    }
+
+    /// `llr`: the 1840 cells' LLRs in order (positive = 0).
+    pub fn decode(&mut self, llr: &[f32]) -> PreOutcome {
+        assert_eq!(llr.len(), super::L1_PRE_CELLS);
+        self.0.decode(llr)
+    }
+}
+
+/// L1-post from its QPSK cells' bit LLRs (two a cell: I, then Q).
+pub struct PostDecoder(L1Decoder);
+
+impl PostDecoder {
+    pub fn new(p: &Params) -> Self {
+        PostDecoder(L1Decoder {
+            want: post_bits(p, 0),
+            fields: &POST_FIELDS,
+            ksig: KSIG_POST,
+            kbch: KBCH_1_2,
+            pad: post_padded(),
+            punct: post_punctured(),
+            ldpc: crate::dvbs2::ldpc::Decoder::from_table(&LDPC_1_2S, N_SHORT, NBCH_1_2),
+            bch: crate::dvbs2::bch::Bch::short(),
+            llr: vec![0.0; N_SHORT],
+            bits: vec![0; N_SHORT],
+        })
+    }
+
+    pub fn decode(&mut self, llr: &[f32]) -> PreOutcome {
+        assert_eq!(llr.len(), post_sizes().0);
+        self.0.decode(llr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn llrs(cells: &[Cell], flip: &[usize], noise: f32) -> Vec<f32> {
+        let mut seed = 9u64;
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                let n = ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0 * noise;
+                let v = if c == super::super::BPSK0 { 1.0 } else { -1.0 };
+                4.0 * (if flip.contains(&i) { -v } else { v } + n)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pre_decodes_and_tells_a_different_configuration() {
+        let p = Params::amateur();
+        let mut d = PreDecoder::new(&p);
+        let cells = pre(&p);
+        assert_eq!(d.decode(&llrs(&cells, &[], 0.0)), PreOutcome::Ok);
+        // hard-decision errors beyond BCH's 12: the LDPC puts them right
+        let flips: Vec<usize> = (0..40).map(|i| i * 41 + 3).collect();
+        assert_eq!(d.decode(&llrs(&cells, &flips, 0.3)), PreOutcome::Ok);
+        // another transmitter: PP4 (its own T2_SYSTEM_ID is no matter)
+        let mut q = p;
+        q.pilots = super::super::Pilots::PP4;
+        q.t2_system_id = 7;
+        assert_eq!(d.decode(&llrs(&pre(&q), &[], 0.0)), PreOutcome::Mismatch(vec!["PILOT_PATTERN"]));
+        q.pilots = p.pilots;
+        assert_eq!(d.decode(&llrs(&pre(&q), &[], 0.0)), PreOutcome::Ok);
+        // noise only
+        let noise: Vec<f32> = llrs(&cells, &[], 0.0).iter().enumerate().map(|(i, _)| if (i * 7919) % 3 == 0 { 1.0 } else { -1.0 }).collect();
+        assert_eq!(d.decode(&noise), PreOutcome::Failed);
+    }
+
+    /// L1-post from its QPSK cells: any frame index; another modulation,
+    /// rotation or the real FREQUENCY told apart from layout changes.
+    #[test]
+    fn post_decodes_and_tells_a_different_configuration() {
+        let p = Params::amateur();
+        let mut d = PostDecoder::new(&p);
+        let bits = |q: &Params, f: usize, noise: f32| -> Vec<f32> {
+            let mut seed = 5u64;
+            post(q, f)
+                .iter()
+                .flat_map(|&c| {
+                    let w = c - L1_QPSK;
+                    [(w >> 1) & 1, w & 1]
+                })
+                .map(|b| {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                    let n = ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0 * noise;
+                    4.0 * (if b == 0 { 1.0 } else { -1.0 } + n)
+                })
+                .collect()
+        };
+        assert_eq!(d.decode(&bits(&p, 0, 0.0)), PreOutcome::Ok);
+        assert_eq!(d.decode(&bits(&p, 1, 0.9)), PreOutcome::Ok);
+        let mut q = p;
+        q.frequency_hz = 437_000_000;
+        assert_eq!(d.decode(&bits(&q, 0, 0.0)), PreOutcome::Ok);
+        q.constellation = super::super::Constellation::Qam16;
+        q.rotation = !p.rotation;
+        assert_eq!(d.decode(&bits(&q, 0, 0.0)), PreOutcome::Mismatch(vec!["PLP_MOD", "PLP_ROTATION"]));
+    }
 }

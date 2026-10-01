@@ -208,21 +208,50 @@ qspiboot_extraenv=sf read ${extraenv_load_address} 0xFF000 0x1000;
 # iminfo checks every image's hash in the slot before anything boots from it.
 qspi_slot_select=\
   run ab_count; \
+  setenv boot_slot ${slot}; \
   if test "${slot}" = "b"; then setenv slot_offset 0xE40000; else setenv slot_offset 0x200000; fi; \
   echo "Booting QSPI slot ${slot} at ${slot_offset} (upgrade_available=${upgrade_available} bootcount=${bootcount})";
 
-qspiboot=\
-  adi_hwref; \
-  run qspi_slot_select; \
+# Zynq system watchdog (SWDT, 0xF8005000), started before anything is read
+# from flash: a hang in U-Boot's loading, in bootm or in the kernel before
+# S15watchdog takes the watchdog over resets the board, and that reset is a
+# boot like any other (counted while the slot is unconfirmed). Reset only, no
+# IRQ; counter restart value 0x500 with the /4096 prescaler: about 160-190 s
+# at cpu_1x 111-133 MHz. The kernel's cadence_wdt leaves a running watchdog
+# alone until S15watchdog opens it and sets its own timeout. Not started on
+# an interrupted autoboot or a manual dfu_sf; it stays on in the DFU wait
+# after both slots failed, which then reboots and tries again.
+wdt_start=mw f8005000 00abc000; mw f8005004 00921403; mw f8005000 00abc033; mw f8005008 1999
+
+# Load and boot the slot at ${slot_offset}; returns only if that failed.
+qspi_try=\
   echo Copying Linux from QSPI flash to RAM... \
   && sf probe 0:0 50000000 0 && sf read ${fit_load_address} ${slot_offset} 0xC40000 && iminfo ${fit_load_address} \
   && if run adi_loadvals; then \
     echo Loaded AD936x refclk frequency and model into devicetree; \
   fi; \
   run pl_init; \
-  setenv bootargs console=ttyPS0,115200 maxcpus=${maxcpus} rootfstype=ramfs root=/dev/ram0 rw earlyprintk clk_ignore_unused cpuidle.off=1 panic=10 uio_pdrv_genirq.of_id=uio_pdrv_genirq UBOOT_MODEBOOT=$modeboot UBOOT_SLOT=${slot} UBOOT_VERSION='\"'${uboot-version}'\"' \
-  && bootm ${fit_load_address}#${fit_config}; \
+  setenv bootargs console=ttyPS0,115200 maxcpus=${maxcpus} rootfstype=ramfs root=/dev/ram0 rw earlyprintk clk_ignore_unused cpuidle.off=1 panic=10 uio_pdrv_genirq.of_id=uio_pdrv_genirq UBOOT_MODEBOOT=$modeboot UBOOT_SLOT=${boot_slot} ${boot_note} UBOOT_VERSION='\"'${uboot-version}'\"' \
+  && bootm ${fit_load_address}#${fit_config}
+
+# An unconfirmed slot that fails is reset, which counts it (ab_count). A
+# confirmed slot that fails (flash damage, a bad read) boots the other slot,
+# for this boot only: nothing is saved, slot= still names the failed one, and
+# the kernel gets UBOOT_SLOT=<other> UBOOT_FALLBACK=1, so fw-update writes the
+# next firmware over the failed slot and S99fwconfirm reports it. Only when
+# both fail: DFU.
+qspiboot=\
+  adi_hwref; \
+  run wdt_start; \
+  setenv boot_note; \
+  run qspi_slot_select; \
+  run qspi_try; \
   if test "${upgrade_available}" = "1"; then echo "Slot ${slot} failed to boot: resetting to count it"; reset; fi; \
+  if test "${boot_slot}" = "b"; then setenv boot_slot a; setenv slot_offset 0x200000; else setenv boot_slot b; setenv slot_offset 0xE40000; fi; \
+  setenv boot_note UBOOT_FALLBACK=1; \
+  echo "Slot ${slot} failed to boot: trying slot ${boot_slot} for this boot"; \
+  run qspi_try; \
+  setenv boot_note; \
   echo BOOT failed entering DFU mode && run dfu_sf
 
 ramboot_verbose=\
@@ -275,6 +304,7 @@ slot_select=\
 
 sdboot_ram=\
   if mmcinfo; then \
+    run wdt_start; \
     run uenvboot; \
     run slot_select; \
     echo Copying Linux from SD to RAM... \

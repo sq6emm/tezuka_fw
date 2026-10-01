@@ -19,6 +19,17 @@ pick_config() {
 	fi
 }
 
+# Transmitter off whatever trxd left behind (a crash, a kill -9): the TX LO
+# powered down, the configured PTT line low. Before every (re)start and on stop.
+rf_off() {
+	for d in /sys/bus/iio/devices/iio:device*; do
+		[ "$(cat "$d/name" 2>/dev/null)" = ad9361-phy ] && echo 1 > "$d/out_altvoltage1_TX_LO_powerdown" 2>/dev/null
+	done
+	G=$(sed -n 's/^[[:space:]]*ptt_gpio[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${1:-$(pick_config)}" 2>/dev/null | head -n 1)
+	[ -n "$G" ] && [ -w "$G" ] && echo 0 > "$G"
+	return 0
+}
+
 start() {
 	CONF=$(pick_config)
 	printf 'Starting trxd (%s): ' "$CONF"
@@ -31,7 +42,7 @@ start() {
 	# load it (fpga-mode: the PL reloaded, the drivers bound again) and
 	# start trxd again at once (docs/FPGA-MODES.md).
 	start-stop-daemon -S -b -m -p "$PIDFILE" -x /bin/sh -- -c \
-		"while :; do if [ -f /run/fpga-mode.want ]; then /usr/sbin/fpga-mode \$(cat /run/fpga-mode.want) >>$LOG 2>&1; rm -f /run/fpga-mode.want; fi; RUST_LOG=\${RUST_LOG:-info} $DAEMON --config '$CONF' >>$LOG 2>&1; [ -f /run/fpga-mode.want ] || sleep 5; done"
+		"while :; do /etc/init.d/S80trxd rf-off '$CONF'; if [ -f /run/fpga-mode.want ]; then /usr/sbin/fpga-mode \$(cat /run/fpga-mode.want) >>$LOG 2>&1; rm -f /run/fpga-mode.want; fi; RUST_LOG=\${RUST_LOG:-info} $DAEMON --config '$CONF' >>$LOG 2>&1; [ -f /run/fpga-mode.want ] || sleep 5; done"
 	echo "OK"
 }
 
@@ -39,6 +50,11 @@ stop() {
 	printf 'Stopping trxd: '
 	start-stop-daemon -K -q -p "$PIDFILE"
 	killall trxd 2>/dev/null
+	sleep 1
+	killall -9 trxd 2>/dev/null
+	rf_off
+	# No PL DMA left writing RAM into a reboot (or the next bitstream).
+	[ -x /usr/sbin/fpga-mode ] && /usr/sbin/fpga-mode stop-dma >/dev/null 2>&1
 	rm -f "$PIDFILE"
 	echo "OK"
 }
@@ -47,5 +63,6 @@ case "$1" in
 	start) start ;;
 	stop) stop ;;
 	restart|reload) stop; sleep 1; start ;;
-	*) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+	rf-off) rf_off "$2" ;;
+	*) echo "Usage: $0 {start|stop|restart|rf-off}"; exit 1 ;;
 esac

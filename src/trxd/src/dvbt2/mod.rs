@@ -128,6 +128,10 @@ pub struct Params {
     /// 0xFF01) and T2_SYSTEM_ID (unique within that network).
     pub network_id: u16,
     pub t2_system_id: u16,
+    /// L1-post FREQUENCY: the channel's centre, Hz (32 bits: 5.76 GHz does
+    /// not fit, it saturates). Default gr-dtv's 729 833 333 (the
+    /// bit-exact tests); [`tx::Mode::with_frequency`] sets the real one.
+    pub frequency_hz: u32,
 }
 
 impl Params {
@@ -146,6 +150,7 @@ impl Params {
             t2_frames: 2,
             network_id: 0xFF01,
             t2_system_id: 0x0001,
+            frequency_hz: 729_833_333,
         }
     }
 

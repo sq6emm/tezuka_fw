@@ -25,6 +25,15 @@ pub trait RadioControl: Send {
     fn set_los(&mut self, rx_hz: f64, tx_hz: f64) -> Result<(), String> {
         if rx_hz == tx_hz { self.set_lo(rx_hz) } else { Err("this radio has one LO".into()) }
     }
+    /// Move only the RX LO (the TX LO stays as it is: transmitting).
+    fn set_rx_lo(&mut self, hz: f64) -> Result<(), String> {
+        self.set_lo(hz)
+    }
+    /// A new reference correction (Hz of the 40 MHz reference): the clock
+    /// chain and the LOs recomputed from it, at the frequencies already set.
+    fn apply_xo(&mut self, _hz: f64) -> Result<(), String> {
+        Ok(())
+    }
     fn set_rx_gain(&mut self, mode: GainMode, db: f64) -> Result<(), String>;
     fn set_tx_attenuation(&mut self, db: f64) -> Result<(), String>;
     /// Power the TX LO (and the external PTT line) up or down. While down the

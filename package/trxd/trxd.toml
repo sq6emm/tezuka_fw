@@ -44,11 +44,6 @@ decoders = ["pi4", "q65", "cw"]
 q65_submode = "D"
 # wav_dir = "/mnt/sd/beacon"
 
-[mqtt]
-host = "127.0.0.1"
-port = 1883
-topic_prefix = "trxd/{hostname}"
-
 [reference]             # see docs/REFERENCE.md
 mode = "auto"           # auto | pps | chrony | 10mhz | off
 

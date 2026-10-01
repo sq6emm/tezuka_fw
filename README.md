@@ -10,12 +10,12 @@ boards into:
 
 * a **headless remote transceiver** (SQTRX): SSB, CW and data modes over
   **TCI** and **Hamlib rigctld** (FT8 is left to WSJT-X on the PC), with
-  on-board Q65/PI4 decoders and a live CW decoder, published to **MQTT**, and
+  on-board Q65/PI4 decoders and a live CW decoder (web UI and TCI), and
   low-rate **DATV** (DVB-S2 from and to the browser's camera; docs/DATV.md); or
 * an **IARU-R1 MGM beacon transmitter**: PI4 or Q65-60x plus CW
   identification plus carrier, GPS/NTP-timed; or
 * a **beacon receiver**: PI4, Q65 and CW decodes, plus a carrier
-  frequency/SNR measurement every minute, published to MQTT.
+  frequency/SNR measurement every minute, written to the log.
 
 Frequency range is that of the AD936x: about 47 MHz to 6 GHz. HF needs a transverter.
 
@@ -108,24 +108,12 @@ decoders = ["q65"]       # q65 | pi4
 |---|---|
 | TCI (WSJT-X, JTDX, MSHV, sdroxide, ...) | `ws://<board>:40001` |
 | Hamlib | `rigctl -m 2 -r <board>:4532` (and WSJT-X "Hamlib NET rigctl") |
-| MQTT broker | `<board>:1883`, WebSocket `:9001` |
+| Web UI | `https://<board>/` |
 
-MQTT topics, with `<p>` = `trxd/<hostname>`:
-
-| Topic | Content |
-|---|---|
-| `<p>/online` | `true` / `false` (retained, last will) |
-| `<p>/state` | frequency, mode, PTT, gains, clients, time sync (retained) |
-| `<p>/decode/q65-60d`, `.../pi4`, `.../cw` | one JSON per decode: `utc`, `freq_hz`, `audio_hz`, `dt`, `snr_db`, `message`, `call` |
-| `<p>/carrier` | beacon-rx: measured carrier `freq_hz`, `offset_hz`, `snr_db` each minute |
-| `<p>/reference` | reference oscillator: source, measured error in ppb, `xo_correction` |
-| `<p>/cmd/<name>` | commands: `freq`, `mode`, `ptt`, `tune`, `cw` (text), `cw_wpm`, `drive`, `txatt`, `rxgain`, `filter` |
-
-```sh
-mosquitto_sub -h <board> -t 'trxd/+/decode/#' -v
-mosquitto_pub -h <board> -t trxd/plutoskyr2/cmd/freq -m 144050000
-mosquitto_pub -h <board> -t trxd/plutoskyr2/cmd/cw -m "CQ CQ DE SQ6EMM K"
-```
+There is no MQTT (removed 2026-10-01: it was an unauthenticated control
+path). Decodes, beacon-rx carrier reports and the reference state go to the
+log (`logread`, or `/var/log/messages`); in the trx role decodes also go to
+the web UI and to TCI.
 
 ## DATV quality
 
@@ -180,7 +168,7 @@ Firmware and FPGA:
 - [Buildroot](https://buildroot.org/) with a
   [Bootlin toolchain](https://toolchains.bootlin.com/); on the board:
   [BusyBox](https://busybox.net/), [Dropbear](https://matt.ucc.asn.au/dropbear/dropbear.html),
-  [Mosquitto](https://mosquitto.org/), [chrony](https://chrony-project.org/),
+  [chrony](https://chrony-project.org/),
   [pps-tools](https://github.com/redlab-i/pps-tools),
   [Avahi](https://avahi.org/), [libgpiod](https://git.kernel.org/pub/scm/libs/libgpiod/libgpiod.git/),
   [WireGuard tools](https://www.wireguard.com/), [mtd-utils](https://git.infradead.org/mtd-utils.git),
@@ -208,7 +196,6 @@ trxd (Rust):
   [num-complex](https://github.com/rust-num/num-complex),
   [rustls](https://github.com/rustls/rustls), [rcgen](https://github.com/rustls/rcgen),
   [tungstenite](https://github.com/snapview/tungstenite-rs),
-  [rumqttc](https://github.com/bytebeamio/rumqtt),
   [crossbeam](https://github.com/crossbeam-rs/crossbeam),
   [rayon](https://github.com/rayon-rs/rayon), [serde](https://serde.rs/),
   [toml](https://github.com/toml-rs/toml), [tracing](https://github.com/tokio-rs/tracing),

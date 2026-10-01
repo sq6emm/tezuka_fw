@@ -21,6 +21,16 @@ const GATE_DB: f32 = -40.0;
 /// ...at this ratio, by at most this much.
 const GATE_RATIO: f32 = 3.0;
 const GATE_MAX_DB: f32 = 20.0;
+/// Most gain the CESSB stage gets ahead of its clipper. This stage already
+/// levels the voice and brings it up to near full scale; driving the clipper
+/// by the whole COMP setting again would clip the levelled audio by that much
+/// a second time. A few dB is the peak trim CESSB is here for.
+pub const CESSB_DRIVE_DB: f32 = 3.0;
+
+/// The CESSB compression (dB into its clipper) for a COMP setting.
+pub fn cessb_drive_db(comp_db: f32) -> f32 {
+    comp_db.clamp(0.0, CESSB_DRIVE_DB)
+}
 
 fn coef(ms: f32) -> f32 {
     1.0 - (-1.0 / (RATE * ms / 1000.0)).exp()
@@ -54,7 +64,12 @@ impl SpeechProc {
     /// it in place: threshold at -comp_db dBFS, 4:1, make-up of 3/4 of it, so
     /// full-scale peaks stay near full scale and the rest comes up.
     pub fn process(&mut self, audio: &mut [f32], comp_db: Option<f32>) {
-        for x in audio.iter() {
+        for x in audio.iter_mut() {
+            // A NaN/inf from a client would latch the filter and detector
+            // state for the rest of the transmission.
+            if !x.is_finite() {
+                *x = 0.0;
+            }
             self.peak = self.peak.max(x.abs());
         }
         let Some(depth) = comp_db else {
@@ -142,5 +157,25 @@ mod tests {
         p.process(&mut x, None);
         assert_eq!(x, orig, "COMP off: metering only");
         assert!((p.take_peak_db() - 20.0 * 0.3f32.log10()).abs() < 0.1);
+    }
+
+    #[test]
+    fn nan_input_does_not_latch() {
+        let mut p = SpeechProc::default();
+        let mut x = tone(0.3, 4_800);
+        x[100] = f32::NAN;
+        x[200] = f32::INFINITY;
+        p.process(&mut x, Some(12.0));
+        let mut y = tone(0.3, 4_800);
+        p.process(&mut y, Some(12.0));
+        assert!(x.iter().chain(&y).all(|v| v.is_finite()));
+        assert!(rms_db(&y) > -30.0, "still passing audio");
+    }
+
+    #[test]
+    fn cessb_gets_only_a_peak_trim() {
+        assert_eq!(cessb_drive_db(0.0), 0.0);
+        assert_eq!(cessb_drive_db(2.0), 2.0);
+        assert_eq!(cessb_drive_db(12.0), CESSB_DRIVE_DB);
     }
 }

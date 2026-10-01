@@ -8,8 +8,7 @@
 **tezuka_fw_simple** is a stripped fork of tezuka_fw (a Buildroot
 `BR2_EXTERNAL` tree for Zynq-7000/AD936x SDRs), turning a PlutoSky R2 or
 LibreSDR into a headless remote transceiver (TCI + rigctld, SSB/CW/data, Q65/PI4,
-neural CW skimmer) or an IARU-R1 MGM beacon transmitter/receiver with MQTT
-output. See `docs/PLAN.md` for architecture, `docs/REFERENCE.md` for the
+neural CW skimmer) or an IARU-R1 MGM beacon transmitter/receiver. See `docs/PLAN.md` for architecture, `docs/REFERENCE.md` for the
 frequency-reference design and `docs/DATV.md` for DVB-S2 video (trxd
 `src/dvbs2/`: TX, RX, TS mux/demux; web UI DATV panel) and `docs/DATV-FPGA.md`
 for its FPGA front end (Maia DDC + ring DMA, maia-sdr branch `datv-ddc`); `docs/DATV-OTA.md` has every DATV mode over the air on every band.

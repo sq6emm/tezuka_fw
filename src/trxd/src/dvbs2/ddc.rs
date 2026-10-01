@@ -451,7 +451,10 @@ mod tests {
     fn dump_vectors_for_the_hdl() {
         let path = std::env::var("DDC_VECTORS").expect("DDC_VECTORS=<file>");
         let mut cases = Vec::new();
-        for (rs, center) in [(256e3, 100e3), (64e3, -37_500.0)] {
+        // The third case is full scale (the ADC clipping a strong signal):
+        // I and Q both near +-2047 rotate past 12 bits in the mixer, where
+        // the HDL saturates as this model does (it used to wrap).
+        for (rs, center, full) in [(256e3, 100e3, false), (64e3, -37_500.0, false), (256e3, 100e3, true)] {
             let d = design(FS, rs, 0.35).unwrap();
             let r = d.registers();
             let fw = frequency_word(center, FS);
@@ -462,7 +465,13 @@ mod tests {
                     seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
                     let n = ((seed >> 40) as i64 & 0x3FF) - 512;
                     let p = std::f64::consts::TAU * (center + rs / 5.0) * k as f64 / FS;
-                    [(1200.0 * p.cos()) as i16 + n as i16, (1200.0 * p.sin()) as i16 - (n / 2) as i16]
+                    if full {
+                        // a square-ish clipped tone: both rails most of the time
+                        let c = |v: f64| (3000.0 * v + n as f64).clamp(-2048.0, 2047.0) as i16;
+                        [c(p.cos()), c(p.sin())]
+                    } else {
+                        [(1200.0 * p.cos()) as i16 + n as i16, (1200.0 * p.sin()) as i16 - (n / 2) as i16]
+                    }
                 })
                 .collect();
             let mut m = DdcModel::new(&d, fw);
@@ -477,6 +486,27 @@ mod tests {
             }));
         }
         std::fs::write(path, serde_json::to_vec(&cases).unwrap()).unwrap();
+    }
+
+    /// Full-scale I and Q rotate beyond 12 bits: the mixer (and the HDL)
+    /// saturate instead of wrapping to the other rail.
+    #[test]
+    fn full_scale_input_saturates() {
+        let d = design(FS, 256e3, 0.35).unwrap();
+        let mut m = DdcModel::new(&d, frequency_word(FS / 8.0, FS));
+        let x = vec![[2047i16, 2047i16]; 64];
+        let mixed = m.mix(&x);
+        let lim = (1i64 << (IN_WIDTH - 1)) - 1;
+        assert!(mixed.iter().any(|v| v[0] == lim || v[1] == lim || v[0] == -lim - 1 || v[1] == -lim - 1));
+        // No sign flip: at 45 degrees the rotated sample is (0, 2895) ->
+        // (0, 2047), never a large negative value.
+        for (k, v) in mixed.iter().enumerate() {
+            let a = -std::f64::consts::TAU * k as f64 / 8.0;
+            let (re, im) = (2047.0 * (a.cos() - a.sin()), 2047.0 * (a.sin() + a.cos()));
+            for (got, want) in [(v[0], re), (v[1], im)] {
+                assert!((got as f64 - want.clamp(-2048.0, 2047.0)).abs() <= 2.0, "{k}: {got} vs {want}");
+            }
+        }
     }
 
     #[test]

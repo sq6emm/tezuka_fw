@@ -63,6 +63,8 @@ fn char_dev(dev_root: &Path, sysfs: &Path) -> PathBuf {
 pub struct IioControl {
     phy: PathBuf,
     ptt_gpio: Option<PathBuf>,
+    /// PTT line up -> RF, and RF gone -> PTT line down (relay settling).
+    ptt_delay: std::time::Duration,
     stream_rate: f64,
     tx_rf: Option<bool>,
     /// The phy's debugfs directory (1R1T channel choice, re-initialisation).
@@ -74,6 +76,8 @@ pub struct IioControl {
     /// `Some(on)` on real hardware: the FPGA filter bits to put back.
     fpga_decimation: Option<bool>,
     lo: Option<String>,
+    /// The TX LO when apart from the RX LO (cross-band DATV).
+    tx_lo: Option<String>,
     gain: Option<(GainMode, f64)>,
     atten: Option<String>,
 }
@@ -86,16 +90,45 @@ impl RadioControl for IioControl {
     fn set_lo(&mut self, hz: f64) -> Result<(), String> {
         let v = format!("{}", hz.round() as u64);
         write_attr(&self.phy, "out_altvoltage0_RX_LO_frequency", &v)?;
-        write_attr(&self.phy, "out_altvoltage1_TX_LO_frequency", &v)?;
+        let r = write_attr(&self.phy, "out_altvoltage1_TX_LO_frequency", &v);
+        self.keep_tx_lo_down();
+        r?;
         self.lo = Some(v);
+        self.tx_lo = None;
+        Ok(())
+    }
+
+    fn set_rx_lo(&mut self, hz: f64) -> Result<(), String> {
+        let v = format!("{}", hz.round() as u64);
+        write_attr(&self.phy, "out_altvoltage0_RX_LO_frequency", &v)?;
+        if self.tx_lo.is_none() {
+            self.tx_lo = self.lo.clone();
+        }
+        self.lo = Some(v);
+        Ok(())
+    }
+
+    fn apply_xo(&mut self, hz: f64) -> Result<(), String> {
+        write_attr(&self.phy, "xo_correction", &format!("{}", hz.round() as u64))?;
+        write_attr(&self.phy, "in_voltage_sampling_frequency", &self.adc_rate.to_string())?;
+        if let Some(v) = self.lo.clone() {
+            write_attr(&self.phy, "out_altvoltage0_RX_LO_frequency", &v)?;
+        }
+        if let Some(v) = self.tx_lo.clone().or_else(|| self.lo.clone()) {
+            write_attr(&self.phy, "out_altvoltage1_TX_LO_frequency", &v)?;
+        }
+        self.keep_tx_lo_down();
         Ok(())
     }
 
     fn set_los(&mut self, rx_hz: f64, tx_hz: f64) -> Result<(), String> {
         let (r, t) = (format!("{}", rx_hz.round() as u64), format!("{}", tx_hz.round() as u64));
         write_attr(&self.phy, "out_altvoltage0_RX_LO_frequency", &r)?;
-        write_attr(&self.phy, "out_altvoltage1_TX_LO_frequency", &t)?;
+        let res = write_attr(&self.phy, "out_altvoltage1_TX_LO_frequency", &t);
+        self.keep_tx_lo_down();
+        res?;
         self.lo = Some(r);
+        self.tx_lo = Some(t);
         Ok(())
     }
 
@@ -180,6 +213,8 @@ impl RadioControl for IioControl {
         }
         if let Some(v) = self.lo.clone() {
             write_attr(&self.phy, "out_altvoltage0_RX_LO_frequency", &v)?;
+        }
+        if let Some(v) = self.tx_lo.clone().or_else(|| self.lo.clone()) {
             write_attr(&self.phy, "out_altvoltage1_TX_LO_frequency", &v)?;
         }
         if let Some((mode, db)) = self.gain {
@@ -198,14 +233,30 @@ impl RadioControl for IioControl {
         if self.tx_rf == Some(on) {
             return Ok(());
         }
-        // LO first on key-down, PTT line first on key-up: the PA never sees an
-        // unlocked LO, and the relay never switches with RF on it.
+        // Key-down: PTT line, the relay settles, then the TX LO. Key-up: TX
+        // LO off, the relay settles, then the line drops. The relay never
+        // switches with RF on it. The watchdog (crate::safety) knows RF is
+        // on from the first write to the last.
         if on {
-            write_attr(&self.phy, "out_altvoltage1_TX_LO_powerdown", "0")?;
+            crate::safety::set_rf(true);
+            self.tx_rf = None;
             self.set_ptt_line(true)?;
+            if self.ptt_gpio.is_some() {
+                std::thread::sleep(self.ptt_delay);
+            }
+            write_attr(&self.phy, "out_altvoltage1_TX_LO_powerdown", "0")?;
         } else {
-            self.set_ptt_line(false)?;
-            write_attr(&self.phy, "out_altvoltage1_TX_LO_powerdown", "1")?;
+            self.tx_rf = None;
+            let lo = write_attr(&self.phy, "out_altvoltage1_TX_LO_powerdown", "1");
+            if self.ptt_gpio.is_some() {
+                std::thread::sleep(self.ptt_delay);
+            }
+            let line = self.set_ptt_line(false);
+            if lo.is_ok() && line.is_ok() {
+                crate::safety::set_rf(false);
+            }
+            lo?;
+            line?;
         }
         self.tx_rf = Some(on);
         Ok(())
@@ -228,6 +279,14 @@ fn read_gain(phy: &Path) -> Option<f64> {
 }
 
 impl IioControl {
+    /// LO writes may power the TX LO up again (set_port says the same of a
+    /// re-initialisation): while not transmitting, keep it down.
+    fn keep_tx_lo_down(&self) {
+        if self.tx_rf != Some(true) {
+            let _ = write_attr(&self.phy, "out_altvoltage1_TX_LO_powerdown", "1");
+        }
+    }
+
     fn set_ptt_line(&self, on: bool) -> Result<(), String> {
         match &self.ptt_gpio {
             Some(p) => fs::write(p, if on { "1" } else { "0" })
@@ -288,6 +347,7 @@ fn set_fpga_filters(on: bool) -> Result<(), String> {
         if p == libc::MAP_FAILED {
             return Err(format!("mmap axi_ad9361: {}", std::io::Error::last_os_error()));
         }
+        let _g = crate::dvbs2::fpga_tx::GPIO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for off in [ADC_GPIO_OUT, DAC_GPIO_OUT] {
             let r = p.cast::<u8>().add(off).cast::<u32>();
             let v = std::ptr::read_volatile(r);
@@ -333,7 +393,11 @@ pub struct IioTx {
 impl TxStream for IioTx {
     fn write(&mut self, iq: &[Complex32]) -> Result<(), String> {
         self.raw.clear();
-        for z in iq {
+        for &z in iq {
+            // Limit the envelope, not I and Q apart: clipping the axes alone
+            // distorts the phase and splatters.
+            let a = z.norm_sqr();
+            let z = if a > 1.0 { z / a.sqrt() } else if a.is_nan() { Complex32::default() } else { z };
             let i = (z.re.clamp(-1.0, 1.0) * TX_SCALE) as i16;
             let q = (z.im.clamp(-1.0, 1.0) * TX_SCALE) as i16;
             self.raw.push(i.to_le());
@@ -382,6 +446,7 @@ pub fn open(cfg: &RadioConfig) -> Result<Radio, String> {
         .map_err(|e| format!("TX buffer: {e}"))?;
 
     let ptt_gpio = (!cfg.ptt_gpio.is_empty()).then(|| PathBuf::from(&cfg.ptt_gpio));
+    crate::safety::register(phy.clone(), ptt_gpio.clone());
     // Port switching needs 1R1T and the driver's debugfs knobs.
     let debug = phy
         .file_name()
@@ -399,6 +464,7 @@ pub fn open(cfg: &RadioConfig) -> Result<Radio, String> {
         control: Box::new(IioControl {
             phy,
             ptt_gpio,
+            ptt_delay: std::time::Duration::from_millis(cfg.ptt_delay_ms as u64),
             stream_rate: cfg.stream_rate(),
             tx_rf: None,
             debug,
@@ -407,6 +473,7 @@ pub fn open(cfg: &RadioConfig) -> Result<Radio, String> {
             rf_bandwidth: cfg.rf_bandwidth,
             fpga_decimation: (cfg.iio_root == "/sys/bus/iio/devices").then_some(cfg.fpga_decimation),
             lo: None,
+            tx_lo: None,
             gain: None,
             atten: None,
         }),
@@ -484,12 +551,15 @@ mod tests {
         assert_eq!(buf[0], Complex32::new(0.5, -1.0));
         assert!((buf[1].im - 2047.0 / 2048.0).abs() < 1e-6);
 
-        radio.tx.write(&[Complex32::new(1.0, -1.0)]).unwrap();
+        // Inside the unit circle as it is; outside, the envelope limited
+        // (the phase kept), not I and Q clipped apart.
+        radio.tx.write(&[Complex32::new(0.6, -0.8), Complex32::new(1.0, -1.0)]).unwrap();
         let tx = fs::read(t.path().join("dev/iio:device1")).unwrap();
-        let i = i16::from_le_bytes([tx[0], tx[1]]);
-        let q = i16::from_le_bytes([tx[2], tx[3]]);
-        assert_eq!(i, (TX_SCALE) as i16);
-        assert_eq!(q, -(TX_SCALE as i16));
+        let w = |k: usize| i16::from_le_bytes([tx[2 * k], tx[2 * k + 1]]);
+        assert_eq!(w(0), (0.6 * TX_SCALE) as i16);
+        assert_eq!(w(1), (-0.8 * TX_SCALE) as i16);
+        assert_eq!(w(2), (std::f32::consts::FRAC_1_SQRT_2 * TX_SCALE) as i16);
+        assert_eq!(w(3), (-std::f32::consts::FRAC_1_SQRT_2 * TX_SCALE) as i16);
     }
 
     #[test]

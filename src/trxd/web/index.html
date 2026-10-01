@@ -733,8 +733,8 @@ function renderPorts(st) {
   if (st.port == null) { box.innerHTML = `<span class="note">this radio cannot switch sockets (needs the AD936x in 1R1T mode)</span>`; return; }
   const keys = BANDS.map(([n]) => n.toUpperCase()).concat((st.xvtrs || []).map((t) => t.name), ["GEN"]);
   const map = st.ports || {};
-  box.innerHTML = keys.map((k) => `<label class="note" style="display:inline-flex;gap:4px;align-items:center;margin-right:10px">${k === "GEN" ? "other" : k}
-    <select data-port-band="${k}">${[[0, "manual"], [1, "RX1·TX1"], [2, "RX2·TX2"]].map(([v, l]) => `<option value="${v}"${(map[k] || 0) === v ? " selected" : ""}>${l}</option>`).join("")}</select></label>`).join("");
+  box.innerHTML = keys.map((k) => `<label class="note" style="display:inline-flex;gap:4px;align-items:center;margin-right:10px">${k === "GEN" ? "other" : escHtml(k)}
+    <select data-port-band="${escHtml(k)}">${[[0, "manual"], [1, "RX1·TX1"], [2, "RX2·TX2"]].map(([v, l]) => `<option value="${v}"${(map[k] || 0) === v ? " selected" : ""}>${l}</option>`).join("")}</select></label>`).join("");
   box.querySelectorAll("select").forEach((sel) => sel.onchange = () => send({ cmd: "port_map", band: sel.dataset.portBand, port: +sel.value }));
 }
 function renderCal(st) {

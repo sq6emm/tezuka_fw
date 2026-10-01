@@ -1,0 +1,68 @@
+#!/bin/sh
+#
+# Keep a copy of the U-Boot environment in jffs2, and put it back if the
+# flash copy is lost.
+#
+# The environment has a single copy in flash (U-Boot is never rewritten by
+# fw-update, so it cannot be switched to a redundant environment on boards
+# already in the field: docs/FLASH.md). A power cut while it is being written
+# (fw-update, fw_setenv, or U-Boot's own boot counting while a new slot is
+# tried) leaves a bad CRC. U-Boot then boots its built-in defaults, which
+# boot slot A; the A/B scripts, the boot counter and the network settings
+# (ipaddr_eth, gateway_eth, hostname) are gone.
+#
+# Here, after jffs2 is mounted and before the network starts:
+# - bad CRC and a saved copy: restore every saved variable, except that the
+#   slot becomes the one running now and no update is pending (the running
+#   slot boots, so it is the one to keep); logged in fw-update.log;
+# - good CRC and no update pending (a confirmed slot): save the environment
+#   if it changed since the last copy.
+
+BAK=/mnt/jffs2/uboot-env.bak
+LOG=/mnt/jffs2/fw-update.log
+
+running_slot() {
+	s=$(sed -n 's/.* UBOOT_SLOT=\([ab]\).*/\1/p; s/^UBOOT_SLOT=\([ab]\).*/\1/p' /proc/cmdline)
+	echo "${s:-a}"
+}
+
+restore() {
+	tmp=/tmp/uboot-env.restore
+	sed -n 's/^\([^=]*\)=\(.*\)$/\1 \2/p' "$BAK" |
+		grep -v -E '^(slot|upgrade_available|bootcount|rolled_back|env_restored) ' > "$tmp"
+	printf '%s\n' "slot $(running_slot)" "upgrade_available 0" "bootcount 0" "env_restored 1" >> "$tmp"
+	if fw_setenv -s "$tmp"; then
+		echo "$(date '+%F %T') S20uenv: U-Boot environment had a bad CRC; restored from $BAK (slot $(running_slot))" >> "$LOG"
+		logger -t uenv "U-Boot environment restored from $BAK"
+		echo "restored from $BAK"
+	else
+		echo "FAILED to restore"
+	fi
+	rm -f "$tmp"
+}
+
+backup() {
+	[ "$(fw_printenv -n upgrade_available 2>/dev/null)" = "1" ] && return 0
+	fw_printenv > "$BAK.new" 2>/dev/null || { rm -f "$BAK.new"; return 0; }
+	if [ -s "$BAK.new" ] && ! cmp -s "$BAK.new" "$BAK"; then
+		mv "$BAK.new" "$BAK"
+	else
+		rm -f "$BAK.new"
+	fi
+}
+
+case "$1" in
+start)
+	grep -q ' /mnt/jffs2 ' /proc/mounts || exit 0
+	printf "U-Boot environment: "
+	if fw_printenv 2>&1 >/dev/null | grep -q 'Bad CRC'; then
+		if [ -s "$BAK" ]; then restore; else echo "bad CRC, no saved copy"; fi
+	else
+		backup
+		echo "OK"
+	fi
+	;;
+stop|restart|reload) ;;
+*) echo "Usage: $0 {start}"; exit 1 ;;
+esac
+exit 0

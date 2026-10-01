@@ -13,6 +13,11 @@
 //!
 //! Frequency error up to about +-1.5 kHz is pulled in by the header at
 //! increasing lags; the pilots then hold it to a fraction of a hertz.
+//!
+//! Other PLFRAMEs on the carrier (dummy frames, EN 302 307-1 5.5.1, and
+//! frames of other MODCODs or sizes, VCM) are recognised by their PLS code
+//! when locked and stepped over by their own length; only the configured
+//! MODCOD is decoded (a frame of another one counts as lost for the TS).
 
 use std::collections::VecDeque;
 
@@ -68,6 +73,42 @@ pub struct Stats {
     /// Es/N0 of the last frame's data symbols, decision-directed (a check on
     /// phase and timing between the known blocks), dB.
     pub data_esn0_db: f32,
+    /// Frames stepped over: dummy PLFRAMEs / frames of another MODCOD or size.
+    pub frames_dummy: u64,
+    pub frames_other: u64,
+    /// BBFRAMEs decoded but not taken: MATYPE other than TS, single stream,
+    /// no ISSY, no null-packet deletion, UPL 1504 (or a bad DFL / SYNCD).
+    pub bb_unsupported: u64,
+    /// User packets whose CRC-8 (EN 302 307-1 5.1.4) failed: passed on with
+    /// transport_error_indicator set.
+    pub ts_crc_bad: u64,
+    /// DVB-T2 blocks in DDR whose router buffer was reused before they were
+    /// decoded (the decoder more than three frames behind): dropped.
+    pub blocks_lapped: u64,
+}
+
+/// Length (symbols) of a PLFRAME with this PLS; None for reserved MODCODs.
+pub fn plframe_len(modcod: u8, short: bool, pilots: bool) -> Option<usize> {
+    if modcod == 0 {
+        // Dummy PLFRAME: header and 36 slots, no pilots.
+        return Some(SLOT + 36 * SLOT);
+    }
+    let bps = match modcod {
+        1..=11 => 2,
+        12..=17 => 3,
+        18..=23 => 4,
+        24..=28 => 5,
+        _ => return None,
+    };
+    let slots = if short { 16_200 } else { 64_800 } / bps / SLOT;
+    Some(SLOT + slots * SLOT + if pilots { (slots - 1) / 16 * PILOT } else { 0 })
+}
+
+/// A PLFRAME the receiver steps over: its PLS, length and header.
+struct Other {
+    modcod: u8,
+    len: usize,
+    header: Vec<Complex32>,
 }
 
 pub struct Receiver {
@@ -134,6 +175,10 @@ pub struct Receiver {
     /// in step with `syms` (only when `flagged`): the search looks there only.
     flags: Vec<bool>,
     flagged: bool,
+    /// Every other PLFRAME type (dummy, other MODCODs and sizes).
+    others: Vec<Other>,
+    /// The frame at `locked_at`: ours (None) or `others[i]`.
+    cur: Option<usize>,
 }
 
 /// LDPC + BBFRAME -> TS: the expensive part, which can run on its own core.
@@ -145,6 +190,8 @@ pub struct Fec {
     bits: Vec<u8>,
     partial: Vec<u8>,
     have_prev: bool,
+    /// BBFRAMEs with an unsupported MATYPE so far (logged once).
+    matype_warned: bool,
 }
 
 enum FecMode {
@@ -160,7 +207,7 @@ pub static FEC_PROF_NS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::
 impl Fec {
     pub fn new(spec: FrameSpec) -> Self {
         let bch = Some(if spec.is_short() { Bch::short() } else { Bch::new() });
-        Fec { spec, dec: Ldpc::for_spec(&spec), bch, bbscr: bb_scrambling(spec.kbch / 8), bits: vec![0; spec.n], partial: Vec::new(), have_prev: false }
+        Fec { spec, dec: Ldpc::for_spec(&spec), bch, bbscr: bb_scrambling(spec.kbch / 8), bits: vec![0; spec.n], partial: Vec::new(), have_prev: false, matype_warned: false }
     }
 
     /// Decode one frame of LLRs; TS packets out. False if it did not decode.
@@ -317,6 +364,20 @@ impl Receiver {
             symbol_input: false,
             flags: Vec::new(),
             flagged: false,
+            others: {
+                let mut v = Vec::new();
+                for modcod in 0..=28u8 {
+                    for (short, pilots) in [(false, false), (false, true), (true, false), (true, true)] {
+                        if modcod == spec.modcod && short == spec.is_short() && pilots == spec.pilots {
+                            continue;
+                        }
+                        let len = plframe_len(modcod, short, pilots).unwrap();
+                        v.push(Other { modcod, len, header: super::plheader_typed(modcod, pilots, short) });
+                    }
+                }
+                v
+            },
+            cur: None,
         }
     }
 
@@ -448,17 +509,60 @@ impl Receiver {
     /// Normalized header correlation at symbol `k` (0..1), chunked coherent
     /// (10 symbols) so a frequency error of a few hundred Hz does not hurt.
     fn header_metric(&self, k: usize) -> f32 {
+        self.header_metric_with(k, &self.header)
+    }
+
+    fn header_metric_with(&self, k: usize, header: &[Complex32]) -> f32 {
         let s = &self.syms[k..k + SLOT];
         let (mut num, mut den) = (0f32, 0f32);
         for c in 0..SLOT / 10 {
             let mut acc = Complex32::default();
             for i in c * 10..c * 10 + 10 {
-                acc += s[i] * self.header[i].conj();
+                acc += s[i] * header[i].conj();
                 den += s[i].norm();
             }
             num += acc.norm();
         }
         num / den.max(1e-20)
+    }
+
+    /// Another PLFRAME's header in `lo..=hi`: the best SOF position (two
+    /// coherent chunks of 13, as the FPGA's [`super::hdrdet`]), then every
+    /// other PLS code there. (position, metric, index into `others`) when
+    /// one reaches [`SYNC_MIN`].
+    fn other_at(&self, lo: usize, hi: usize) -> Option<(usize, f32, usize)> {
+        let sof = |k: usize| -> f32 {
+            let (mut num, mut den) = (0f32, 0f32);
+            for c in 0..2 {
+                let mut acc = Complex32::default();
+                for i in c * 13..c * 13 + 13 {
+                    acc += self.syms[k + i] * self.header[i].conj();
+                    den += self.syms[k + i].norm();
+                }
+                num += acc.norm();
+            }
+            num / den.max(1e-20)
+        };
+        let k = (lo..=hi).max_by(|&a, &b| sof(a).total_cmp(&sof(b)))?;
+        let (i, m) = self.others.iter().enumerate().map(|(i, o)| (i, self.header_metric_with(k, &o.header))).max_by(|a, b| a.1.total_cmp(&b.1))?;
+        (m >= SYNC_MIN).then_some((k, m, i))
+    }
+
+    /// A frame of another type was stepped over.
+    fn skip_other(&mut self, i: usize) {
+        if self.others[i].modcod == 0 {
+            // No BBFRAME: the TS continues in the next frame.
+            self.stats.frames_dummy += 1;
+            return;
+        }
+        // Part of the stream we cannot decode: the packet straddling it is lost.
+        self.stats.frames_other += 1;
+        match &mut self.fec {
+            FecMode::Inline(f) => f.lost(),
+            FecMode::Thread { tx, .. } => {
+                let _ = tx.try_send(Vec::new());
+            }
+        }
     }
 
     /// The best header position in `start..end`: [`Self::header_metric`],
@@ -483,7 +587,7 @@ impl Receiver {
             for k in start..end {
                 if self.flags.get(k + last) == Some(&true) {
                     let m = self.header_metric(k);
-                    if m > best.1 {
+                    if m > best.1 && !self.other_beats(k, m) {
                         best = (k, m);
                     }
                 }
@@ -515,11 +619,17 @@ impl Receiver {
                 continue;
             }
             let m = self.header_metric(k);
-            if m > best.1 {
+            if m > best.1 && !self.other_beats(k, m) {
                 best = (k, m);
             }
         }
         best
+    }
+
+    /// Another PLS code fits the header at `k` better than ours (`m`): all
+    /// share the SOF, which alone makes over a quarter of our metric.
+    fn other_beats(&self, k: usize, m: f32) -> bool {
+        m >= SYNC_MIN && self.others.iter().any(|o| self.header_metric_with(k, &o.header) > m)
     }
 
     fn frames(&mut self, out: &mut Vec<[u8; TS_LEN]>) {
@@ -534,11 +644,19 @@ impl Receiver {
                         return;
                     }
                     let end = need - SLOT;
-                    let (best, m) = self.search(start, end);
+                    let (mut best, mut m) = self.search(start, end);
+                    if m < SYNC_MIN && self.candidate.is_some() {
+                        // One frame after ours a dummy or another MODCOD's
+                        // header confirms it as well.
+                        if let Some((k, mo, _)) = self.other_at(start, end - 1) {
+                            (best, m) = (k, mo);
+                        }
+                    }
                     if m >= SYNC_MIN {
                         if let Some(first) = self.candidate.and(best.checked_sub(l)) {
                             // Two headers one frame apart: locked.
                             self.locked_at = Some(first);
+                            self.cur = None;
                             self.missed = 0;
                             self.frames_locked = 0;
                             self.acq = [Complex32::default(); 3];
@@ -562,24 +680,41 @@ impl Receiver {
                     }
                 }
                 Some(p) => {
+                    // This frame's length: ours, or the one stepped over.
+                    let l = self.cur.map_or(l, |i| self.others[i].len);
                     // A frame is ready once the next header can be checked.
                     if self.syms.len() < p + l + TRACK_SLACK + SLOT {
                         return;
                     }
                     let lo = p + l - TRACK_SLACK;
-                    let (next, m) = (lo..=p + l + TRACK_SLACK).map(|k| (k, self.header_metric(k))).fold((lo, 0f32), |a, b| if b.1 > a.1 { b } else { a });
+                    let (mut next, mut m) = (lo..=p + l + TRACK_SLACK).map(|k| (k, self.header_metric(k))).fold((lo, 0f32), |a, b| if b.1 > a.1 { b } else { a });
+                    // Not ours: a dummy frame or another MODCOD (by its PLS code).
+                    // (All share the SOF: a header of another PLS can pass
+                    // ours; the better fit wins.)
+                    let mut kind = None;
+                    if let Some((k, mo, i)) = self.other_at(lo, p + l + TRACK_SLACK) {
+                        if mo > m {
+                            (next, m, kind) = (k, mo, Some(i));
+                        }
+                    }
                     if std::env::var_os("DVBS2_DEBUG").is_some() {
-                        eprintln!("frame: next header at {:+} (metric {m:.2})", next as i64 - (p + l) as i64);
+                        eprintln!("frame: next header at {:+} (metric {m:.2}, {})", next as i64 - (p + l) as i64, kind.map_or("ours".to_string(), |i| format!("modcod {}", self.others[i].modcod)));
                     }
                     let next = if m >= SYNC_MIN {
                         self.missed = 0;
                         next
                     } else {
                         self.missed += 1;
+                        kind = None;
                         p + l
                     };
-                    self.frame(p, next, out);
+                    match self.cur {
+                        None => self.frame(p, next, kind, out),
+                        Some(i) => self.skip_other(i),
+                    }
+                    self.cur = kind;
                     if self.missed >= LOST_AFTER {
+                        self.cur = None;
                         self.locked_at = None;
                         self.candidate = None;
                         self.stats.locked = false;
@@ -607,6 +742,11 @@ impl Receiver {
     /// acquisition sees with the NCO held) comes out with its phase flipped,
     /// and the frame's fit an alias (rs / 1476) off for good.
     fn block(&self, base: usize, at: usize, len: usize, f: f64) -> Complex32 {
+        self.block_with(base, at, len, f, &self.header)
+    }
+
+    /// [`Self::block`] with the header of the frame at `base` given.
+    fn block_with(&self, base: usize, at: usize, len: usize, f: f64, header: &[Complex32]) -> Complex32 {
         let mut acc = Complex32::default();
         let a = std::f32::consts::FRAC_1_SQRT_2;
         let w = -std::f64::consts::TAU * f / self.rs;
@@ -615,7 +755,7 @@ impl Receiver {
             let ph = w * (i as f64 - mid);
             let s = self.syms[base + at + i] * Complex32::new(ph.cos() as f32, ph.sin() as f32);
             let r = if at == 0 {
-                self.header[i]
+                header[i]
             } else {
                 // Pilots: (1+j)/sqrt2, PL-scrambled like the data.
                 super::rotate(Complex32::new(a, a), self.scramble[at - SLOT + i])
@@ -646,7 +786,9 @@ impl Receiver {
         self.nco *= Complex32::new(ph.cos() as f32, ph.sin() as f32);
     }
 
-    fn frame(&mut self, p: usize, next: usize, out: &mut Vec<[u8; TS_LEN]>) {
+    /// One frame of ours at `p`; the next header at `next` is ours (`kind`
+    /// None) or `others[i]`'s.
+    fn frame(&mut self, p: usize, next: usize, kind: Option<usize>, out: &mut Vec<[u8; TS_LEN]>) {
         let rs = self.rs;
         // Header: frequency at increasing lags (+-rs/2, then finer).
         let z: Vec<Complex32> = (0..SLOT).map(|i| self.syms[p + i] * self.header[i].conj()).collect();
@@ -678,7 +820,8 @@ impl Receiver {
             pts.push(((at + len / 2) as f64, c.arg() as f64, c.norm() * len as f32));
         }
         if with_next {
-            let c = self.block(next, 0, SLOT, f);
+            let h = kind.map_or(&self.header, |i| &self.others[i].header);
+            let c = self.block_with(next, 0, SLOT, f, h);
             pts.push(((next - p + SLOT / 2) as f64, c.arg() as f64, c.norm() * SLOT as f32));
         }
         // Unwrap against a predicted frequency, fit a line (weighted least
@@ -935,20 +1078,57 @@ impl Fec {
             self.have_prev = false;
             return false;
         }
-        let dfl = u16::from_be_bytes([bb[4], bb[5]]) as usize / 8;
-        let syncd = u16::from_be_bytes([bb[7], bb[8]]) as usize / 8;
-        let data = &bb[BBHEADER..(BBHEADER + dfl).min(n)];
-        // The tail of a packet that began in the previous frame.
+        // MATYPE-1 (EN 302 307-1 5.1.6): TS, single input stream, no ISSY,
+        // no null-packet deletion (CCM/ACM and roll-off free); UPL 188 bytes.
+        // Anything else is a stream this deframer would misparse.
+        let upl = u16::from_be_bytes([bb[2], bb[3]]);
+        let dfl_bits = u16::from_be_bytes([bb[4], bb[5]]) as usize;
+        let syncd_bits = u16::from_be_bytes([bb[7], bb[8]]);
+        let reason = if bb[0] & 0xEC != 0xE0 {
+            Some("MATYPE")
+        } else if upl as usize != TS_LEN * 8 {
+            Some("UPL")
+        } else if dfl_bits % 8 != 0 || dfl_bits / 8 > n - BBHEADER {
+            Some("DFL")
+        } else if syncd_bits != 0xFFFF && (syncd_bits % 8 != 0 || syncd_bits as usize > dfl_bits) {
+            Some("SYNCD")
+        } else {
+            None
+        };
+        if let Some(what) = reason {
+            stats.bb_unsupported += 1;
+            if !self.matype_warned {
+                self.matype_warned = true;
+                tracing::warn!(matype = format!("{:02x} {:02x}", bb[0], bb[1]), upl, dfl = dfl_bits, syncd = syncd_bits, "DATV: BBFRAME {what} not supported (TS, single stream, no ISSY/NPD only): not taken");
+            }
+            self.partial.clear();
+            self.have_prev = false;
+            // Decoded fine (the carrier is right): not a failure to re-acquire on.
+            return true;
+        }
+        let data = &bb[BBHEADER..BBHEADER + dfl_bits / 8];
+        if syncd_bits == 0xFFFF {
+            // No packet starts in this data field: all of it continues one.
+            if self.have_prev && self.partial.len() + data.len() < TS_LEN {
+                self.partial.extend_from_slice(data);
+            } else {
+                self.partial.clear();
+                self.have_prev = false;
+            }
+            return true;
+        }
+        let syncd = syncd_bits as usize / 8;
+        // The tail of a packet that began in the previous frame; its CRC-8 is
+        // in the next packet's first byte (when that is in this frame).
         if self.have_prev && syncd <= data.len() && self.partial.len() + syncd == TS_LEN {
             let mut up = std::mem::take(&mut self.partial);
             up.extend_from_slice(&data[..syncd]);
-            self.emit(&up, stats, out);
+            self.emit(&up, data.get(syncd).copied(), stats, out);
         }
         self.partial.clear();
         let mut i = syncd;
         while i + TS_LEN <= data.len() {
-            let up = data[i..i + TS_LEN].to_vec();
-            self.emit(&up, stats, out);
+            self.emit(&data[i..i + TS_LEN], data.get(i + TS_LEN).copied(), stats, out);
             i += TS_LEN;
         }
         self.partial.extend_from_slice(&data[i.min(data.len())..]);
@@ -956,11 +1136,18 @@ impl Fec {
         true
     }
 
-    /// One user packet: its first byte is the CRC-8 of the packet before.
-    fn emit(&mut self, up: &[u8], stats: &mut Stats, out: &mut Vec<[u8; TS_LEN]>) {
+    /// One user packet: its first byte is the CRC-8 of the packet before;
+    /// `check` (the next packet's first byte, when known) is this one's. A
+    /// mismatch sets the transport_error_indicator (TS packets passed on as
+    /// a demodulator does, EN 302 307-1 5.1.4).
+    fn emit(&mut self, up: &[u8], check: Option<u8>, stats: &mut Stats, out: &mut Vec<[u8; TS_LEN]>) {
         let mut pkt = [0u8; TS_LEN];
         pkt.copy_from_slice(up);
         pkt[0] = 0x47;
+        if check.is_some_and(|c| c != crc8(&pkt[1..])) {
+            pkt[1] |= 0x80;
+            stats.ts_crc_bad += 1;
+        }
         stats.packets += 1;
         out.push(pkt);
     }
@@ -1047,7 +1234,29 @@ impl FecBlock for crate::dvbt2::stream::T2Block {
         match self {
             crate::dvbt2::stream::T2Block::Llr(v) => fec.frame_q(v, st, ts),
             crate::dvbt2::stream::T2Block::Cells(c, p) => fec.frame_cells(c, p, st, ts),
-            crate::dvbt2::stream::T2Block::Ddr(a, p) => fec.frame_ddr(*a, p, st, ts),
+            crate::dvbt2::stream::T2Block::Ddr(a, p, tag) => {
+                // The router reuses its buffers about a second later: a
+                // block whose buffer was taken before or while it was
+                // decoded is lost, not decoded from another frame's cells.
+                let lapped = |st: &mut Stats| {
+                    st.frames_bad += 1;
+                    st.blocks_lapped += 1;
+                };
+                if tag.as_ref().is_some_and(|t| !t.holds()) {
+                    lapped(st);
+                    fec.lost();
+                    return false;
+                }
+                let n0 = ts.len();
+                let ok = fec.frame_ddr(*a, p, st, ts);
+                if tag.as_ref().is_some_and(|t| !t.holds()) {
+                    ts.truncate(n0);
+                    lapped(st);
+                    fec.lost();
+                    return false;
+                }
+                ok
+            }
         }
     }
     fn dump(&self) -> Vec<u8> {
@@ -1546,6 +1755,9 @@ impl RxThread {
         st.ldpc_fail = f.ldpc_fail;
         st.crc_fail = f.crc_fail;
         st.packets = f.packets;
+        st.bb_unsupported = f.bb_unsupported;
+        st.ts_crc_bad = f.ts_crc_bad;
+        st.blocks_lapped = f.blocks_lapped;
         st.ldpc_s = f.ldpc_s;
         st.blocks_dropped = self.dropped.load(std::sync::atomic::Ordering::Relaxed);
         st.wall_s = self.started.elapsed().as_secs_f64();
@@ -1672,6 +1884,119 @@ pub(crate) mod tests {
             rx.process(c, &mut out);
         }
         assert!(rx.stats.locked && out.len() >= 21, "{} packets, {:?}", out.len(), rx.stats);
+    }
+
+    /// Dummy PLFRAMEs and a frame of another MODCOD between ours (5.5.1,
+    /// VCM): stepped over by their PLS, lock held, every packet of ours
+    /// back except the one straddling the foreign frame.
+    #[test]
+    fn steps_over_dummy_and_other_modcod_frames() {
+        use super::super::fpga_tx::LongMode;
+        use super::super::{pl_scrambling, plheader_typed, rotate};
+        let spec = FrameSpec::long(LongMode::Qpsk12);
+        let l = spec.frame_symbols();
+        let mut next = counter_packets();
+        let ours = long_symbols(LongMode::Qpsk12, 9, &mut next);
+        let a = std::f32::consts::FRAC_1_SQRT_2;
+        let dummy = {
+            let mut v = plheader_typed(0, false, false);
+            let scr = pl_scrambling(36 * SLOT);
+            v.extend((0..36 * SLOT).map(|k| rotate(Complex32::new(a, a), scr[k])));
+            assert_eq!(v.len(), plframe_len(0, false, false).unwrap());
+            v
+        };
+        let other = {
+            // QPSK 3/5 short with pilots: random data, right length.
+            let len = plframe_len(5, true, true).unwrap();
+            let mut v = plheader_typed(5, true, true);
+            let mut x = 7u32;
+            while v.len() < len {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                v.push(Complex32::new(if x & 0x10000 != 0 { a } else { -a }, if x & 0x20000 != 0 { a } else { -a }));
+            }
+            v
+        };
+        // ours x3, dummy, ours, dummy x2, ours, other, ours x4
+        let mut syms = Vec::new();
+        let mut f = ours.chunks(l);
+        for _ in 0..3 {
+            syms.extend_from_slice(f.next().unwrap());
+        }
+        syms.extend_from_slice(&dummy);
+        syms.extend_from_slice(f.next().unwrap());
+        syms.extend_from_slice(&dummy);
+        syms.extend_from_slice(&dummy);
+        syms.extend_from_slice(f.next().unwrap());
+        syms.extend_from_slice(&other);
+        for c in f {
+            syms.extend_from_slice(c);
+        }
+        // a little noise and a carrier phase
+        let mut seed = 3u64;
+        let mut g = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.3
+        };
+        let rot = Complex32::from_polar(1.0, 0.7);
+        let x: Vec<Complex32> = syms.iter().map(|z| z * rot + Complex32::new(g(), g())).collect();
+        let mut rx = Receiver::new_symbols_spec(spec, 250e3, 0.0);
+        let mut out = Vec::new();
+        for c in x.chunks(4096) {
+            rx.process(c, &mut out);
+        }
+        let s = rx.stats;
+        assert!(s.locked, "{s:?}");
+        assert_eq!((s.frames_dummy, s.frames_other), (3, 1), "{s:?}");
+        let data: Vec<u32> = out.iter().filter(|p| p[1..3] != [0x1F, 0xFF]).map(|p| u32::from_be_bytes(p[1..5].try_into().unwrap())).collect();
+        let gaps: Vec<u32> = data.windows(2).map(|w| w[1] - w[0]).filter(|&d| d != 1).collect();
+        assert_eq!(gaps, vec![2], "packets {} first {:?} {s:?}", data.len(), data.first());
+        // 9 frames of ours, about 21.4 packets each: the first two or three
+        // go to acquisition.
+        assert!(data.len() >= 6 * 21, "{} packets {s:?}", data.len());
+        assert_eq!(s.ts_crc_bad, 0);
+    }
+
+    /// MATYPE: a BBFRAME that is not TS / single stream / no ISSY / no NPD
+    /// is not taken (counted), the stream continues after it.
+    #[test]
+    fn rejects_unsupported_matype() {
+        use super::super::fpga_tx::LongMode;
+        use super::super::{Framer, bb_scrambling};
+        let spec = FrameSpec::long(LongMode::Qpsk12);
+        let mut fec = Fec::new(spec);
+        let mut framer = Framer::new();
+        let mut next = counter_packets();
+        let bbscr = bb_scrambling(spec.kbch / 8);
+        let mut st = Stats::default();
+        let mut out = Vec::new();
+        for (i, npd) in [false, true, false].into_iter().enumerate() {
+            let mut bb = framer.frame_bytes(spec.kbch / 8, 0, &mut next);
+            if npd {
+                bb[0] |= 0x04;
+                bb[9] = crc8(&bb[..9]);
+            }
+            for (k, byte) in bb.iter().enumerate() {
+                for b in 0..8 {
+                    fec.bits[k * 8 + b] = ((byte ^ bbscr[k]) >> (7 - b)) & 1;
+                }
+            }
+            assert!(fec.deframe(&mut st, &mut out), "frame {i}");
+        }
+        assert_eq!(st.bb_unsupported, 1);
+        // first frame's packets, then the third's (its first whole one on)
+        assert!(out.len() >= 2 * 20, "{}", out.len());
+        // a corrupted packet byte: the TEI set on it
+        let mut bb = framer.frame_bytes(spec.kbch / 8, 0, &mut next);
+        bb[BBHEADER + 300] ^= 0x10;
+        for (k, byte) in bb.iter().enumerate() {
+            for b in 0..8 {
+                fec.bits[k * 8 + b] = ((byte ^ bbscr[k]) >> (7 - b)) & 1;
+            }
+        }
+        out.clear();
+        fec.deframe(&mut st, &mut out);
+        assert_eq!(st.ts_crc_bad, 1);
+        assert_eq!(out.iter().filter(|p| p[1] & 0x80 != 0).count(), 1);
     }
 
     pub(crate) fn counter_packets() -> impl FnMut() -> [u8; TS_LEN] {

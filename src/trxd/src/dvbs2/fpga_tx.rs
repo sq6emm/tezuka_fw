@@ -33,18 +33,27 @@ const RAW8_BIT: u32 = 1 << 3;
 /// interpolator (maia-hdl t2ifft.py): the words are, per T2 frame, a sync
 /// word, P1's samples and each symbol's carriers.
 const IFFT_BIT: u32 = 1 << 4;
+/// Every DATV bit of the DAC GPIO register.
+const ALL_BITS: u32 = DATV_BIT | RAW_BIT | RAW8_BIT | IFFT_BIT;
+/// Held over every read-modify-write of the axi_ad9361 GPIO registers
+/// (DAC 0x790240BC here, both in radio/iio.rs: bit 0 the x8 filters): two
+/// threads changing different bits at once lose one write.
+pub static GPIO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const ID_DTX1: u32 = 0x3158_5444;
 /// The same transmitter with the DVB-T2 IFFT in front of it.
 const ID_DTX2: u32 = 0x3258_5444;
+/// DTX2 with the underflow counter at 0x10 (datv_merge.v: DAC requests it
+/// had no sample for since DATV was selected; zeros went out instead).
+const ID_DTX3: u32 = 0x3358_5444;
 
 fn tx_id(id: u32) -> bool {
-    id == ID_DTX1 || id == ID_DTX2
+    id == ID_DTX1 || id == ID_DTX2 || id == ID_DTX3
 }
 
 /// The bitstream does the DVB-T2 transmit IFFT (see [`RawMode::T2Ifft`]).
 pub fn has_t2ifft() -> bool {
     let Ok(mem) = open_mem() else { return false };
-    Mapping::new(&mem, 4096, DATV_TX_PHYS).is_ok_and(|r| r.rd32(0xC) == ID_DTX2)
+    Mapping::new(&mem, 4096, DATV_TX_PHYS).is_ok_and(|r| matches!(r.rd32(0xC), ID_DTX2 | ID_DTX3))
 }
 
 /// What the raw DMA words are.
@@ -148,6 +157,13 @@ impl Mapping {
         // SAFETY: see new().
         unsafe { std::ptr::write_volatile(self.ptr.add(off).cast::<u32>(), v) }
     }
+    /// The DAC GPIO register: `clear` bits off, then `set` on, under
+    /// [`GPIO_LOCK`].
+    fn dac_gpio(&self, clear: u32, set: u32) {
+        let _g = GPIO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let g = self.rd32(DAC_GPIO_OUT);
+        self.wr32(DAC_GPIO_OUT, (g & !clear) | set);
+    }
 }
 
 impl Drop for Mapping {
@@ -161,6 +177,15 @@ impl Drop for Mapping {
 
 fn open_mem() -> Result<File, String> {
     OpenOptions::new().read(true).write(true).custom_flags(libc::O_SYNC).open("/dev/mem").map_err(|e| format!("/dev/mem: {e}"))
+}
+
+/// Before the PL is reloaded (fpgamode): the DAC back on IQ, the DATV
+/// encoder held in reset.
+pub fn quiesce() {
+    let Ok(mem) = open_mem() else { return };
+    if let Ok(ad9361) = Mapping::new(&mem, 0x1_0000, AD9361_PHYS) {
+        ad9361.dac_gpio(ALL_BITS, 0);
+    }
 }
 
 /// Does the bitstream have the DATV transmitter?
@@ -252,6 +277,38 @@ pub struct Transmitter {
     ad9361: Mapping,
     pub mode: LongMode,
     framer: Framer,
+    under: Underflows,
+}
+
+/// The DAC underflow counter (DTX3), followed: a growth means the feed
+/// fell behind and zeros went on air in the middle of frames.
+struct Underflows {
+    has: bool,
+    last: u16,
+    frames: u32,
+    logged: Option<std::time::Instant>,
+}
+
+impl Underflows {
+    fn new(regs: &Mapping) -> Self {
+        Underflows { has: regs.rd32(0xC) == ID_DTX3, last: 0, frames: 0, logged: None }
+    }
+    /// Every 32 frames: the count, said at most every 10 s.
+    fn check(&mut self, regs: &Mapping) {
+        self.frames += 1;
+        if !self.has || self.frames % 32 != 0 {
+            return;
+        }
+        let n = regs.rd32(0x10) as u16;
+        if n != self.last {
+            let new = n.wrapping_sub(self.last);
+            self.last = n;
+            if self.logged.is_none_or(|t| t.elapsed().as_secs() >= 10) {
+                tracing::warn!(new, total = n, "DATV transmit: the DAC ran out of samples (zeros sent)");
+                self.logged = Some(std::time::Instant::now());
+            }
+        }
+    }
 }
 
 impl Transmitter {
@@ -267,13 +324,16 @@ impl Transmitter {
             regs.wr32(0x8, 1 | (((c as u32) & ((1 << COEFF_BITS) - 1)) << 1));
         }
         regs.wr32(0x0, step(sr));
-        let g = ad9361.rd32(DAC_GPIO_OUT);
-        ad9361.wr32(DAC_GPIO_OUT, g | DATV_BIT);
-        Ok(Transmitter { _mem: mem, regs, ad9361, mode, framer: Framer::new() })
+        // RAW/RAW8/IFFT left set by a DVB-T2 transmitter that never dropped
+        // (a crash) would send these bytes to the DAC as samples.
+        ad9361.dac_gpio(ALL_BITS, DATV_BIT);
+        let under = Underflows::new(&regs);
+        Ok(Transmitter { _mem: mem, regs, ad9361, mode, framer: Framer::new(), under })
     }
 
     /// One frame for the encoder: 0xB8, the config byte, the BBFRAME.
     pub fn frame(&mut self, rolloff_code: u8, next: &mut dyn FnMut() -> [u8; TS_LEN], out: &mut Vec<u8>) {
+        self.under.check(&self.regs);
         out.push(0xB8);
         out.push(self.mode.config_byte());
         out.extend(self.framer.frame_bytes(self.mode.kbch() / 8, rolloff_code, next));
@@ -287,6 +347,7 @@ impl Transmitter {
 /// into the TX buffer. Dropping it switches back to IQ.
 pub struct RawTransmitter {
     _mem: File,
+    regs: Mapping,
     ad9361: Mapping,
 }
 
@@ -306,24 +367,27 @@ impl RawTransmitter {
             regs.wr32(0x8, 1 | (((c as u32) & ((1 << COEFF_BITS) - 1)) << 1));
         }
         regs.wr32(0x0, step(fs_in));
-        let g = ad9361.rd32(DAC_GPIO_OUT);
         let bits = DATV_BIT | RAW_BIT | if mode == RawMode::Samples8 { RAW8_BIT } else { IFFT_BIT };
-        ad9361.wr32(DAC_GPIO_OUT, (g & !(RAW8_BIT | IFFT_BIT)) | bits);
-        Ok(RawTransmitter { _mem: mem, ad9361 })
+        ad9361.dac_gpio(ALL_BITS, bits);
+        Ok(RawTransmitter { _mem: mem, regs, ad9361 })
+    }
+
+    /// DAC requests with no sample (zeros sent) since the start, on cores
+    /// that count them (DTX3).
+    pub fn underflows(&self) -> Option<u16> {
+        (self.regs.rd32(0xC) == ID_DTX3).then(|| self.regs.rd32(0x10) as u16)
     }
 }
 
 impl Drop for RawTransmitter {
     fn drop(&mut self) {
-        let g = self.ad9361.rd32(DAC_GPIO_OUT);
-        self.ad9361.wr32(DAC_GPIO_OUT, g & !(DATV_BIT | RAW_BIT | RAW8_BIT | IFFT_BIT));
+        self.ad9361.dac_gpio(ALL_BITS, 0);
     }
 }
 
 impl Drop for Transmitter {
     fn drop(&mut self) {
-        let g = self.ad9361.rd32(DAC_GPIO_OUT);
-        self.ad9361.wr32(DAC_GPIO_OUT, g & !DATV_BIT);
+        self.ad9361.dac_gpio(ALL_BITS, 0);
         let _ = &self.regs;
     }
 }

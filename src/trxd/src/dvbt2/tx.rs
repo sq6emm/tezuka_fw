@@ -78,8 +78,23 @@ impl Mode {
         Some(Mode { bw_hz, p })
     }
 
+    /// L1-post FREQUENCY: the centre frequency on the air, Hz (saturated at
+    /// 2^32 - 1: the field has 32 bits, about 4.29 GHz).
+    pub fn with_frequency(mut self, hz: f64) -> Mode {
+        self.p.frequency_hz = hz.round().clamp(0.0, u32::MAX as f64) as u32;
+        self
+    }
+
+    /// The standard's channel: 1.7 MHz has its own elementary period
+    /// (EN 302 755 9.5, 71/131 us); 2.0 and 1.35 MHz are not T2 channels
+    /// (8/7 x bandwidth, the 5-8 MHz rule scaled down: receivers with a free
+    /// elementary clock only, not Sony-based TV demodulators).
+    pub fn is_standard(&self) -> bool {
+        self.bw_hz == 1_700_000.0
+    }
+
     /// Elementary sample rate: 131/71 MHz for the standard 1.7 MHz channel,
-    /// 8/7 x bandwidth otherwise (the amateur convention).
+    /// 8/7 x bandwidth otherwise (the amateur convention, not in EN 302 755).
     pub fn fs(&self) -> f64 {
         if self.bw_hz == 1_700_000.0 { 131e6 / 71.0 } else { self.bw_hz * 8.0 / 7.0 }
     }

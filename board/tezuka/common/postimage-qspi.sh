@@ -90,6 +90,6 @@ if [ -f "$MODEL" ]; then
     cp "$MODEL" "$QSPIDIR/model.bin"
 fi
 "$COMMON_DIR/uboot-ab-env.sh" "$BIN_DIR/uboot-env.txt" > "$QSPIDIR/uboot-ab.env"
-[ "$(wc -l < "$QSPIDIR/uboot-ab.env")" -eq 10 ] || { echo "ERROR: uboot-ab.env incomplete" >&2; exit 1; }
+[ "$(wc -l < "$QSPIDIR/uboot-ab.env")" -eq 12 ] || { echo "ERROR: uboot-ab.env incomplete" >&2; exit 1; }
 (cd "$COMMON_DIR" && git describe --abbrev=4 --always --tags --dirty 2>/dev/null || echo unknown) > "$QSPIDIR/VERSION"
 (cd "$QSPIDIR" && sha256sum firmware.itb $( [ -f model.bin ] && echo model.bin ) uboot-ab.env VERSION > SHA256SUMS)

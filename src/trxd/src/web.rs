@@ -27,8 +27,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::net::{IpAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -46,7 +46,16 @@ const SESSIONS_FILE: &str = "/run/trxd-sessions";
 /// The sessions to /run: a token and its age (s) a line.
 fn save_sessions(s: &HashMap<String, Instant>) {
     let text: String = s.iter().map(|(tok, t)| format!("{tok} {}\n", t.elapsed().as_secs())).collect();
-    let _ = std::fs::write(SESSIONS_FILE, text);
+    write_private(Path::new(SESSIONS_FILE), text.as_bytes());
+}
+
+/// Write a file only its owner may read (a key, session tokens).
+fn write_private(p: &Path, data: &[u8]) -> bool {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(p);
+    let ok = f.and_then(|mut f| f.write_all(data)).is_ok();
+    let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
+    ok
 }
 
 fn load_sessions() -> HashMap<String, Instant> {
@@ -255,7 +264,9 @@ fn load_or_make_tls(dir: &PathBuf) -> Result<Arc<rustls::ServerConfig>, String> 
         let names = vec![host.clone(), format!("{host}.local"), "localhost".into()];
         let ck = rcgen::generate_simple_self_signed(names).map_err(|e| format!("certificate: {e}"))?;
         std::fs::write(&cert_p, ck.cert.pem()).map_err(|e| e.to_string())?;
-        std::fs::write(&key_p, ck.key_pair.serialize_pem()).map_err(|e| e.to_string())?;
+        if !write_private(&key_p, ck.key_pair.serialize_pem().as_bytes()) {
+            return Err(format!("{}: cannot write", key_p.display()));
+        }
         info!(dir = %dir.display(), "generated a self-signed web certificate");
     }
     let cert_pem = std::fs::read(&cert_p).map_err(|e| e.to_string())?;
@@ -321,16 +332,118 @@ struct Request {
     body: Vec<u8>,
 }
 
+/// Longest request line or header line taken.
+const MAX_LINE: u64 = 8192;
+/// The whole request (TLS handshake included) within this, however slowly
+/// it trickles in.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(20);
+/// Connections at once, and from one address.
+const MAX_CONNS: usize = 32;
+const MAX_CONNS_PER_IP: usize = 8;
+/// Failed logins from one address in a minute before it has to wait.
+const MAX_LOGIN_FAILS: u32 = 5;
+/// A WebSocket that has answered nothing (pongs included) this long is dead.
+const WS_DEAD: Duration = Duration::from_secs(15);
+
+fn read_line_capped<S: Read>(r: &mut BufReader<S>, line: &mut String) -> Option<usize> {
+    let n = r.by_ref().take(MAX_LINE).read_line(line).ok()?;
+    if n as u64 >= MAX_LINE && !line.ends_with('\n') {
+        return None;
+    }
+    Some(n)
+}
+
+/// A connection's socket: until `until`, reads give up at that instant
+/// whatever trickles in (the request phase); `None` for the WebSocket.
+struct Sock {
+    tcp: TcpStream,
+    until: Option<Instant>,
+}
+
+impl Read for Sock {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(u) = self.until {
+            let left = u.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            let _ = self.tcp.set_read_timeout(Some(left));
+        }
+        self.tcp.read(b)
+    }
+}
+
+impl Write for Sock {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.tcp.write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
+/// Connections open, per address; a [`Slot`] holds one until dropped.
+static CONNS: Mutex<Option<HashMap<IpAddr, usize>>> = Mutex::new(None);
+
+struct Slot(IpAddr);
+
+impl Slot {
+    fn take(ip: IpAddr) -> Option<Slot> {
+        let mut g = CONNS.lock().ok()?;
+        let m = g.get_or_insert_with(HashMap::new);
+        let total: usize = m.values().sum();
+        let mine = m.get(&ip).copied().unwrap_or(0);
+        if total >= MAX_CONNS || mine >= MAX_CONNS_PER_IP {
+            return None;
+        }
+        m.insert(ip, mine + 1);
+        Some(Slot(ip))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Ok(mut g) = CONNS.lock() {
+            if let Some(m) = g.as_mut() {
+                if let Some(n) = m.get_mut(&self.0) {
+                    *n -= 1;
+                    if *n == 0 {
+                        m.remove(&self.0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Failed logins per address: (count, since).
+static LOGIN_FAILS: Mutex<Option<HashMap<IpAddr, (u32, Instant)>>> = Mutex::new(None);
+
+/// May `ip` try a password now? Every address, every connection counted.
+fn login_allowed(ip: IpAddr) -> bool {
+    let Ok(mut g) = LOGIN_FAILS.lock() else { return false };
+    let m = g.get_or_insert_with(HashMap::new);
+    m.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(60));
+    m.get(&ip).is_none_or(|(n, _)| *n < MAX_LOGIN_FAILS)
+}
+
+fn login_failed(ip: IpAddr) {
+    if let Ok(mut g) = LOGIN_FAILS.lock() {
+        let e = g.get_or_insert_with(HashMap::new).entry(ip).or_insert((0, Instant::now()));
+        e.0 += 1;
+    }
+}
+
 fn read_request<S: Read>(r: &mut BufReader<S>) -> Option<Request> {
     let mut line = String::new();
-    r.read_line(&mut line).ok()?;
+    read_line_capped(r, &mut line)?;
     let mut parts = line.split_whitespace();
     let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
     let mut headers = HashMap::new();
     loop {
         let mut h = String::new();
-        if r.read_line(&mut h).ok()? == 0 {
+        if read_line_capped(r, &mut h)? == 0 {
             return None;
         }
         let h = h.trim_end();
@@ -398,7 +511,7 @@ fn session_ok(shared: &Shared, req: &Request) -> bool {
     s.contains_key(&tok)
 }
 
-type Tls = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
+type Tls = rustls::StreamOwned<rustls::ServerConnection, Sock>;
 
 fn handle_https(
     tcp: TcpStream,
@@ -408,10 +521,15 @@ fn handle_https(
     joined_tx: Sender<u64>,
     id: u64,
 ) {
-    let _ = tcp.set_read_timeout(Some(Duration::from_secs(15)));
+    let Ok(peer) = tcp.peer_addr() else { return };
+    let Some(_slot) = Slot::take(peer.ip()) else {
+        debug!(%peer, "web: too many connections");
+        return;
+    };
     let _ = tcp.set_nodelay(true);
     let Ok(conn) = rustls::ServerConnection::new(tls) else { return };
-    let mut reader = BufReader::new(rustls::StreamOwned::new(conn, tcp));
+    let sock = Sock { tcp, until: Some(Instant::now() + REQUEST_DEADLINE) };
+    let mut reader = BufReader::new(rustls::StreamOwned::new(conn, sock));
     let Some(req) = read_request(&mut reader) else { return };
     debug!(method = %req.method, path = %req.path, "web request");
     let authed = session_ok(&shared, &req);
@@ -434,6 +552,10 @@ fn handle_https(
             &[("Content-Type", "application/json".into()), ("Cache-Control", "no-store".into())],
             if authed { b"{\"ok\":true}" } else { b"{\"ok\":false}" },
         ),
+        ("POST", "/login") if !login_allowed(peer.ip()) => {
+            warn!(%peer, "web login: too many failures, refused for a minute");
+            respond(reader.get_mut(), "429 Too Many Requests", &[("Retry-After", "60".into())], b"too many attempts, wait a minute");
+        }
         ("POST", "/login") => {
             let body = String::from_utf8_lossy(&req.body).to_string();
             let pw = body
@@ -458,7 +580,8 @@ fn handle_https(
                     b"",
                 );
             } else {
-                warn!("web login refused");
+                warn!(%peer, "web login refused");
+                login_failed(peer.ip());
                 std::thread::sleep(Duration::from_secs(1));
                 respond(reader.get_mut(), "303 See Other", &[("Location", "/?bad=1".into())], b"");
             }
@@ -502,16 +625,23 @@ fn handle_https(
 fn run_ws(stream: Tls, shared: Arc<Shared>, cmd_tx: Sender<WebCmd>, joined_tx: Sender<u64>, id: u64) {
     // Short read timeout: this thread alternates between reading the browser
     // and writing whatever the engine queued for it.
-    let _ = stream.sock.set_read_timeout(Some(Duration::from_millis(15)));
+    let mut stream = stream;
+    stream.sock.until = None;
+    let _ = stream.sock.tcp.set_read_timeout(Some(Duration::from_millis(15)));
     let mut ws = WebSocket::from_raw_socket(stream, Role::Server, None);
     let (tx, rx) = bounded::<Out>(64);
     shared.clients.lock().unwrap().push(Client { id, tx });
     let _ = joined_tx.send(id);
     info!(client = id, "web client connected");
     let mut last_ping = Instant::now();
+    let mut last_heard = Instant::now();
     'outer: loop {
         loop {
-            match ws.read() {
+            let got = ws.read();
+            if got.is_ok() {
+                last_heard = Instant::now();
+            }
+            match got {
                 Ok(Message::Text(t)) => match serde_json::from_str::<serde_json::Value>(t.as_str()) {
                     Ok(v) => {
                         let _ = cmd_tx.send(WebCmd { client: id, msg: v });
@@ -556,9 +686,15 @@ fn run_ws(stream: Tls, shared: Arc<Shared>, cmd_tx: Sender<WebCmd>, joined_tx: S
                 break 'outer;
             }
         }
-        if last_ping.elapsed() > Duration::from_secs(20) {
+        // Pinged every 5 s; a browser answers at once, so silence means a
+        // dead link (and a key held down through it is released).
+        if last_ping.elapsed() > Duration::from_secs(5) {
             last_ping = Instant::now();
             let _ = ws.write(Message::Ping(Vec::new().into()));
+        }
+        if last_heard.elapsed() > WS_DEAD {
+            warn!(client = id, "web client silent for {} s: dropped", WS_DEAD.as_secs());
+            break;
         }
         match ws.flush() {
             Ok(()) => {}
@@ -580,9 +716,10 @@ fn run_ws(stream: Tls, shared: Arc<Shared>, cmd_tx: Sender<WebCmd>, joined_tx: S
 
 fn redirect_http(listener: TcpListener, https_port: u16) {
     for tcp in listener.incoming().flatten() {
+        let Some(slot) = tcp.peer_addr().ok().and_then(|p| Slot::take(p.ip())) else { continue };
         std::thread::spawn(move || {
-            let _ = tcp.set_read_timeout(Some(Duration::from_secs(5)));
-            let mut r = BufReader::new(tcp);
+            let _slot = slot;
+            let mut r = BufReader::new(Sock { tcp, until: Some(Instant::now() + Duration::from_secs(5)) });
             let Some(req) = read_request(&mut r) else { return };
             let host = req.headers.get("host").map(|h| h.split(':').next().unwrap_or("").to_string()).unwrap_or_default();
             let port = if https_port == 443 { String::new() } else { format!(":{https_port}") };
@@ -653,6 +790,39 @@ pub fn start(cfg: &WebConfig) -> Option<WebHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_lines_are_capped() {
+        let ok = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+        assert!(read_request(&mut BufReader::new(&ok[..])).is_some());
+        let mut long = b"GET /".to_vec();
+        long.extend(std::iter::repeat(b'a').take(MAX_LINE as usize + 10));
+        long.extend(b" HTTP/1.1\r\n\r\n");
+        assert!(read_request(&mut BufReader::new(&long[..])).is_none());
+        let mut hdr = b"GET / HTTP/1.1\r\nX: ".to_vec();
+        hdr.extend(std::iter::repeat(b'a').take(MAX_LINE as usize * 2));
+        assert!(read_request(&mut BufReader::new(&hdr[..])).is_none());
+    }
+
+    #[test]
+    fn connections_per_address_are_capped() {
+        let ip: IpAddr = "192.0.2.77".parse().unwrap();
+        let held: Vec<Slot> = (0..MAX_CONNS_PER_IP).map(|_| Slot::take(ip).expect("under the cap")).collect();
+        assert!(Slot::take(ip).is_none());
+        drop(held);
+        assert!(Slot::take(ip).is_some());
+    }
+
+    #[test]
+    fn logins_are_rate_limited_per_address() {
+        let ip: IpAddr = "192.0.2.78".parse().unwrap();
+        for _ in 0..MAX_LOGIN_FAILS {
+            assert!(login_allowed(ip));
+            login_failed(ip);
+        }
+        assert!(!login_allowed(ip));
+        assert!(login_allowed("192.0.2.79".parse().unwrap()));
+    }
 
     #[test]
     fn mulaw_round_trip_is_close() {

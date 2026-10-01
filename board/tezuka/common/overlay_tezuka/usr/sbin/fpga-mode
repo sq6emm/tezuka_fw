@@ -2,7 +2,8 @@
 #
 # fpga-mode NAME: load the FPGA bitstream for a trxd mode at runtime
 # (/lib/firmware/fpga-NAME.bin, the byte-swapped .bin the zynq fpga
-# manager takes). fpga-mode with no argument prints the loaded one.
+# manager takes). fpga-mode with no argument prints the loaded one;
+# fpga-mode stop-dma only stops the PL's DMA (see quiesce below).
 #
 # The whole PL is reconfigured, so nothing may touch it meanwhile: trxd must
 # not be running (its S80trxd loop calls this between runs), the drivers of
@@ -14,6 +15,11 @@
 # VCTCXO keeps its setting: the reset values made the script's warm-start
 # check (error 0: "already locked") adopt the reset DAC code, 12 ppm off.
 #
+# Before the reload every PL bus master is brought to rest (quiesce): a DMA
+# cut off in the middle of a burst can wedge the HP port it writes through
+# and hang the board. trxd does the same on its way out (fpgamode.rs); this
+# covers a trxd that crashed.
+#
 # /run/fpga-mode holds the loaded mode ("boot": the one U-Boot loaded).
 
 FW=/lib/firmware
@@ -22,6 +28,70 @@ MGR=/sys/class/fpga_manager/fpga0
 LOG=/var/log/fpga-mode.log
 
 cur=$(cat $STATE 2>/dev/null || cat /etc/fpga-boot-mode 2>/dev/null || echo all)
+
+hex() { printf '%d' "$1"; }
+
+# devmem on a register that may be absent: only ids that read back are
+# trusted (an absent slave answers DECERR: devmem dies, nothing else)
+rd() { devmem "$1" 32 2>/dev/null || echo 0; }
+
+quiesce() {
+	# a PL that is not configured answers nothing: any access would hang
+	[ "$(cat $MGR/state 2>/dev/null)" = operating ] || return 0
+	# Maia ring recorder (DATV): stop, then wait for its last burst
+	# (committed address still for three polls)
+	if [ "$(rd 0x7C460000)" = 0x6169616D ]; then
+		devmem 0x7C460010 32 2
+		last=; n=0
+		for i in $(seq 50); do
+			c=$(rd 0x7C460018)
+			if [ "$c" = "$last" ]; then n=$((n + 1)); [ $n -ge 3 ] && break; else n=0; fi
+			last=$c; usleep 2000
+		done
+		# the spectrometer DMA writes a 32 KB buffer per integration:
+		# right after one is done (its index moves) it is idle for tens
+		# of ms; hold the core in sdr_reset from then on
+		b0=$(( ($(hex $(rd 0x7C460020)) >> 12) & 7 ))
+		for i in $(seq 100); do
+			b=$(( ($(hex $(rd 0x7C460020)) >> 12) & 7 ))
+			[ $b != $b0 ] && break
+			usleep 2000
+		done
+		devmem 0x7C460008 32 1
+	fi
+	# DATV transmit back to IQ (encoder in reset): DAC GPIO bits 1-4
+	g=$(hex $(rd 0x790240BC))
+	devmem 0x790240BC 32 $((g & ~30))
+	case "$cur" in
+	datv|all)
+		# LDPC decoder ("LDP*"): its DDR engine runs only while busy
+		case "$(rd 0x43C4FF08)" in 0x3?50444C)
+			for i in $(seq 100); do
+				[ $(( $(hex $(rd 0x43C4FF04)) & 1 )) = 0 ] && break
+				usleep 5000
+			done;;
+		esac
+		# DVB-T2 cell router ("T2R1"): off, then a moment for its writes
+		if [ "$(rd 0x43C6003C)" = 0x31523254 ]; then
+			devmem 0x43C60000 32 0; usleep 5000
+		fi;;
+	esac
+	case "$cur" in
+	trx|all)
+		# CW-RS network ("RSF*"): reads its weights only while busy
+		case "$(rd 0x43C5FF08)" in 0x3?465352)
+			for i in $(seq 100); do
+				[ $(( $(hex $(rd 0x43C5FF04)) & 1 )) = 0 ] && break
+				usleep 5000
+			done;;
+		esac;;
+	esac
+}
+
+# fpga-mode stop-dma: only bring the PL's bus masters to rest (S80trxd stop:
+# a reboot must not leave a DMA writing RAM under U-Boot). Idempotent; the
+# Maia core stays in sdr_reset until trxd starts it again.
+[ "$1" = stop-dma ] && { quiesce; exit 0; }
 [ -z "$1" ] && { echo "$cur"; exit 0; }
 want=$1
 [ "$want" = "$cur" ] && exit 0
@@ -77,6 +147,7 @@ if [ -n "$gpsdo" ]; then
 	vc_ctrl=$(devmem 0x43C00000 32); vc_set=$(devmem 0x43C00004 32); vc_ref=$(devmem 0x43C0000C 32)
 	log "vctcxo_lock ctrl $vc_ctrl set $vc_set ref $vc_ref"
 fi
+quiesce
 unbind_all
 echo 0 > $MGR/flags
 if echo "fpga-$want.bin" > $MGR/firmware && [ "$(cat $MGR/state)" = operating ]; then

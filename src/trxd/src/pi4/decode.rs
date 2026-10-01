@@ -106,7 +106,10 @@ const TIME_STEP_SAMPLES: i64 = (SYMBOL_SAMPLES / 8) as i64;
 /// beacon-network convention than any operator following it would actually
 /// be, without so wide it starts spending the search budget on frequencies
 /// nobody tunes to.
-const FREQ_RADIUS_HZ: f32 = 150.0;
+///
+/// trxd: 300 (upstream 150). Two trxd boards on microwave bands can be a
+/// few hundred Hz apart; +-150 left little margin around the nominal.
+const FREQ_RADIUS_HZ: f32 = 300.0;
 
 /// Coarse-stage sync scores below this are not worth refining — see
 /// [`sync_score`]. Well under [`MIN_FIT`]: this is a much cheaper, much

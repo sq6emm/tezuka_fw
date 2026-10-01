@@ -92,7 +92,7 @@ min_step_hz = 0.2      # rewrite xo_correction only past this (Hz at 40 MHz = 5 
 kernel reports the clock synchronised. On Libre the hardware loop belongs to
 the board's `S22gpsdo` (`gpsdo_boot.sh`: reference choice, calibrated DAC
 centre); trxd only reports it there, and corrects in software only with
-`mode = "chrony"`. On R2, `S22refclk` still picks the ADF4001 source. Status goes to MQTT `<prefix>/reference` every 10 s:
+`mode = "chrony"`. On R2, `S22refclk` still picks the ADF4001 source. Status goes to the log (`reference`) every 5 minutes:
 source, measured frequency, error in ppb, applied `xo_correction`, and the
 Libre lock bit.
 

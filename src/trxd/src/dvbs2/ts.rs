@@ -14,8 +14,11 @@
 //! second). Repetition as ISO/IEC 13818-1 and TR 101 290 ask: PCR at least
 //! within 100 ms (13818-1's limit; 90 ms below 200 kbit/s, where TR 101
 //! 290's recommended 40 ms would cost a third of the packets) and every
-//! 40 ms from 200 kbit/s up, PAT and PMT every 0.5 s, SDT within 2 s. The lean profile below 40 kbit/s is a deliberate exception:
-//! tables every second, a PCR every 0.5 s.
+//! 40 ms from 200 kbit/s up, PAT and PMT every 0.5 s, SDT within 2 s. The
+//! lean profile below [`LEAN_BELOW_BPS`] (where even 3 packets take over
+//! 100 ms) is a deliberate exception: tables every second, a PCR every
+//! 0.5 s, PTS up to 1.4 s after the data arrives (13818-1's T-STD limit,
+//! 1 s, is kept from there up).
 
 use std::collections::VecDeque;
 
@@ -50,6 +53,15 @@ const HZ27: f64 = 27_000_000.0;
 /// PTS = arrival on the mux clock + this (plus the audio PES length), so the
 /// receiver's buffer never runs dry.
 const DELAY_S: f64 = 0.6;
+/// ... but never more than this: data spends at most 1 s in the T-STD
+/// buffers (ISO/IEC 13818-1 2.4.2.6).
+const DELAY_MAX_S: f64 = 1.0;
+/// Below this TS rate 3 packets (the least a PCR interval may be, so data
+/// moves between PCRs) last over 100 ms: the lean profile.
+pub const LEAN_BELOW_BPS: f64 = 30.0 * TS_LEN as f64 * 8.0;
+/// Two sections of a table on one PID at least this far apart (TS 101 211
+/// 4.4: 25 ms between sections of the same table_id_extension).
+const SECTION_GAP_S: f64 = 0.025;
 /// Service Description Table: the latest the SDT may follow the previous one
 /// (EN 300 468: at most 2 s).
 const SDT_MAX_S: f64 = 1.9;
@@ -61,8 +73,9 @@ const SERVICE_TYPE: u8 = 0x16;
 /// Payload bytes of a video packet (the adaptation field for a PCR takes 8).
 const VIDEO_PAYLOAD: f64 = 176.0;
 /// What the browser sends, and how it is packed, for a TS rate. Below
-/// 40 kbit/s the 188-byte packet overhead dominates: small pictures, fewer
-/// of them, lean audio packed 800 ms to a PES, tables every second.
+/// [`LEAN_BELOW_BPS`] the 188-byte packet overhead dominates: small
+/// pictures, fewer of them, lean audio packed 800 ms to a PES, tables every
+/// second.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Profile {
     pub width: u32,
@@ -75,23 +88,31 @@ pub struct Profile {
     pub psi_every_s: f64,
     /// A PCR at least this often, seconds.
     pub pcr_every_s: f64,
+    /// PTS at most this long after the data arrives, seconds: 1 s
+    /// (13818-1's T-STD limit) except in the lean profile.
+    pub tstd_max_s: f64,
 }
 
 impl Profile {
     pub fn for_rate(ts_rate: f64) -> Profile {
-        if ts_rate < 40_000.0 {
-            // A deliberate exception: at 15-20 packets a second a PCR every
-            // 100 ms (13818-1's limit) would leave the picture about 4 kbit/s.
+        if ts_rate < LEAN_BELOW_BPS {
+            // A deliberate exception: at 15-30 packets a second a PCR every
+            // 100 ms (13818-1's limit) would leave the picture almost nothing.
             // Tables every second, a PCR every 0.5 s; only MiniTiouner-class
-            // receivers work at these rates anyway.
-            Profile { width: 160, height: 120, fps: 2.0, audio_bps: 6_000.0, audio_per_pes: 40, psi_every_s: 1.0, pcr_every_s: 0.5 }
+            // receivers work at these rates anyway. Audio 800 ms to a PES,
+            // and so PTS up to 1.4 s after the data (13818-1's T-STD allows
+            // 1 s): with 1 s the audio PES (4 packets at 15-30 a second)
+            // and large pictures miss their PTS.
+            Profile { width: 160, height: 120, fps: 2.0, audio_bps: 6_000.0, audio_per_pes: 40, psi_every_s: 1.0, pcr_every_s: 0.5, tstd_max_s: 1.4 }
         } else if ts_rate < 80_000.0 {
-            Profile { width: 320, height: 240, fps: 5.0, audio_bps: 12_000.0, audio_per_pes: 10, psi_every_s: 0.5, pcr_every_s: 0.09 }
+            // (audio 8 kbit/s, 300 ms to a PES: 12 kbit/s in 200 ms PES took
+            // a third of the packets at 46 kbit/s and left no picture)
+            Profile { width: 320, height: 240, fps: 5.0, audio_bps: 8_000.0, audio_per_pes: 15, psi_every_s: 0.5, pcr_every_s: 0.09, tstd_max_s: DELAY_MAX_S }
         } else if ts_rate < 200_000.0 {
-            Profile { width: 320, height: 240, fps: 10.0, audio_bps: 16_000.0, audio_per_pes: 10, psi_every_s: 0.5, pcr_every_s: 0.09 }
+            Profile { width: 320, height: 240, fps: 10.0, audio_bps: 16_000.0, audio_per_pes: 10, psi_every_s: 0.5, pcr_every_s: 0.09, tstd_max_s: DELAY_MAX_S }
         } else {
             // 192 kS/s and up at 2/3-3/4 (FPGA front end): 240-360 kbit/s.
-            Profile { width: 640, height: 480, fps: 10.0, audio_bps: 24_000.0, audio_per_pes: 10, psi_every_s: 0.5, pcr_every_s: 0.04 }
+            Profile { width: 640, height: 480, fps: 10.0, audio_bps: 24_000.0, audio_per_pes: 10, psi_every_s: 0.5, pcr_every_s: 0.04, tstd_max_s: DELAY_MAX_S }
         }
     }
 
@@ -100,18 +121,32 @@ impl Profile {
         ((SDT_MAX_S / self.psi_every_s).floor() as u64).max(1)
     }
 
+    /// Packets a second for tables and for PCR-only packets.
+    fn overhead_pps(&self, pps: f64) -> (f64, f64) {
+        let psi = (2.0 + 1.0 / self.sdt_rounds() as f64) / self.psi_every_s + 2.0 / EIT_EVERY_S + 1.0 / NIT_EVERY_S + 1.0 / TDT_EVERY_S;
+        // PCR-only packets while audio or tables hold the queue: about half
+        // of the PCRs at the interval the mux keeps (whole slots, at least
+        // 3), three quarters below 40 packets a second with PCRs that often
+        // (audio and tables are then most of the slots; measured 0.7 at 46
+        // kbit/s).
+        let pcr_rate = pps / (self.pcr_every_s * pps).floor().max(3.0);
+        (psi, pcr_rate * if pps < 40.0 && self.pcr_every_s < 0.2 { 0.75 } else { 0.5 })
+    }
+
+    /// Audio packets a second: an audio PES has 3 control bytes per frame
+    /// and 14 header bytes.
+    fn audio_pps(&self) -> f64 {
+        let pes_per_s = 50.0 / self.audio_per_pes as f64;
+        let audio_bytes = self.audio_bps / 8.0 / pes_per_s + (3 * self.audio_per_pes + 14) as f64;
+        pes_per_s * (audio_bytes / 184.0).ceil()
+    }
+
     /// Video bit rate left for the browser (after PSI, audio and per-frame
     /// packetization), with a margin.
     pub fn video_budget(&self, ts_rate: f64) -> f64 {
         let pps = ts_rate / (TS_LEN as f64 * 8.0);
-        let psi = (2.0 + 1.0 / self.sdt_rounds() as f64) / self.psi_every_s + 2.0 / EIT_EVERY_S + 1.0 / NIT_EVERY_S + 1.0 / TDT_EVERY_S;
-        // PCR-only packets while audio or tables hold the queue: about half
-        // of the PCRs, at the interval the mux keeps (at least 3 slots).
-        let pcr_only = 0.5 / self.pcr_every_s.max(3.0 / pps);
-        // An audio PES: 3 control bytes per frame, 14 header bytes.
-        let pes_per_s = 50.0 / self.audio_per_pes as f64;
-        let audio_bytes = self.audio_bps / 8.0 / pes_per_s + (3 * self.audio_per_pes + 14) as f64;
-        let audio = pes_per_s * (audio_bytes / 184.0).ceil();
+        let (psi, pcr_only) = self.overhead_pps(pps);
+        let audio = self.audio_pps();
         // Video packets carry 176 bytes (8 reserved for a PCR); a frame
         // also costs its PES header, AUD and half a packet of padding.
         let video_bytes_s = ((pps - psi - audio - pcr_only) * VIDEO_PAYLOAD - self.fps * (14.0 + 6.0 + VIDEO_PAYLOAD / 2.0)).max(0.0);
@@ -174,6 +209,70 @@ impl Media {
     }
 }
 
+/// What the NIT says about the carrier (its delivery system descriptor).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Delivery {
+    /// DVB-S2: satellite_delivery_system_descriptor (0x43).
+    S2 { freq_hz: f64, symbol_rate: f64, rolloff: f32, modcod: u8 },
+    /// DVB-T2: T2_delivery_system_descriptor (extension 0x04).
+    T2 { freq_hz: f64, bw_hz: f64, plp_id: u8, t2_system_id: u16 },
+}
+
+/// `v` as `digits` BCD digits (rounded, saturated).
+fn bcd(v: f64, digits: u32) -> u32 {
+    let mut x = (v.round().max(0.0) as u64).min(10u64.pow(digits) - 1);
+    let mut out = 0u32;
+    for i in 0..digits {
+        out |= ((x % 10) as u32) << (4 * i);
+        x /= 10;
+    }
+    out
+}
+
+impl Delivery {
+    pub fn descriptor(&self) -> Vec<u8> {
+        match *self {
+            Delivery::S2 { freq_hz, symbol_rate, rolloff, modcod } => {
+                // frequency: 8 BCD digits, GHz with the point after the third
+                // (10 kHz units); orbital position 0; polarization linear
+                // horizontal; symbol rate: 7 BCD digits, Msym/s with the point
+                // after the third (100 sym/s units), then FEC_inner.
+                let ro = if rolloff <= 0.21 { 2 } else if rolloff <= 0.26 { 1 } else { 0 };
+                let (mtype, fec) = match modcod {
+                    1..=11 => (1u8, [0u8, 0, 0, 1, 7, 2, 3, 8, 4, 6, 9][modcod as usize - 1]),
+                    12..=17 => (2, [7u8, 2, 3, 4, 6, 9][modcod as usize - 12]),
+                    _ => (0, 0),
+                };
+                let mut d = vec![0x43, 11];
+                d.extend_from_slice(&bcd(freq_hz / 1e4, 8).to_be_bytes());
+                d.extend_from_slice(&[0x00, 0x00]);
+                // west_east 0, polarization 00, roll_off, modulation_system 1 (S2), modulation_type
+                d.push((ro << 3) | 0x04 | mtype);
+                let sr = bcd(symbol_rate / 100.0, 7);
+                d.extend_from_slice(&((sr << 4) | fec as u32).to_be_bytes());
+                d
+            }
+            Delivery::T2 { freq_hz, bw_hz, plp_id, t2_system_id } => {
+                let mut d = vec![0x7F, 0, 0x04, plp_id];
+                d.extend_from_slice(&t2_system_id.to_be_bytes());
+                // Only 1.7 MHz of trxd's channels has a bandwidth code
+                // (0101 = 1.712 MHz); the others take the short form.
+                if (bw_hz - 1.7e6).abs() < 20e3 {
+                    // SISO, bandwidth 0101, GI 1/8 (010), 2K (000), no other
+                    // frequency, no TFS; one cell: id 0, centre in 10 Hz units.
+                    d.push((0x05 << 2) | 0x03);
+                    d.push(0x02 << 5);
+                    d.extend_from_slice(&[0x00, 0x00]);
+                    d.extend_from_slice(&(((freq_hz / 10.0).round().clamp(0.0, u32::MAX as f64)) as u32).to_be_bytes());
+                    d.push(0);
+                }
+                d[1] = (d.len() - 2) as u8;
+                d
+            }
+        }
+    }
+}
+
 pub struct Mux {
     pub profile: Profile,
     /// Packets per second the modulator pulls.
@@ -196,6 +295,10 @@ pub struct Mux {
     next_eit: u64,
     next_tdt: u64,
     eit_step: u8,
+    /// The EIT's second section not before this packet.
+    next_eit_section: u64,
+    /// The NIT's delivery system descriptor, when the modulator says.
+    delivery: Option<Delivery>,
     /// Wall clock (Unix seconds) at packet 0: the TDT and EIT times.
     start_unix: f64,
     /// PAT, PMT, SDT, NIT, EIT: version_number and a hash of the content it
@@ -237,6 +340,8 @@ impl Mux {
             next_eit: 0,
             next_tdt: 0,
             eit_step: 0,
+            next_eit_section: 0,
+            delivery: None,
             versions: [(0, None); 5],
             last_pts: [None; 2],
             sps_pps: Vec::new(),
@@ -251,6 +356,12 @@ impl Mux {
         }
     }
 
+    /// The NIT names the delivery system (the modulator's settings).
+    pub fn with_delivery(mut self, d: Delivery) -> Self {
+        self.delivery = Some(d);
+        self
+    }
+
     /// The mux clock, 27 MHz ticks, at packet `n`.
     fn clock27(&self, n: u64) -> u64 {
         (n as f64 / self.pps * HZ27) as u64
@@ -263,7 +374,7 @@ impl Mux {
 
     fn pts90(&mut self, ts_us: i64) -> u64 {
         let now90 = self.clock27(self.sent) / 300;
-        let delay90 = ((DELAY_S + self.profile.audio_per_pes as f64 * 0.02) * 90_000.0) as u64;
+        let delay90 = ((DELAY_S + self.profile.audio_per_pes as f64 * 0.02).min(self.profile.tstd_max_s) * 90_000.0) as u64;
         if let Some((t0, p0)) = self.anchor {
             let pts = p0 as i64 + (ts_us - t0) * 9 / 100;
             // Browser and board clocks drift apart slowly; re-anchor when late or far ahead.
@@ -284,9 +395,13 @@ impl Mux {
     }
 
     /// When everything queued now has gone out, on the 90 kHz clock (the
-    /// PCR and table packets between counted with a tenth to spare).
+    /// PCR-only, table and audio packets between counted, with a tenth to
+    /// spare).
     fn done_at_90(&self) -> u64 {
-        let n = self.sent as f64 + (self.queue.len() + self.aqueue.len()) as f64 * 1.1;
+        // (audio goes first: what is queued, and what comes meanwhile)
+        let (psi, pcr_only) = self.profile.overhead_pps(self.pps);
+        let share = (1.0 - (psi + pcr_only + self.profile.audio_pps()) / self.pps).max(0.2);
+        let n = self.sent as f64 + self.aqueue.len() as f64 + self.queue.len() as f64 * 1.1 / share;
         (n / self.pps * 90_000.0) as u64
     }
 
@@ -324,8 +439,9 @@ impl Mux {
                 let pts = self.pts90(ts_us);
                 let pts = self.monotonic(0, pts);
                 let mut es = Vec::with_capacity(data.len() + 6);
-                // Access unit delimiter first, unless the encoder put one there.
-                if !data.windows(5).take(1).any(|w| w == [0, 0, 0, 1, 0x09]) {
+                // Access unit delimiter first, unless the encoder put one there
+                // (after a 3- or 4-byte start code).
+                if !(data.starts_with(&[0, 0, 0, 1]) && data.get(4).is_some_and(|b| b & 0x1F == 9) || data.starts_with(&[0, 0, 1]) && data.get(3).is_some_and(|b| b & 0x1F == 9)) {
                     es.extend_from_slice(&[0, 0, 0, 1, 0x09, 0xF0]);
                 }
                 // A keyframe starts decoding: it needs the SPS and PPS with it.
@@ -472,12 +588,13 @@ impl Mux {
         let n = self.sent;
         self.sent += 1;
         let now27 = self.clock27(n);
-        // PCR first: due when the next slot would be too late. The interval
-        // never below 3 slots, so data keeps moving between PCRs at the
-        // lowest rates.
-        let every = (self.profile.pcr_every_s * self.pps).max(3.0);
+        // PCR first: due when the profile's interval (in whole slots, never
+        // over it) has passed. Never below 3 slots, so data keeps moving
+        // between PCRs at the lowest rates (from LEAN_BELOW_BPS up 3 slots
+        // are within 13818-1's 100 ms).
+        let every = ((self.profile.pcr_every_s * self.pps).floor() as u64).max(3);
         // (the first tables go before anything: a receiver learns the PIDs)
-        let pcr_due = self.psi_round > 0 && self.last_pcr.is_none_or(|l| (n + 1 - l) as f64 >= every);
+        let pcr_due = self.psi_round > 0 && self.last_pcr.is_none_or(|l| n - l >= every);
         if pcr_due {
             if self.aqueue.is_empty() && self.queue.front().is_some_and(|q| q.pcr) {
                 // a video packet: its reserved adaptation field takes the PCR
@@ -526,10 +643,12 @@ impl Mux {
             }
             return pkt;
         }
-        // DVB SI: the EIT's two sections back to back, the NIT, the TDT.
-        if self.eit_step > 0 || n >= self.next_eit {
+        // DVB SI: the EIT's two sections (at least 25 ms apart), the NIT,
+        // the TDT.
+        if (self.eit_step == 0 && n >= self.next_eit) || (self.eit_step > 0 && n >= self.next_eit_section) {
             if self.eit_step == 0 {
                 self.next_eit = n + (EIT_EVERY_S * self.pps) as u64;
+                self.next_eit_section = n + (SECTION_GAP_S * self.pps).ceil() as u64;
             }
             // (both sections share the table's version; the present one sets it)
             let sec = self.eit(self.eit_step, n);
@@ -586,8 +705,12 @@ impl Mux {
     fn nit(&self) -> Vec<u8> {
         let mut net = vec![0x40, NETWORK_NAME.len() as u8];
         net.extend_from_slice(NETWORK_NAME);
-        // service_list_descriptor: service 1, its type
-        let ts_desc = [0x41, 3, 0x00, 0x01, SERVICE_TYPE];
+        // service_list_descriptor: service 1, its type; the delivery system
+        // descriptor (EN 300 468 6.2.13.3 / 6.4.6.3) when known
+        let mut ts_desc = vec![0x41, 3, 0x00, 0x01, SERVICE_TYPE];
+        if let Some(d) = &self.delivery {
+            ts_desc.extend_from_slice(&d.descriptor());
+        }
         let mut s = vec![0x40, 0xF0, 0, (ONID >> 8) as u8, ONID as u8, 0xC1, 0, 0];
         s.extend_from_slice(&[0xF0 | (net.len() >> 8) as u8, net.len() as u8]);
         s.extend_from_slice(&net);
@@ -724,6 +847,12 @@ pub struct Demux {
     audio: Option<u16>,
     pes: std::collections::HashMap<u16, (Vec<u8>, bool)>,
     cc: std::collections::HashMap<u16, u8>,
+    /// PSI/SI sections being put together (they may span packets).
+    secs: std::collections::HashMap<u16, Vec<u8>>,
+    /// PTS unwrapping (33 bits wrap every 26.5 h): the last PTS and the
+    /// wraps so far.
+    pts_last: Option<u64>,
+    pts_wraps: u64,
     pub pes_dropped: u64,
     pub si: Si,
 }
@@ -744,20 +873,21 @@ impl Demux {
             return;
         }
         let payload = &p[start..];
-        if pid == 0 || Some(pid) == self.pmt || matches!(pid, PID_NIT | PID_SDT | PID_EIT | PID_TDT) {
-            if pusi {
-                let ptr = payload[0] as usize;
-                if let Some(sec) = payload.get(1 + ptr..) {
-                    self.section(pid, sec);
-                }
-            }
-            return;
-        }
-        if Some(pid) != self.video && Some(pid) != self.audio {
+        let psi = pid == 0 || Some(pid) == self.pmt || matches!(pid, PID_NIT | PID_SDT | PID_EIT | PID_TDT);
+        if !psi && Some(pid) != self.video && Some(pid) != self.audio {
             return;
         }
         let cc = p[3] & 0x0F;
-        let lost = self.cc.insert(pid, cc).is_some_and(|prev| cc != (prev + 1) & 0x0F);
+        let prev = self.cc.insert(pid, cc);
+        // 13818-1 2.4.3.3: one duplicate packet (same counter) may follow.
+        if prev == Some(cc) {
+            return;
+        }
+        let lost = prev.is_some_and(|prev| cc != (prev + 1) & 0x0F);
+        if psi {
+            self.psi(pid, pusi, lost, payload);
+            return;
+        }
         let entry = self.pes.entry(pid).or_insert_with(|| (Vec::new(), false));
         if pusi {
             let (buf, ok) = std::mem::replace(entry, (payload.to_vec(), true));
@@ -782,6 +912,59 @@ impl Demux {
         }
     }
 
+    /// PSI/SI payload: sections may start anywhere (pointer_field), span
+    /// packets and follow each other in one.
+    fn psi(&mut self, pid: u16, pusi: bool, lost: bool, payload: &[u8]) {
+        let mut buf = self.secs.remove(&pid).unwrap_or_default();
+        if lost {
+            buf.clear();
+        }
+        let mut rest = payload;
+        if pusi {
+            let ptr = payload[0] as usize;
+            let Some(tail) = payload.get(1..1 + ptr) else { return };
+            // The end of the section begun before (if it was being collected).
+            if !buf.is_empty() {
+                buf.extend_from_slice(tail);
+                self.sections(pid, &mut buf);
+            }
+            buf.clear();
+            rest = &payload[1 + ptr..];
+            buf.extend_from_slice(rest);
+        } else if !buf.is_empty() {
+            buf.extend_from_slice(rest);
+        } else {
+            return;
+        }
+        self.sections(pid, &mut buf);
+        if !buf.is_empty() {
+            self.secs.insert(pid, buf);
+        }
+    }
+
+    /// Every complete section at the front of `buf` out; stuffing (0xFF)
+    /// ends the packet's sections.
+    fn sections(&mut self, pid: u16, buf: &mut Vec<u8>) {
+        loop {
+            if buf.first().is_none_or(|&t| t == 0xFF) {
+                buf.clear();
+                return;
+            }
+            if buf.len() < 3 {
+                return;
+            }
+            let len = (((buf[1] as usize) & 0x0F) << 8 | buf[2] as usize) + 3;
+            if buf.len() < len {
+                if len > 4096 + 3 {
+                    buf.clear();
+                }
+                return;
+            }
+            let sec: Vec<u8> = buf.drain(..len).collect();
+            self.section(pid, &sec);
+        }
+    }
+
     fn section(&mut self, pid: u16, s: &[u8]) {
         // TDT: a short section, no CRC
         if pid == PID_TDT && s.len() >= 8 && s[0] == 0x70 {
@@ -797,26 +980,35 @@ impl Demux {
         }
         let body = &s[8..len - 4];
         if pid == 0 && s[0] == 0x00 {
-            for e in body.chunks_exact(4) {
-                if u16::from_be_bytes([e[0], e[1]]) != 0 {
-                    self.pmt = Some(u16::from_be_bytes([e[2], e[3]]) & 0x1FFF);
-                    break;
+            // The first program's PMT; a new PID (another transmitter, a
+            // remux) starts over.
+            if let Some(e) = body.chunks_exact(4).find(|e| u16::from_be_bytes([e[0], e[1]]) != 0) {
+                let pmt = u16::from_be_bytes([e[2], e[3]]) & 0x1FFF;
+                if self.pmt != Some(pmt) {
+                    if let Some(old) = self.pmt {
+                        self.secs.remove(&old);
+                    }
+                    self.pmt = Some(pmt);
+                    self.set_streams(None, None);
                 }
             }
-        } else if s[0] == 0x02 && body.len() >= 4 {
+        } else if Some(pid) == self.pmt && s[0] == 0x02 && body.len() >= 4 {
+            // The streams as this PMT has them (they may change).
             let info = (((body[2] as usize) & 0x0F) << 8) | body[3] as usize;
             let mut i = 4 + info;
+            let (mut video, mut audio) = (None, None);
             while i + 5 <= body.len() {
                 let (st, epid) = (body[i], u16::from_be_bytes([body[i + 1], body[i + 2]]) & 0x1FFF);
                 let dl = (((body[i + 3] as usize) & 0x0F) << 8) | body[i + 4] as usize;
                 let desc = body.get(i + 5..i + 5 + dl).unwrap_or(&[]);
                 match st {
-                    0x1B if self.video.is_none() => self.video = Some(epid),
-                    0x06 if self.audio.is_none() && desc.windows(4).any(|w| w == b"Opus") => self.audio = Some(epid),
+                    0x1B if video.is_none() => video = Some(epid),
+                    0x06 if audio.is_none() && desc.windows(4).any(|w| w == b"Opus") => audio = Some(epid),
                     _ => {}
                 }
                 i += 5 + dl;
             }
+            self.set_streams(video, audio);
         } else if pid == PID_SDT && s[0] == 0x42 {
             // services from byte 11: id, flags, then descriptors
             let end = len - 4;
@@ -877,6 +1069,33 @@ impl Demux {
         }
     }
 
+    /// Video and audio PIDs; a change drops what was collected for the old.
+    fn set_streams(&mut self, video: Option<u16>, audio: Option<u16>) {
+        if (video, audio) != (self.video, self.audio) {
+            for p in [self.video, self.audio].into_iter().flatten() {
+                self.pes.remove(&p);
+                self.cc.remove(&p);
+            }
+            self.video = video;
+            self.audio = audio;
+        }
+    }
+
+    /// A 33-bit PTS made continuous (the 90 kHz counter wraps every 26.5 h).
+    fn unwrap_pts(&mut self, pts: u64) -> u64 {
+        const WRAP: u64 = 1 << 33;
+        if let Some(last) = self.pts_last {
+            if last > pts && last - pts > WRAP / 2 {
+                self.pts_wraps += 1;
+            } else if pts > last && pts - last > WRAP / 2 && self.pts_wraps > 0 {
+                // (a late packet from before the wrap)
+                return pts + (self.pts_wraps - 1) * WRAP;
+            }
+        }
+        self.pts_last = Some(pts);
+        pts + self.pts_wraps * WRAP
+    }
+
     fn pes_out(&mut self, pid: u16, pes: &[u8], out: &mut Vec<Vec<u8>>) {
         if pes.len() < 9 || pes[..3] != [0, 0, 1] {
             return;
@@ -885,7 +1104,8 @@ impl Demux {
         let Some(data) = pes.get(9 + hl..) else { return };
         let pts90 = if pes[7] & 0x80 != 0 && hl >= 5 {
             let b = &pes[9..14];
-            ((b[0] as u64 >> 1) & 7) << 30 | (b[1] as u64) << 22 | (b[2] as u64 >> 1) << 15 | (b[3] as u64) << 7 | b[4] as u64 >> 1
+            let pts = ((b[0] as u64 >> 1) & 7) << 30 | (b[1] as u64) << 22 | (b[2] as u64 >> 1) << 15 | (b[3] as u64) << 7 | b[4] as u64 >> 1;
+            self.unwrap_pts(pts)
         } else {
             0
         };
@@ -1085,7 +1305,7 @@ mod tests {
     /// writes each stream there (for TSDuck's tsanalyze).
     #[test]
     fn repetition_meets_tr101290() {
-        for rate in [30_000.0, 54_325.0, 120_000.0, 300_000.0, 360_000.0] {
+        for rate in [30_000.0, 40_000.0, 45_000.0, 46_000.0, 50_000.0, 54_325.0, 120_000.0, 300_000.0, 360_000.0] {
             let mut m = Mux::new(rate, "SQ6EMM");
             let p = m.profile;
             let pps = rate / (TS_LEN as f64 * 8.0);
@@ -1151,8 +1371,13 @@ mod tests {
             let pcr_max = p.pcr_every_s.max(3.0 * slot);
             let psi_max = p.psi_every_s;
             assert!(pcr <= pcr_max + 1e-9, "rate {rate}: PCR gap {pcr}");
-            if rate >= 40_000.0 {
+            if rate >= LEAN_BELOW_BPS {
                 assert!(pcr <= 0.1, "rate {rate}: PCR gap {pcr} over 13818-1's 100 ms");
+            }
+            // EIT: the two sections at least 25 ms apart (TS 101 211 4.4)
+            let eit_idx: Vec<usize> = out.iter().enumerate().filter(|(_, p)| pid(p) == PID_EIT && start(p)).map(|(i, _)| i).collect();
+            for w in eit_idx.windows(2) {
+                assert!((w[1] - w[0]) as f64 / pps >= SECTION_GAP_S - 1e-9, "rate {rate}: EIT sections {} s apart", (w[1] - w[0]) as f64 / pps);
             }
             if rate >= 200_000.0 {
                 assert!(pcr <= 0.04 + 1e-9, "rate {rate}: PCR gap {pcr} over TR 101 290's 40 ms");
@@ -1160,7 +1385,8 @@ mod tests {
             assert!(pat <= psi_max + 1e-9 && pmt <= psi_max + 1e-9, "rate {rate}: PAT {pat} PMT {pmt}");
             assert!(sdt <= 2.0, "rate {rate}: SDT {sdt}");
             assert!(dropped * 20 < vi, "rate {rate}: the video budget overflows ({dropped} of {vi} dropped)");
-            // T-STD: each PES in whole before its PTS, and PTS never back
+            // T-STD: each PES in whole before its PTS, never over 1 s
+            // there (the first byte's arrival to the PTS), PTS never back
             for want in [PID_VIDEO, PID_AUDIO] {
                 let starts: Vec<usize> = out.iter().enumerate().filter(|(_, p)| pid(p) == want && start(p)).map(|(i, _)| i).collect();
                 let mut last = 0u64;
@@ -1176,6 +1402,8 @@ mod tests {
                     let end = (i..next).rev().find(|&j| pid(&out[j]) == want && out[j][3] & 0x10 != 0).unwrap();
                     let in_by = (end + 1) as f64 / pps;
                     assert!(in_by <= pts as f64 / 90_000.0, "rate {rate}: pid {want:#x} PES {k} in at {in_by:.3} s, PTS {:.3} s", pts as f64 / 90_000.0);
+                    let first_in = i as f64 / pps;
+                    assert!(pts as f64 / 90_000.0 - first_in <= m.profile.tstd_max_s + 1e-6, "rate {rate}: pid {want:#x} PES {k} {:.3} s in the T-STD", pts as f64 / 90_000.0 - first_in);
                 }
             }
             // service_type and original_network_id in the SDT
@@ -1301,20 +1529,22 @@ mod tests {
     fn demux_gives_back_what_the_mux_took() {
         let mut m = Mux::new(54_325.0, "SQ6EMM");
         let frames: Vec<Vec<u8>> = (0..6u8).map(|i| [vec![0, 0, 0, 1, 0x09, 0xF0, 0, 0, 0, 1, if i == 0 { 0x65 } else { 0x41 }], vec![i; 300 + i as usize * 150]].concat()).collect();
-        let opus: Vec<Vec<u8>> = (0..20u8).map(|i| vec![i; 30 + i as usize * 13]).collect();
-        let (mut vi, mut ai, mut t) = (0, 0, 0i64);
+        // (two whole audio PES of the 15 frames this profile packs)
+        let opus: Vec<Vec<u8>> = (0..30u8).map(|i| vec![i; 30 + i as usize * 7]).collect();
+        let (mut vi, mut ai) = (0, 0);
         let mut dmx = Demux::default();
         let mut msgs = Vec::new();
         for n in 0..3000 {
             if n % 60 == 0 && vi < frames.len() {
                 // The mux adds its own AUD only when the frame has none: ours do.
-                m.push(Media::Video { ts_us: t, key: vi == 0, data: frames[vi].clone() });
+                // (on the stream's clock: the frames are 1.7 s apart)
+                m.push(Media::Video { ts_us: (n as f64 * 1504.0 / 54_325.0 * 1e6) as i64, key: vi == 0, data: frames[vi].clone() });
                 vi += 1;
             }
             if n % 6 == 0 && ai < opus.len() {
+                let t = (n as f64 * 1504.0 / 54_325.0 * 1e6) as i64;
                 m.push(Media::Audio { ts_us: t, data: opus[ai].clone() });
                 ai += 1;
-                t += 20_000;
             }
             dmx.push(&m.next(), &mut msgs);
         }
@@ -1348,5 +1578,102 @@ mod tests {
         // (tables every second instead of every 2 s, about 1.9 kbit/s, and
         // the NIT, EIT and TDT, about 1.9 kbit/s more)
         assert!(v14 > 4_000.0, "{v14}");
+    }
+
+    /// The delivery system descriptors (EN 300 468 6.2.13.3, 6.4.6.3).
+    #[test]
+    fn nit_names_the_delivery_system() {
+        let d = Delivery::S2 { freq_hz: 1_255_000_000.0, symbol_rate: 333_000.0, rolloff: 0.35, modcod: 14 }.descriptor();
+        // 001.25500 GHz, orbit 0, S2 8PSK roll-off 0.35, 000.3330 Msym/s, FEC 3/4
+        assert_eq!(d, [0x43, 11, 0x00, 0x12, 0x55, 0x00, 0x00, 0x00, 0x06, 0x00, 0x03, 0x33, 0x03]);
+        let d = Delivery::S2 { freq_hz: 10_491_500_000.0, symbol_rate: 1_500_000.0, rolloff: 0.2, modcod: 4 }.descriptor();
+        assert_eq!(d, [0x43, 11, 0x01, 0x04, 0x91, 0x50, 0x00, 0x00, 0x15, 0x00, 0x15, 0x00, 0x01]);
+        let d = Delivery::T2 { freq_hz: 437_000_000.0, bw_hz: 1.7e6, plp_id: 0, t2_system_id: 0x8001 }.descriptor();
+        assert_eq!(d, [0x7F, 13, 0x04, 0, 0x80, 0x01, 0x17, 0x40, 0, 0, 0x02, 0x9A, 0xCF, 0x20, 0]);
+        // 2 MHz: no bandwidth code, the short form
+        let d = Delivery::T2 { freq_hz: 437_000_000.0, bw_hz: 2.0e6, plp_id: 0, t2_system_id: 0x8001 }.descriptor();
+        assert_eq!(d, [0x7F, 4, 0x04, 0, 0x80, 0x01]);
+        // in the NIT's transport stream loop, after the service list
+        let mut m = Mux::new(300_000.0, "SQ6EMM").with_delivery(Delivery::S2 { freq_hz: 1_255_000_000.0, symbol_rate: 333_000.0, rolloff: 0.35, modcod: 14 });
+        let pkt = (0..2000).map(|_| m.next()).find(|p| ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) == PID_NIT).unwrap();
+        assert!(pkt.windows(3).any(|w| w == [0x43, 11, 0x00]));
+        let sec = &pkt[5..];
+        let len = ((sec[1] as usize & 0x0F) << 8 | sec[2] as usize) + 3;
+        assert_eq!(crc32(&sec[..len]), 0);
+    }
+
+    /// An access unit delimiter after a 3-byte start code is the encoder's:
+    /// no second one.
+    #[test]
+    fn one_aud_per_access_unit() {
+        for (data, auds) in [(vec![0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x65, 1, 2], 1), (vec![0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x65, 1], 1), (vec![0, 0, 0, 1, 0x65, 1, 2, 3], 1)] {
+            let mut m = Mux::new(300_000.0, "X");
+            m.push(Media::Video { ts_us: 0, key: true, data });
+            let es: Vec<u8> = (0..400).map(|_| m.next()).filter(|p| ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) == PID_VIDEO && p[3] & 0x10 != 0).flat_map(|p| {
+                let at = if p[3] & 0x20 != 0 { 5 + p[4] as usize } else { 4 };
+                p[at..].to_vec()
+            }).collect();
+            let n = es.windows(4).filter(|w| w[..3] == [0, 0, 1] && w[3] & 0x1F == 9).count();
+            assert_eq!(n, auds, "{es:02x?}");
+        }
+    }
+
+    /// Sections over several packets (and two in one), a PMT that moves the
+    /// streams, a duplicate packet, a PTS that wraps.
+    #[test]
+    fn demux_survives_foreign_streams() {
+        let mut dmx = Demux::default();
+        let mut msgs = Vec::new();
+        let mut cc = std::collections::HashMap::<u16, u8>::new();
+        let mut pk = |pid: u16, pusi: bool, payload: &[u8]| -> [u8; TS_LEN] {
+            let c = cc.entry(pid).or_insert(0);
+            let mut p = [0xFFu8; TS_LEN];
+            p[..4].copy_from_slice(&[0x47, ((pusi as u8) << 6) | (pid >> 8) as u8, pid as u8, 0x10 | *c]);
+            *c = (*c + 1) & 15;
+            p[4..4 + payload.len()].copy_from_slice(payload);
+            p
+        };
+        let pat = finish_section(vec![0x00, 0xB0, 0, 0x00, 0x01, 0xC1, 0, 0, 0x00, 0x01, 0xE0 | 0x10, 0x00]);
+        // a PMT over 300 bytes (a long descriptor loop), two packets
+        let mut pmt = vec![0x02, 0xB0, 0, 0x00, 0x01, 0xC1, 0, 0, 0xE2, 0x00, 0xF0, 0];
+        pmt.extend_from_slice(&[0x1B, 0xE2, 0x00, 0xF0, 0]);
+        let mut desc = vec![0x05, 4, b'O', b'p', b'u', b's'];
+        for _ in 0..40 {
+            desc.extend_from_slice(&[0x0A, 4, b'e', b'n', b'g', 0]);
+        }
+        pmt.extend_from_slice(&[0x06, 0xE2, 0x01, 0xF0 | (desc.len() >> 8) as u8, desc.len() as u8]);
+        pmt.extend_from_slice(&desc);
+        let pmt = finish_section(pmt);
+        assert!(pmt.len() > 184);
+        let mut first = vec![0u8];
+        first.extend_from_slice(&pat);
+        dmx.push(&pk(0, true, &first), &mut msgs);
+        let mut a = vec![0u8];
+        a.extend_from_slice(&pmt[..183]);
+        dmx.push(&pk(0x1000, true, &a), &mut msgs);
+        let b = pk(0x1000, false, &pmt[183..]);
+        dmx.push(&b, &mut msgs);
+        // (a duplicate of the last packet: ignored)
+        dmx.push(&b, &mut msgs);
+        assert_eq!((dmx.pmt, dmx.video, dmx.audio), (Some(0x1000), Some(0x200), Some(0x201)));
+        // a PES near the 33-bit wrap, then one just after it
+        let pes = |pts: u64, i: u8| -> Vec<u8> {
+            let mut v = vec![0, 0, 1, 0xE0, 0, 0, 0x84, 0x80, 5];
+            v.extend_from_slice(&pts_bytes(pts));
+            v.extend_from_slice(&[0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x41, i]);
+            v
+        };
+        for (i, pts) in [(1u64 << 33) - 9000, 9000, 18000].into_iter().enumerate() {
+            dmx.push(&pk(0x200, true, &pes(pts, i as u8)), &mut msgs);
+        }
+        let ts: Vec<i64> = msgs.iter().filter(|m| m[0] == 6).map(|m| i64::from_le_bytes(m[2..10].try_into().unwrap())).collect();
+        assert_eq!(ts.len(), 2);
+        assert_eq!(ts[1] - ts[0], 200_000, "{ts:?}");
+        // the PAT moves the PMT: streams forgotten until it comes
+        let pat2 = finish_section(vec![0x00, 0xB0, 0, 0x00, 0x01, 0xC3, 0, 0, 0x00, 0x01, 0xE0 | 0x03, 0x00]);
+        let mut v = vec![0u8];
+        v.extend_from_slice(&pat2);
+        dmx.push(&pk(0, true, &v), &mut msgs);
+        assert_eq!((dmx.pmt, dmx.video), (Some(0x300), None));
     }
 }

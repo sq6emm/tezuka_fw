@@ -175,6 +175,8 @@ mod tests {
         }
         eprintln!("with 25 kHz told: frames {}, freq {:.0} Hz, MER {:.1}", d.stats.frames, d.stats.freq_hz, d.stats.mer_db);
         assert!(d.stats.frames >= 4 && d.stats.mer_db > 20.0);
+        // every frame's L1-pre decoded and as configured
+        assert_eq!((d.stats.l1_ok, d.stats.l1_mismatch), (d.stats.frames, 0), "{:?}", d.stats);
         assert!(r.frames >= 4 && r.ldpc_fail == 0 && r.mer_db.iter().all(|&m| m > 20.0));
         assert!((r.freq_hz - 2000.0).abs() < 50.0);
     }
@@ -249,6 +251,7 @@ mod tests {
         eprintln!("frames {}, blocks {}, packets {}, MER {:.1} dB, freq {:.0} Hz, P1 missed {}, LDPC failures {}", d.stats.frames, d.stats.blocks, packets.len(), d.stats.mer_db, d.stats.freq_hz, d.stats.p1_missed, stats.ldpc_fail);
         assert!(d.stats.frames >= 4, "{} frames", d.stats.frames);
         assert_eq!(stats.ldpc_fail, 0);
+        assert_eq!((d.stats.l1_ok, d.stats.l1_mismatch), (d.stats.frames, 0), "{:?}", d.stats);
         assert!((d.stats.freq_hz - 2000.0).abs() < 30.0);
         let data: Vec<_> = packets.iter().filter(|p| p[1] == 0x01).collect();
         let f0 = u32::from_be_bytes(data[0][4..8].try_into().unwrap());

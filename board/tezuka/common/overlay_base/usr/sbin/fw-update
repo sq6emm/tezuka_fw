@@ -18,6 +18,8 @@
 # (upgrade_available=1). U-Boot counts boots; S99fwconfirm clears the flag
 # once the network and trxd are up; the fourth unconfirmed boot (a hang is
 # rebooted by the watchdog, a panic by panic=10) switches back by itself.
+# A confirmed slot that fails to load boots the other slot for that boot
+# only (UBOOT_FALLBACK=1); the running slot is the one on the command line.
 #
 # First install on a board still running tezuka (one 30 MB "qspi-linux"
 # partition): slot A is written over the old image, which cannot be kept - it
@@ -112,6 +114,9 @@ status() {
 	echo "upgrade_available: $(env_get upgrade_available)"
 	echo "bootcount:         $(env_get bootcount)"
 	[ "$(env_get rolled_back)" = "1" ] && echo "rolled_back:       1 (the last update failed and was reverted)"
+	grep -q 'UBOOT_FALLBACK=1' "$CMDLINE" &&
+		echo "fallback:          slot $(env_get slot) failed to load; running slot ${cur} for this boot (the next update rewrites $(env_get slot))"
+	[ "$(env_get env_restored)" = "1" ] && echo "env_restored:      1 (the U-Boot environment was lost and restored from jffs2, S20uenv)"
 	if [ "$(boot_medium)" = qspi ]; then
 		for s in a b; do
 			echo "slot $s:            $(env_get "ver_$s") $(mtd_dev "linux-$s")"
@@ -140,7 +145,7 @@ while [ $# -gt 0 ]; do
 		if [ "$(env_get upgrade_available)" = "1" ] && [ "$cur" != "$(env_get slot)" ]; then
 			die "slot $(env_get slot) is pending and has not booted yet; not confirming it from slot ${cur:-?}"
 		fi
-		env_set "upgrade_available 0" "bootcount 0" "rolled_back 0"
+		env_set "upgrade_available 0" "bootcount 0" "rolled_back 0" "env_restored 0"
 		log "fw-update: slot ${cur:-?} confirmed"
 		exit 0 ;;
 	--rollback)
@@ -153,7 +158,7 @@ while [ $# -gt 0 ]; do
 	--no-reboot) REBOOT=0 ;;
 	--force) FORCE=1 ;;
 	--bootloader) BOOTLOADER=1 ;;
-	-h|--help) sed -n '3,25p' "$0"; exit 0 ;;
+	-h|--help) sed -n '3,27p' "$0"; exit 0 ;;
 	-*) die "unknown option $1" ;;
 	*) SRC="$1" ;;
 	esac

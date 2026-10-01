@@ -29,7 +29,6 @@ use sdroxide_tci::server::{ServerRequest as TciRequest, TciServerController, Tci
 use sdroxide_types::{
     AgcMode, Band, Command, DeviceCaps, Mode, RigctldConfig, TciServerConfig, TxTelemetry, Vfo,
 };
-use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, DecoderKind, GainMode};
@@ -37,7 +36,6 @@ use crate::cwlive::CwLiveThread;
 use crate::settings::{Settings, Transverter};
 use crate::decode::{Decode, DecodeWorker, Job, Q65Letter};
 use crate::keyer::CwKeyer;
-use crate::mqtt::Mqtt;
 use crate::pace::TxPace;
 use crate::radio::RadioControl;
 use crate::scope::{self, Scope};
@@ -94,25 +92,6 @@ const STREAM_SPAN_MAX: f64 = 300_000.0;
 const DC_AVOID_SPAN_MAX: f64 = 100_000.0;
 /// Room between the edge of the view and the LO.
 const DC_GUARD_HZ: f64 = 5_000.0;
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
-struct PublicState {
-    role: &'static str,
-    freq_hz: f64,
-    tx_freq_hz: f64,
-    mode: &'static str,
-    filter: (f32, f32),
-    ptt: bool,
-    tune: bool,
-    center_hz: f64,
-    rx_gain_db: f64,
-    s_dbfs: i32,
-    tx_attenuation_db: f64,
-    drive_pct: u32,
-    tci_clients: usize,
-    rigctl_clients: usize,
-    time_synced: bool,
-}
 
 /// Where the transmit audio is coming from right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +222,10 @@ pub struct Trx {
     // Transmit DSP
     tx_on: Option<TxSource>,
     tx_since: Option<Instant>,
+    /// RF is on (from set_tx_rf(true) until unkey): the TX LO stays put.
+    rf_live: bool,
+    /// The AD936x TX LO as last written (its own frequency, not the air's).
+    hw_tx_lo: Option<f64>,
     /// MUTE AT TX: the receiver is muted until then after TX.
     rx_quiet_until: Option<Instant>,
     modulator: Option<Box<dyn Modulator>>,
@@ -318,11 +301,8 @@ pub struct Trx {
     // Control surfaces
     tci: Option<TciServerController>,
     rig: Option<RigctldController>,
-    mqtt: Mqtt,
     last_rig: Option<RigState>,
     last_tci: Option<TciStateSnapshot>,
-    last_public: Option<PublicState>,
-    last_public_at: Instant,
     /// Engine time per stage since the last load report (see [`STAGES`]).
     prof: [Duration; STAGES.len()],
 }
@@ -339,7 +319,6 @@ impl Trx {
         cfg: Config,
         radio: Box<dyn RadioControl>,
         tx_sink: Sender<crate::stream::TxBlock>,
-        mqtt: Mqtt,
         web: Option<WebHandle>,
     ) -> Self {
         let rate = radio.stream_rate();
@@ -469,6 +448,8 @@ impl Trx {
             s_dbfs: -120.0,
             tx_on: None,
             tx_since: None,
+            rf_live: false,
+            hw_tx_lo: None,
             rx_quiet_until: None,
             modulator: None,
             datv: None,
@@ -512,11 +493,8 @@ impl Trx {
             mic_buf: Vec::new(),
             tci,
             rig,
-            mqtt,
             last_rig: None,
             last_tci: None,
-            last_public: None,
-            last_public_at: Instant::now(),
             prof: [Duration::ZERO; STAGES.len()],
             cfg,
         };
@@ -605,12 +583,27 @@ impl Trx {
     /// Every frequency here is the one on the air; through a transverter the
     /// AD936x is set to its IF, and an LO above the band mirrors the spectrum
     /// (undone by conjugating the samples both ways).
+    ///
+    /// While RF is on the TX LO never moves (nor the transverter or the
+    /// sockets): a change that would need that ends the transmission first,
+    /// and so does one that takes the TX frequency out of where it may send.
     fn retune(&mut self, force: bool) {
+        if self.rf_live {
+            if let Err(e) = self.tx_check(self.tx_eff(), self.tx_half_bw()) {
+                warn!("transmission ended: {e}");
+                self.unkey();
+                if force {
+                    self.retune(true);
+                }
+                return;
+            }
+        }
         self.follow_port();
         let half = self.rate * 0.4;
         let rx = self.rx_eff();
         let tx = self.tx_eff();
-        let keepout = self.dc_keepout();
+        // (Transmitting, the DC spike in the scope does not matter.)
+        let keepout = if self.rf_live { None } else { self.dc_keepout() };
         let clear = |c: f64| keepout.is_none_or(|(a, b)| c < a || c > b);
         let fits = |f: f64, c: f64| {
             let off = f - c;
@@ -647,10 +640,19 @@ impl Trx {
                 self.apply_offsets();
                 return;
             }
-            if let Err(e) = self.radio.set_los(rx_lo, tx_lo) {
+            let moved = if self.rf_live {
+                if self.hw_tx_lo.is_none_or(|t| (t - tx_lo).abs() >= 1.0) {
+                    return self.end_tx_to_retune(force);
+                }
+                self.radio.set_rx_lo(rx_lo)
+            } else {
+                self.radio.set_los(rx_lo, tx_lo)
+            };
+            if let Err(e) = moved {
                 warn!("tune RX {rx_lo} TX {tx_lo}: {e}");
                 return;
             }
+            self.hw_tx_lo = Some(tx_lo);
             info!(rx_lo, tx_lo, "LOs apart (cross band)");
             self.lo_split = Some((rx_lo, tx_lo));
             self.xvtr = None;
@@ -704,10 +706,20 @@ impl Trx {
                 (lo, lo)
             }
         };
-        if let Err(e) = self.radio.set_lo(hw) {
+        let moved = if self.rf_live {
+            if xvtr != self.xvtr || self.hw_tx_lo.is_none_or(|t| (t - hw).abs() >= 1.0) {
+                return self.end_tx_to_retune(force);
+            }
+            // Only the RX LO comes back (from a cross-band split).
+            self.radio.set_rx_lo(hw)
+        } else {
+            self.radio.set_lo(hw)
+        };
+        if let Err(e) = moved {
             warn!("tune {hw}: {e}");
             return;
         }
+        self.hw_tx_lo = Some(hw);
         if xvtr != self.xvtr {
             info!(xvtr = xvtr.as_ref().map(|t| t.name.as_str()), "transverter");
             self.xvtr = xvtr;
@@ -717,6 +729,55 @@ impl Trx {
         // A row averaged across the move would smear the spectrum.
         self.scope_wide.reset();
         self.apply_offsets();
+    }
+
+    /// A frequency change that needs the TX LO elsewhere while RF is on:
+    /// the transmission ends, then the receiver retunes.
+    fn end_tx_to_retune(&mut self, force: bool) {
+        warn!(tx = self.tx_eff(), "frequency change moves the TX LO: transmission ended");
+        self.unkey();
+        self.retune(force);
+    }
+
+    /// May the transmitter send at `f` (Hz on the air), `half` either side?
+    /// trx.allow_tx, a transverter's own TX flag, else trx.tx_ranges.
+    fn tx_check(&self, f: f64, half: f64) -> Result<(), String> {
+        if !self.cfg.trx.allow_tx {
+            return Err("trx.allow_tx = false".into());
+        }
+        if let Some(t) = self.settings.transverter(f) {
+            return if t.tx { Ok(()) } else { Err(format!("transverter {} is receive-only", t.name)) };
+        }
+        if self.cfg.trx.tx_range_ok(f - half, f + half) {
+            Ok(())
+        } else {
+            Err(format!("{:.4} MHz (+-{:.1} kHz) is outside trx.tx_ranges", f / 1e6, half / 1e3))
+        }
+    }
+
+    /// Half the bandwidth of what is (about to be) sent, Hz.
+    fn tx_half_bw(&self) -> f64 {
+        match &self.datv {
+            // (DVB-T2 keeps its channel width in `sr`.)
+            Some(d) if d.t2.is_some() => d.sr / 2.0,
+            Some(d) => d.sr * (1.0 + d.rolloff as f64) / 2.0,
+            None => (self.filter.0.abs().max(self.filter.1.abs()) as f64).max(1_000.0),
+        }
+    }
+
+    /// The TX analog filter for what is sent: DVB-T2 is wider than the
+    /// default (1 MHz). Set before RF goes on.
+    fn datv_tx_bw(&mut self) {
+        let want = self.datv.as_ref().and_then(|d| d.t2.as_ref()).filter(|_| std::env::var_os("TRXD_NO_TXBW").is_none()).map_or(self.cfg.radio.rf_bandwidth, |t| {
+            self.cfg.radio.rf_bandwidth.max((t.mode.bw_hz * 1.3) as u32)
+        });
+        if want != self.tx_bw {
+            match self.radio.set_tx_bandwidth(want) {
+                Ok(()) => info!(hz = want, "TX bandwidth"),
+                Err(e) => warn!("TX bandwidth: {e}"),
+            }
+            self.tx_bw = want;
+        }
     }
 
     /// Into a band wired to the other sockets (SET > ports): switch to them.
@@ -794,7 +855,8 @@ impl Trx {
     fn make_comp(&self) -> Cessb {
         let (a, b) = (self.filter.0.abs(), self.filter.1.abs());
         let mut c = Cessb::new(CH_RATE, a.min(b).max(100.0), a.max(b).max(300.0));
-        c.set_compression_db(self.comp_db);
+        // SpeechProc does the compression; CESSB only trims the peaks.
+        c.set_compression_db(crate::speech::cessb_drive_db(self.comp_db));
         c
     }
 
@@ -975,9 +1037,18 @@ impl Trx {
         }
         use crate::dvbs2::{Modulator, Params, Rate, ts::Mux, ts::Profile};
         use crate::dvbs2::fpga_tx::{LongMode, Transmitter};
+        // The FPGA's samples go to the DAC untouched: through an inverting
+        // transverter they would go out mirrored (only the software path
+        // can conjugate them).
+        let fpga_path = crate::dvbt2::tx::Mode::parse(rate).is_some() || LongMode::parse(rate).is_some();
+        if fpga_path && self.settings.transverter(self.tx_eff()).is_some_and(|t| t.inverted) {
+            warn!("DATV: the FPGA transmitter cannot send through an inverting transverter");
+            self.datv_refuse(client, "this mode is generated in the FPGA and would go out mirrored through an inverting transverter; use a short-frame mode");
+            return;
+        }
         if let Some(mode) = crate::dvbt2::tx::Mode::parse(rate) {
             // DVB-T2: modulated here, resampled to the DAC rate in the FPGA.
-            let t2 = match crate::dvbt2::tx::T2Tx::start(mode, self.tx_sink.clone(), self.block * 4, self.cfg.trx.t2_drive_db) {
+            let t2 = match crate::dvbt2::tx::T2Tx::start(mode.with_frequency(self.tx_eff()), self.tx_sink.clone(), self.block * 4, self.cfg.trx.t2_drive_db) {
                 Ok(t2) => t2,
                 Err(e) => {
                     warn!("DATV: DVB-T2: {e}");
@@ -1000,7 +1071,7 @@ impl Trx {
                 pilots: true,
                 rolloff: 0.0,
                 ts_rate,
-                mux: Mux::new(ts_rate, &self.callsign()),
+                mux: Mux::new(ts_rate, &self.callsign()).with_delivery(crate::dvbs2::ts::Delivery::T2 { freq_hz: self.tx_eff(), bw_hz: mode.bw_hz, plp_id: 0, t2_system_id: mode.p.t2_system_id }),
                 last_media: Instant::now(),
                 buf: Vec::new(),
             });
@@ -1009,7 +1080,6 @@ impl Trx {
                 self.datv = None;
                 return;
             }
-            self.retune(true);
             info!(bw = mode.bw_hz, mode = rate, ts_rate = ts_rate.round(), video_bps = video_bps.round(), ?profile, "DATV on (DVB-T2)");
             return;
         }
@@ -1043,7 +1113,7 @@ impl Trx {
                 pilots: true,
                 rolloff: 0.35,
                 ts_rate,
-                mux: Mux::new(ts_rate, &self.callsign()),
+                mux: Mux::new(ts_rate, &self.callsign()).with_delivery(crate::dvbs2::ts::Delivery::S2 { freq_hz: self.tx_eff(), symbol_rate: sr, rolloff: 0.35, modcod: mode.modcod() }),
                 last_media: Instant::now(),
                 buf: Vec::new(),
             });
@@ -1052,7 +1122,6 @@ impl Trx {
                 self.datv = None;
                 return;
             }
-            self.retune(true);
             info!(sr, mode = mode.label(), ts_rate = ts_rate.round(), video_bps = video_bps.round(), ?profile, "DATV on (FPGA)");
             return;
         }
@@ -1083,7 +1152,7 @@ impl Trx {
             pilots,
             rolloff: 0.35,
             ts_rate,
-            mux: Mux::new(ts_rate, &self.callsign()),
+            mux: Mux::new(ts_rate, &self.callsign()).with_delivery(crate::dvbs2::ts::Delivery::S2 { freq_hz: self.tx_eff(), symbol_rate: sr, rolloff: 0.35, modcod: rate.modcod() }),
             last_media: Instant::now(),
             buf: Vec::new(),
         });
@@ -1156,16 +1225,20 @@ impl Trx {
         if !self.datv_mode {
             return;
         }
-        self.datv_mode = false;
-        self.datv_rx = None;
-        self.datv_rx_req = None;
-        self.retune(false);
-        self.datv_scan = None;
-        self.datv_auto = false;
-        self.datv_rx_stats = Default::default();
         if matches!(self.tx_on, Some(TxSource::Datv(_))) {
             self.unkey();
         }
+        self.datv_mode = false;
+        self.datv_rx = None;
+        self.datv_rx_req = None;
+        self.datv_scan = None;
+        self.datv_auto = false;
+        self.datv_rx_stats = Default::default();
+        // The slot decoders stood still through DATV: start their slots afresh.
+        for (_, rec) in &mut self.slots {
+            rec.reset();
+        }
+        self.retune(false);
         info!("DATV mode off");
     }
 
@@ -1290,18 +1363,16 @@ impl Trx {
     // ---- Transmit control ----
 
     fn key(&mut self, source: TxSource) {
-        if !self.cfg.trx.allow_tx {
-            warn!("transmit refused: trx.allow_tx = false");
+        if let Some(now) = self.tx_on {
+            // One source at a time: another one taking over mid-transmission
+            // (rigctl T1 during DATV) would feed the wrong path.
+            if now != source {
+                warn!(?now, ?source, "transmit request refused: already transmitting");
+            }
             return;
         }
-        if let Some(t) = self.settings.transverter(self.tx_eff()) {
-            if !t.tx {
-                warn!(xvtr = %t.name, "transmit refused: transverter is receive-only");
-                return;
-            }
-        }
-        if self.tx_on.is_some() {
-            self.tx_on = Some(source);
+        if let Err(e) = self.tx_check(self.tx_eff(), self.tx_half_bw()) {
+            warn!("transmit refused: {e}");
             return;
         }
         self.tx_on = Some(source);
@@ -1318,11 +1389,14 @@ impl Trx {
         self.tx_out.clear();
         self.pace.rekey();
         self.tci_last_audio = Instant::now();
-        self.retune(false);
+        // Every LO and filter move before RF goes on (DATV: the LO onto
+        // the signal). The backend sequences the PTT line and the TX LO.
+        self.retune(matches!(source, TxSource::Datv(_)));
+        self.datv_tx_bw();
         if let Err(e) = self.radio.set_tx_rf(true) {
             warn!("TX on: {e}");
         }
-        std::thread::sleep(Duration::from_millis(self.cfg.radio.ptt_delay_ms as u64));
+        self.rf_live = true;
         info!(freq = self.tx_vfo(), mode = mode_name(self.mode), ?source, "TX");
     }
 
@@ -1338,7 +1412,12 @@ impl Trx {
         }
         self.tx_since = None;
         self.rx_quiet_until = Some(Instant::now() + RX_RECOVER);
-        if self.datv.take().is_some() {
+        let datv = self.datv.take();
+        if datv.is_none() {
+            // The DAC ends on silence rather than holding the last sample.
+            let _ = self.tx_sink.try_send(crate::stream::TxBlock::Iq(vec![Complex32::default(); self.block]));
+        }
+        if datv.is_some() {
             info!("DATV off");
             if let Some((sr, rate, pilots)) = self.datv_rx_req.clone().filter(|_| self.datv_mode && self.datv_rx.is_none()) {
                 self.datv_rx_start(sr, &rate, pilots);
@@ -1357,12 +1436,17 @@ impl Trx {
             t.drain_tx_audio();
             t.deny_tx();
         }
-        // Let the queued RF (a few blocks) drain before the relay drops.
-        std::thread::sleep(Duration::from_millis(self.cfg.radio.ptt_delay_ms as u64 + 30));
+        // Let the queued RF (a few blocks) drain before RF goes off; the
+        // backend then waits ptt_delay before the PTT line drops.
+        let queued = self.tx_sink.len() as f64 * self.block as f64 / self.rate;
+        std::thread::sleep(Duration::from_secs_f64(0.03 + queued.min(0.5)));
         if let Err(e) = self.radio.set_tx_rf(false) {
             warn!("TX off: {e}");
         }
+        self.rf_live = false;
         info!("RX");
+        // Back to where receiving wants the LO (after a cross-band split).
+        self.retune(false);
     }
 
     // ---- Command handling (TCI / rigctld / MQTT all end up here) ----
@@ -1418,17 +1502,11 @@ impl Trx {
         }
     }
 
-    fn apply_mqtt(&mut self, name: &str, payload: &str) {
+    /// A named setting from the web UI (drive, txatt, cw_wpm, rxgain), its
+    /// value as text.
+    fn apply_setting(&mut self, name: &str, payload: &str) {
         let num = payload.parse::<f64>();
         match (name, num) {
-            ("freq", Ok(hz)) => self.set_vfo(self.active, hz),
-            ("mode", _) => match sdroxide_rigctld::from_hamlib_mode(payload) {
-                Some(m) => self.set_mode(m),
-                None => warn!("MQTT mode '{payload}' unknown"),
-            },
-            ("ptt", _) => self.apply(Command::SetPtt(matches!(payload, "1" | "true" | "on"))),
-            ("tune", _) => self.apply(Command::SetTune(matches!(payload, "1" | "true" | "on"))),
-            ("cw", _) => self.send_cw(payload),
             ("cw_wpm", Ok(w)) => self.keyer.set_wpm(w as f32),
             ("drive", Ok(p)) => self.drive = (p / 100.0).clamp(0.0, 1.0) as f32,
             ("txatt", Ok(db)) => {
@@ -1443,7 +1521,7 @@ impl Trx {
                     "fast" => (GainMode::FastAttack, self.rx_gain_db),
                     p => match p.parse::<f64>() {
                         Ok(db) => (GainMode::Manual, db),
-                        Err(_) => return warn!("MQTT rxgain '{p}'"),
+                        Err(_) => return warn!("rxgain '{p}'"),
                     },
                 };
                 self.rx_gain_mode = mode;
@@ -1452,13 +1530,7 @@ impl Trx {
                     warn!("{e}");
                 }
             }
-            ("filter", _) => {
-                let v: Vec<f32> = payload.split(',').filter_map(|s| s.trim().parse().ok()).collect();
-                if v.len() == 2 {
-                    self.apply(Command::SetFilter { rx: sdroxide_types::RxId::Main, lo: v[0], hi: v[1] });
-                }
-            }
-            _ => warn!("MQTT command '{name}' = '{payload}' not understood"),
+            _ => warn!("setting '{name}' = '{payload}' not understood"),
         }
     }
 
@@ -1503,9 +1575,6 @@ impl Trx {
             } else {
                 self.unkey();
             }
-        }
-        for (name, payload) in self.mqtt.poll_cmds() {
-            self.apply_mqtt(&name, &payload);
         }
     }
 
@@ -1566,32 +1635,6 @@ impl Trx {
                 t.broadcast_state(tci.clone());
             }
             self.last_tci = Some(tci);
-        }
-
-        if self.last_public_at.elapsed() >= Duration::from_secs(1) {
-            let p = PublicState {
-                role: "trx",
-                freq_hz: self.rx_vfo(),
-                tx_freq_hz: self.tx_vfo(),
-                mode: mode_name(self.mode),
-                filter: self.filter,
-                ptt: self.tx_on.is_some(),
-                tune: self.tx_on == Some(TxSource::Tune),
-                center_hz: self.center,
-                rx_gain_db: self.rx_gain_db,
-                s_dbfs: self.s_dbfs.round() as i32,
-                tx_attenuation_db: self.tx_att_db,
-                drive_pct: (self.drive * 100.0).round() as u32,
-                tci_clients: self.tci.as_ref().map_or(0, |t| t.clients()),
-                rigctl_clients: self.rig.as_ref().map_or(0, |r| r.clients()),
-                time_synced: time_synced(),
-            };
-            // Publish on change, and at least every 30 s as a heartbeat.
-            if self.last_public.as_ref() != Some(&p) || self.last_public_at.elapsed() >= Duration::from_secs(30) {
-                self.mqtt.publish_json("state", &p, true);
-                self.last_public = Some(p);
-                self.last_public_at = Instant::now();
-            }
         }
     }
 
@@ -1882,17 +1925,6 @@ impl Trx {
                 }
             }
             Some(TxSource::Datv(client)) => {
-                // DVB-T2 is wider than the TX filter's default (1 MHz).
-                let want = self.datv.as_ref().and_then(|d| d.t2.as_ref()).filter(|_| std::env::var_os("TRXD_NO_TXBW").is_none()).map_or(self.cfg.radio.rf_bandwidth, |t| {
-                    self.cfg.radio.rf_bandwidth.max((t.mode.bw_hz * 1.3) as u32)
-                });
-                if want != self.tx_bw {
-                    match self.radio.set_tx_bandwidth(want) {
-                        Ok(()) => info!(hz = want, "TX bandwidth"),
-                        Err(e) => warn!("TX bandwidth: {e}"),
-                    }
-                    self.tx_bw = want;
-                }
                 let mut starved = self.datv.is_none();
                 if let Some(d) = &mut self.datv {
                     if let Some(w) = &self.web {
@@ -2081,13 +2113,9 @@ impl Trx {
         serde_json::json!({"type": "cw", "text": text, "pending": pending})
     }
 
-    /// Live CW text out when it changed: the whole (capped) text to the web
-    /// UI, what settled since last time to MQTT `cw/text`.
+    /// Live CW text out to the web UI when it changed (the whole, capped, text).
     fn publish_cwlive(&mut self) {
-        let Some((text, pending, fresh)) = self.cwlive.changed() else { return };
-        if !fresh.trim().is_empty() {
-            self.mqtt.publish_json("cw/text", &serde_json::json!({"text": fresh, "freq_hz": self.rx_vfo() + CW_PITCH_HZ}), false);
-        }
+        let Some((text, pending, _fresh)) = self.cwlive.changed() else { return };
         if let Some(w) = &self.web {
             if w.clients() > 0 {
                 w.send_json(&serde_json::json!({"type": "cw", "text": text, "pending": pending}));
@@ -2475,7 +2503,7 @@ impl Trx {
             }
             "drive" | "txatt" | "cw_wpm" => {
                 if let Some(v) = num("value") {
-                    self.apply_mqtt(cmd, &v.to_string());
+                    self.apply_setting(cmd, &v.to_string());
                 }
             }
             "rxgain" => {
@@ -2484,7 +2512,7 @@ impl Trx {
                     Some("fast") => "fast".into(),
                     _ => "slow".into(),
                 };
-                self.apply_mqtt("rxgain", &payload);
+                self.apply_setting("rxgain", &payload);
             }
             "cw" => {
                 if let Some(t) = m["text"].as_str() {
@@ -2574,7 +2602,12 @@ impl Trx {
             }
             "xvtr_set" => {
                 if let Ok(list) = serde_json::from_value::<Vec<Transverter>>(m["list"].clone()) {
-                    let ok = list.iter().all(|t| t.rf_max > t.rf_min && !t.name.trim().is_empty());
+                    // Names go into the page and the S-meter tables: plain ones only.
+                    let name_ok = |n: &str| {
+                        let n = n.trim();
+                        (1..=24).contains(&n.len()) && n.chars().all(|c| c.is_ascii_alphanumeric() || " ._-".contains(c))
+                    };
+                    let ok = list.iter().all(|t| t.rf_max > t.rf_min && name_ok(&t.name));
                     if ok {
                         self.settings.transverters = list;
                         self.settings.save(&self.settings_dir);
@@ -2583,7 +2616,7 @@ impl Trx {
                         self.set_vfo(self.active, f);
                         self.retune(true);
                     } else {
-                        warn!("transverter list refused: a name is empty or a range is backwards");
+                        warn!("transverter list refused: a name is empty or not plain (letters, digits, space . _ -, 24 at most), or a range is backwards");
                     }
                 }
             }
@@ -2645,6 +2678,18 @@ impl Trx {
         let mut loads = LoadMeter::new();
         for b in rx {
             let t = Instant::now();
+            crate::safety::tick();
+            if crate::safety::take_tripped() {
+                warn!("the TX watchdog switched RF off: unkeying");
+                self.unkey();
+            }
+            if self.tx_on.is_none() {
+                if let Some(hz) = crate::refclock::take_pending() {
+                    if let Err(e) = self.radio.apply_xo(hz) {
+                        warn!("xo_correction: {e}");
+                    }
+                }
+            }
             self.poll_controls();
             self.receive(&b);
             let mut mark = Instant::now();
@@ -2652,7 +2697,6 @@ impl Trx {
             self.lap(7, &mut mark);
             for d in self.decoder.poll() {
                 info!(mode = %d.mode, snr = d.snr_db, freq = d.freq_hz, "{}", d.message);
-                self.mqtt.publish_decode(&d);
                 self.web_decode(&d);
             }
             self.poll_web();
@@ -2711,5 +2755,127 @@ impl LoadMeter {
             return true;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A radio that only writes down what it is told.
+    struct Rec {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Rec {
+        fn note(&self, s: String) -> Result<(), String> {
+            self.log.lock().unwrap().push(s);
+            Ok(())
+        }
+    }
+
+    impl RadioControl for Rec {
+        fn stream_rate(&self) -> f64 {
+            384_000.0
+        }
+        fn set_lo(&mut self, hz: f64) -> Result<(), String> {
+            self.note(format!("lo {hz:.0}"))
+        }
+        fn set_los(&mut self, rx: f64, tx: f64) -> Result<(), String> {
+            self.note(format!("los {rx:.0} {tx:.0}"))
+        }
+        fn set_rx_lo(&mut self, hz: f64) -> Result<(), String> {
+            self.note(format!("rxlo {hz:.0}"))
+        }
+        fn apply_xo(&mut self, hz: f64) -> Result<(), String> {
+            self.note(format!("xo {hz:.0}"))
+        }
+        fn set_rx_gain(&mut self, _: GainMode, _: f64) -> Result<(), String> {
+            Ok(())
+        }
+        fn set_tx_attenuation(&mut self, _: f64) -> Result<(), String> {
+            Ok(())
+        }
+        fn set_tx_rf(&mut self, on: bool) -> Result<(), String> {
+            self.note(format!("rf {}", if on { "on" } else { "off" }))
+        }
+        fn rx_gain_db(&mut self) -> f64 {
+            0.0
+        }
+    }
+
+    fn trx(freq: f64) -> (Trx, Arc<Mutex<Vec<String>>>) {
+        let dir = std::env::temp_dir().join(format!("trxd-trx-test-{}-{}", std::process::id(), freq as u64));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut cfg = Config::default();
+        cfg.trx.freq_hz = freq;
+        cfg.trx.tci_bind = "127.0.0.1".into();
+        cfg.trx.tci_port = 0;
+        cfg.trx.rigctl_bind = "127.0.0.1".into();
+        cfg.trx.rigctl_port = 0;
+        cfg.web.state_dir = dir.to_string_lossy().into();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let t = Trx::new(cfg, Box::new(Rec { log: log.clone() }), tx, None);
+        log.lock().unwrap().clear();
+        (t, log)
+    }
+
+    fn after_rf_on(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        let l = log.lock().unwrap();
+        let i = l.iter().position(|s| s == "rf on").expect("keyed");
+        l[i + 1..].to_vec()
+    }
+
+    #[test]
+    fn transmit_refused_outside_the_tx_ranges() {
+        let (mut t, log) = trx(147_000_000.0);
+        t.apply(Command::SetPtt(true));
+        assert!(t.tx_on.is_none());
+        assert!(!log.lock().unwrap().iter().any(|s| s == "rf on"));
+        t.cfg.trx.tx_ranges = vec![[146e6, 148e6]];
+        t.apply(Command::SetPtt(true));
+        assert_eq!(t.tx_on, Some(TxSource::Ptt));
+    }
+
+    #[test]
+    fn small_moves_while_keyed_keep_the_tx_lo() {
+        let (mut t, log) = trx(144_300_000.0);
+        t.apply(Command::SetPtt(true));
+        t.set_vfo(Vfo::A, 144_310_000.0);
+        assert_eq!(t.tx_on, Some(TxSource::Ptt));
+        assert!(after_rf_on(&log).is_empty(), "{:?}", log.lock().unwrap());
+    }
+
+    #[test]
+    fn a_move_that_needs_the_lo_ends_the_transmission_first() {
+        let (mut t, log) = trx(144_300_000.0);
+        t.apply(Command::SetPtt(true));
+        t.set_vfo(Vfo::A, 145_500_000.0);
+        assert!(t.tx_on.is_none());
+        let after = after_rf_on(&log);
+        assert_eq!(after.first().map(String::as_str), Some("rf off"), "{after:?}");
+        assert!(after.iter().any(|s| s.starts_with("lo ")), "{after:?}");
+    }
+
+    #[test]
+    fn leaving_the_band_while_keyed_unkeys() {
+        let (mut t, log) = trx(145_990_000.0);
+        t.apply(Command::SetPtt(true));
+        assert!(t.tx_on.is_some());
+        t.set_vfo(Vfo::A, 146_010_000.0);
+        assert!(t.tx_on.is_none());
+        assert_eq!(after_rf_on(&log).first().map(String::as_str), Some("rf off"));
+    }
+
+    #[test]
+    fn a_second_source_does_not_take_over() {
+        let (mut t, _log) = trx(144_300_000.0);
+        t.apply(Command::SetPtt(true));
+        t.apply(Command::SetTune(true));
+        assert_eq!(t.tx_on, Some(TxSource::Ptt));
+        t.apply(Command::SetPtt(false));
+        assert!(t.tx_on.is_none());
     }
 }

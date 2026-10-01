@@ -24,11 +24,11 @@ mod keyer;
 mod maia;
 mod morse;
 mod model;
-mod mqtt;
 mod pace;
 mod pi4;
 mod radio;
 mod refclock;
+mod safety;
 mod scope;
 mod slots;
 mod speech;
@@ -253,6 +253,8 @@ fn main() -> ExitCode {
         };
     }
 
+    // RF off on a panic, a signal or a stalled engine (before any thread).
+    safety::install();
     let initial_lo = match cfg.role {
         Role::Trx => cfg.trx.freq_hz,
         Role::BeaconTx => cfg.beacon.freq_hz,
@@ -273,7 +275,9 @@ fn main() -> ExitCode {
     let rate = radio.control.stream_rate();
     let rx = stream::spawn_rx(radio.rx, rate, cfg.radio.buffer_samples);
     let tx = stream::spawn_tx(radio.tx, cfg.radio.buffer_samples);
-    let mqtt = mqtt::Mqtt::start(&cfg);
+    if cfg.mqtt.is_some() {
+        tracing::warn!("the [mqtt] section is ignored: MQTT was removed (decodes and reports go to the log)");
+    }
     info!(role = ?cfg.role, call = %cfg.callsign, "trxd {}", env!("CARGO_PKG_VERSION"));
 
     // A reference correction retunes the synthesizers for a few ms. A beacon
@@ -286,17 +290,21 @@ fn main() -> ExitCode {
         (56.0..58.5).contains(&s)
     }
     if cfg.radio.backend == Backend::Iio {
-        let quiet = if cfg.role == Role::BeaconTx { beacon_tail } else { always };
-        refclock::spawn(cfg.reference.clone(), mqtt.publisher(), quiet);
+        let apply = match cfg.role {
+            Role::Trx => refclock::Apply::Engine,
+            Role::BeaconTx => refclock::Apply::Direct(beacon_tail),
+            Role::BeaconRx => refclock::Apply::Direct(always),
+        };
+        refclock::spawn(cfg.reference.clone(), apply);
     }
 
     match cfg.role {
         Role::Trx => {
             let web = web::start(&cfg.web);
-            trx::Trx::new(cfg, radio.control, tx, mqtt, web).run(rx)
+            trx::Trx::new(cfg, radio.control, tx, web).run(rx)
         }
-        Role::BeaconTx => beacon::run_tx(cfg, radio.control, rx, tx, mqtt),
-        Role::BeaconRx => beacon::run_rx(cfg, radio.control, rx, tx, mqtt),
+        Role::BeaconTx => beacon::run_tx(cfg, radio.control, rx, tx),
+        Role::BeaconRx => beacon::run_rx(cfg, radio.control, rx, tx),
     }
     ExitCode::SUCCESS
 }

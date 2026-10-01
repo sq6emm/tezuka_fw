@@ -66,6 +66,15 @@ pub fn request(mode: &str, resume: &serde_json::Value) -> ! {
     let _ = std::fs::write(RESUME, resume.to_string());
     let _ = std::fs::write(WANT, mode);
     tracing::info!(from = %loaded(), to = mode, "FPGA bitstream switch: restarting");
+    // The bus masters in the PL to rest before it is reconfigured (fpga-mode
+    // does it again, and the rest: the spectrometer, the T2 router, the
+    // CW-RS network). exit() runs no destructors: the front end's would
+    // not stop the ring.
+    if loaded() != "trx" {
+        crate::dvbs2::fpga_tx::quiesce();
+        crate::dvbs2::fpga::quiesce();
+        crate::dvbs2::fpga_ldpc::quiesce();
+    }
     std::process::exit(0);
 }
 

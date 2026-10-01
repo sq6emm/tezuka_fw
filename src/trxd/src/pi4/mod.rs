@@ -1,6 +1,6 @@
 // Copied from sdroxide (crates/sdroxide-digi/src/pi4, rev 77c8ee3d, GPL-3.0-or-later,
 // same author) so trxd does not pull in all of sdroxide-digi. Keep in sync by
-// re-copying; local changes: none besides this note.
+// re-copying; local changes: decode.rs FREQ_RADIUS_HZ 300 (was 150).
 //! PI4 — the "Next Generation Beacon" digital mode.
 //!
 //! 4-FSK, 146 symbols at 166.667 ms each (24.333 s), rate-1/2 K=32

@@ -13,7 +13,7 @@ pub enum Role {
     Trx,
     /// MGM beacon transmitter (digital mode / CW / carrier, minute cycle).
     BeaconTx,
-    /// Beacon receiver: decode each minute, publish to MQTT.
+    /// Beacon receiver: decode each minute, decodes and carrier reports to the log.
     BeaconRx,
 }
 
@@ -31,7 +31,9 @@ pub struct Config {
     pub trx: TrxConfig,
     pub beacon: BeaconConfig,
     pub beacon_rx: BeaconRxConfig,
-    pub mqtt: MqttConfig,
+    /// Ignored: MQTT was removed (2026-10-01). Accepted so a config that
+    /// still has an [mqtt] section loads (with a warning).
+    pub mqtt: Option<toml::Value>,
     pub reference: crate::refclock::RefConfig,
     pub web: crate::web::WebConfig,
 }
@@ -47,7 +49,7 @@ impl Default for Config {
             trx: TrxConfig::default(),
             beacon: BeaconConfig::default(),
             beacon_rx: BeaconRxConfig::default(),
-            mqtt: MqttConfig::default(),
+            mqtt: None,
             reference: crate::refclock::RefConfig::default(),
             web: crate::web::WebConfig::default(),
         }
@@ -173,6 +175,11 @@ pub struct TrxConfig {
     pub rigctl_port: u16,
     /// Whether network clients may key the transmitter at all.
     pub allow_tx: bool,
+    /// Where the transmitter may be keyed: [low, high] Hz on the air, the
+    /// whole occupied band inside one range. A transverter set up in the web
+    /// UI as able to transmit adds its own band. The default is the IARU
+    /// Region 1 amateur allocations the AD936x reaches; check your licence.
+    pub tx_ranges: Vec<[f64; 2]>,
     /// Transmit time-out: unkey after this many seconds of continuous TX.
     pub max_tx_seconds: u32,
     /// Slot decoders running at start (q65 / pi4); the web UI switches
@@ -207,6 +214,7 @@ impl Default for TrxConfig {
             rigctl_bind: "0.0.0.0".into(),
             rigctl_port: 4532,
             allow_tx: true,
+            tx_ranges: default_tx_ranges(),
             max_tx_seconds: 180,
             decoders: Vec::new(),
             q65_submode: "D".into(),
@@ -248,8 +256,14 @@ pub struct BeaconConfig {
     pub cw_space_shift_hz: f64,
     /// CW text; empty builds "<CALL> <CALL> LOC <LOC> <LOC> " like MGMBeacon.
     pub cw_text: String,
-    /// Digital tone 0 offset from the carrier, Hz.
+    /// Digital tone 0 offset from the carrier, Hz. Unset (nan) = the mode's
+    /// convention: PI4 -117.1875 (tone 0 below the carrier, as the PI4
+    /// specification places it), Q65 0 (tone 0 on the carrier, MGMBeacon).
     pub tone0_offset_hz: f64,
+    /// PI4 only: the IARU-R1 one-minute sequence every minute (PI4 from
+    /// second 0, then CW, then carrier) instead of the MGMBeacon two-minute
+    /// cycle (PI4 in even minutes, CW in odd ones).
+    pub pi4_every_minute: bool,
     /// Refuse to key a timed sequence without a synchronised clock; send
     /// "NOTIME" + CW + carrier instead, like MGMBeacon.
     pub require_time_sync: bool,
@@ -268,7 +282,8 @@ impl Default for BeaconConfig {
             cw_wpm: 12,
             cw_space_shift_hz: 400.0,
             cw_text: String::new(),
-            tone0_offset_hz: 0.0,
+            tone0_offset_hz: f64::NAN,
+            pi4_every_minute: false,
             require_time_sync: true,
             tx_latency_ms: 40,
             hny: true,
@@ -303,30 +318,27 @@ impl Default for BeaconRxConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct MqttConfig {
-    pub enabled: bool,
-    pub host: String,
-    pub port: u16,
-    pub username: String,
-    pub password: String,
-    /// `{hostname}` is replaced with the device hostname.
-    pub topic_prefix: String,
-    pub client_id: String,
+/// IARU Region 1 amateur allocations between 47 MHz and 6 GHz, Hz.
+pub fn default_tx_ranges() -> Vec<[f64; 2]> {
+    [
+        (50.0, 54.0),
+        (70.0, 70.5),
+        (144.0, 146.0),
+        (430.0, 440.0),
+        (1240.0, 1300.0),
+        (2300.0, 2450.0),
+        (3400.0, 3475.0),
+        (5650.0, 5850.0),
+    ]
+    .iter()
+    .map(|&(a, b)| [a * 1e6, b * 1e6])
+    .collect()
 }
 
-impl Default for MqttConfig {
-    fn default() -> Self {
-        MqttConfig {
-            enabled: true,
-            host: "127.0.0.1".into(),
-            port: 1883,
-            username: String::new(),
-            password: String::new(),
-            topic_prefix: "trxd/{hostname}".into(),
-            client_id: String::new(),
-        }
+impl TrxConfig {
+    /// Is [lo, hi] (Hz on the air) inside one of the transmit ranges?
+    pub fn tx_range_ok(&self, lo: f64, hi: f64) -> bool {
+        self.tx_ranges.iter().any(|&[a, b]| lo >= a && hi <= b)
     }
 }
 
@@ -356,6 +368,33 @@ impl Config {
         if r.lo_offset_hz.abs() * 2.0 > stream * 0.8 {
             return Err("radio.lo_offset_hz does not fit inside the stream bandwidth".into());
         }
+        for [a, b] in &self.trx.tx_ranges {
+            if !(a.is_finite() && b.is_finite() && a < b) {
+                return Err(format!("trx.tx_ranges: [{a}, {b}] is not a range"));
+            }
+        }
+        if !(r.freq_min_hz < r.freq_max_hz) {
+            return Err("radio.freq_min_hz must be below radio.freq_max_hz".into());
+        }
+        if r.ptt_delay_ms > 1000 {
+            return Err("radio.ptt_delay_ms above 1000 ms".into());
+        }
+        if self.trx.max_tx_seconds == 0 || self.trx.max_tx_seconds > 3600 {
+            return Err("trx.max_tx_seconds must be 1..3600".into());
+        }
+        if self.role == Role::BeaconTx {
+            let f = self.beacon.freq_hz;
+            if !(r.freq_min_hz..=r.freq_max_hz).contains(&f) {
+                return Err(format!("beacon.freq_hz {f} is outside the radio's range"));
+            }
+            if !self.trx.allow_tx {
+                return Err("trx.allow_tx = false: the beacon transmitter may not transmit".into());
+            }
+            // Carrier, CW key-up shift below it, digital tones above it.
+            if !self.trx.tx_range_ok(f - 1_000.0, f + 2_000.0) {
+                return Err(format!("beacon.freq_hz {f} is outside trx.tx_ranges"));
+            }
+        }
         let loc = self.locator.trim();
         if !(loc.len() == 4 || loc.len() == 6) {
             return Err("locator must be 4 or 6 characters".into());
@@ -368,16 +407,12 @@ impl Config {
         Ok(())
     }
 
-    /// Hostname, for the MQTT topic prefix.
+    /// Hostname (the web UI's certificate name).
     pub fn hostname() -> String {
         std::fs::read_to_string("/etc/hostname")
             .or_else(|_| std::fs::read_to_string("/proc/sys/kernel/hostname"))
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "trxd".into())
-    }
-
-    pub fn topic_prefix(&self) -> String {
-        self.mqtt.topic_prefix.replace("{hostname}", &Self::hostname())
     }
 
     /// The CW identification text, MGMBeacon style, unless configured.

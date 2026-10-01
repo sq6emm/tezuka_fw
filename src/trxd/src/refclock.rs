@@ -25,7 +25,6 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::mqtt::Mqtt;
 use crate::stream::{time_synced, unix_now};
 
 const REFMETER_BASE: u64 = 0x43C1_0000;
@@ -264,23 +263,41 @@ fn libre_vctcxo() -> Option<Regs> {
     Regs::map(VCTCXO_BASE).ok()
 }
 
-/// Spawn the disciplining thread. `quiet` says whether a PLL recalculation
-/// (a few ms of LO settling) is acceptable right now.
-pub fn spawn(cfg: RefConfig, mqtt: Mqtt, quiet: fn() -> bool) {
+/// How a correction reaches the AD936x.
+#[derive(Clone, Copy)]
+pub enum Apply {
+    /// Written from this thread when `quiet()` says a PLL recalculation (a
+    /// few ms of LO settling) is acceptable (the beacon roles, whose engines
+    /// never retune).
+    Direct(fn() -> bool),
+    /// Handed to the engine thread ([`take_pending`]), which owns the LOs and
+    /// applies it only while not transmitting (the trx role).
+    Engine,
+}
+
+static PENDING: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+/// A correction waiting for the engine (the newest wins), Hz of the reference.
+pub fn take_pending() -> Option<f64> {
+    PENDING.lock().ok()?.take()
+}
+
+/// Spawn the disciplining thread.
+pub fn spawn(cfg: RefConfig, apply: Apply) {
     if cfg.mode == RefMode::Off {
         return;
     }
     std::thread::Builder::new()
         .name("refclock".into())
         .spawn(move || {
-            if let Err(e) = run(cfg, mqtt, quiet) {
+            if let Err(e) = run(cfg, apply) {
                 warn!("reference disciplining disabled: {e}");
             }
         })
         .expect("spawn refclock");
 }
 
-fn run(cfg: RefConfig, mqtt: Mqtt, quiet: fn() -> bool) -> Result<(), String> {
+fn run(cfg: RefConfig, apply: Apply) -> Result<(), String> {
     let meter = Regs::map(REFMETER_BASE)?;
     if meter.rd(0x00) != REFMETER_ID {
         return Err("no refmeter in this bitstream".into());
@@ -345,7 +362,13 @@ fn run(cfg: RefConfig, mqtt: Mqtt, quiet: fn() -> bool) -> Result<(), String> {
         }
 
         if let (true, Some(f)) = (software, est) {
-            if (f - applied).abs() >= cfg.min_step_hz && quiet() {
+            if (f - applied).abs() >= cfg.min_step_hz && matches!(apply, Apply::Engine) {
+                if let Ok(mut p) = PENDING.lock() {
+                    *p = Some(f);
+                }
+                info!(source, measured = f, ppb = (f - NOMINAL_HZ) / NOMINAL_HZ * 1e9, "xo_correction (to the engine)");
+                applied = f;
+            } else if (f - applied).abs() >= cfg.min_step_hz && matches!(apply, Apply::Direct(q) if q()) {
                 match apply_xo(&phy, f) {
                     Ok(()) => {
                         info!(source, measured = f, ppb = (f - NOMINAL_HZ) / NOMINAL_HZ * 1e9, "xo_correction");
@@ -357,7 +380,8 @@ fn run(cfg: RefConfig, mqtt: Mqtt, quiet: fn() -> bool) -> Result<(), String> {
         }
 
         let now = unix_now();
-        if now - last_pub >= 10.0 {
+        // the state in the log every 5 minutes
+        if now - last_pub >= 300.0 {
             last_pub = now;
             let state = RefState {
                 source: if vctcxo.is_some() && !software { "libre-vctcxo" } else { source },
@@ -368,7 +392,7 @@ fn run(cfg: RefConfig, mqtt: Mqtt, quiet: fn() -> bool) -> Result<(), String> {
                 libre_vctcxo_locked: hw_locked(&vctcxo),
                 time_synced: time_synced(),
             };
-            mqtt.publish_json("reference", &state, true);
+            info!(state = %serde_json::to_string(&state).unwrap_or_default(), "reference");
         }
     }
 }

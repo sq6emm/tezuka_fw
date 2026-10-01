@@ -65,13 +65,54 @@ On the board, `fw-update` does the following:
 
 U-Boot counts every boot of an unconfirmed slot. `iminfo` verifies every
 image hash in the slot before booting. A failure resets, which counts, and so
-does a kernel panic (`panic=10`). A lockup after init has started is caught by
-the watchdog (`S15watchdog`). U-Boot has no watchdog, though, so a hang in
-U-Boot or early in the kernel stays hung until the power is cycled. Each power
-cycle counts as a boot. `S99fwconfirm` confirms
-the slot once the network is up, dropbear listens and trxd runs, which clears
-`upgrade_available`. The fourth unconfirmed boot switches back to the previous
-slot automatically and sets `rolled_back=1`.
+does a kernel panic (`panic=10`). The boot script starts the Zynq system
+watchdog before it reads the slot (`wdt_start`, about 160-190 s), so a hang
+while loading, in `bootm` or in the kernel before `S15watchdog` takes the
+watchdog over also resets the board and counts. (U-Boot itself has no
+watchdog support compiled in, and it is never rewritten, so the watchdog is
+started from the environment's script, with `mw`; a hang in U-Boot before the
+script runs is not covered.) An interrupted autoboot does not start it, so
+work at the U-Boot prompt or a manual `run dfu_sf` is not reset.
+`S99fwconfirm` confirms the slot once the uplink has an address, dropbear
+runs and the same trxd process has stayed up for 20 s, which clears
+`upgrade_available`. The uplink is not `usb0` (it always has its static
+192.168.2.1, even with Ethernet broken): each healthy boot records in
+`/mnt/jffs2/fw-uplinks` which other interfaces had an address, and a new slot
+must bring up one of them. An empty record means a USB-only board, where
+`usb0` counts. The fourth unconfirmed boot switches back to the previous slot
+automatically and sets `rolled_back=1`.
+
+A **confirmed** slot that fails to load (a flash read error, a damaged
+image) no longer drops to USB DFU: U-Boot boots the other slot, for that boot
+only, with `UBOOT_SLOT=<other> UBOOT_FALLBACK=1` on the kernel command line.
+Nothing is saved: `slot=` still names the failed slot, `fw-update --status`
+and the console say so, and the next `fw-update` writes over the failed slot.
+DFU is entered only when both slots fail (the watchdog then resets the board
+after about three minutes and it tries again).
+
+### The U-Boot environment has one copy
+
+A power cut while the environment is written (`fw-update`, `fw_setenv`, or
+U-Boot counting the boots of a new slot) leaves it with a bad CRC. U-Boot
+then uses its built-in defaults, which boot slot A, and the A/B scripts, the
+boot counter and the network settings are gone.
+
+A redundant environment (`CONFIG_SYS_REDUNDAND_ENVIRONMENT`, two sectors with
+a flags byte) would avoid that, but it is a U-Boot build option, and U-Boot is
+never rewritten by updates: boards in the field keep the single-copy U-Boot
+they have. The rootfs's `fw_env.config` must match the U-Boot on the board;
+a two-copy `fw_env.config` against a single-copy U-Boot makes every Linux
+write unreadable for U-Boot (bad CRC, defaults, slot A). So it is not used.
+
+Instead `S20uenv` (after jffs2 is mounted, before the network starts) keeps
+a copy: on every boot of a confirmed slot it saves the environment to
+`/mnt/jffs2/uboot-env.bak` when it changed, and on a bad CRC it writes that
+copy back, with `slot=` the slot running now, nothing pending, and
+`env_restored=1` (logged in `fw-update.log`, shown by `fw-update --status`).
+The network settings are then back before `S40network` reads them. Tested
+with the real `fw_printenv`/`fw_setenv` against a file-backed environment:
+good, unchanged, pending (no backup taken), damaged (restored), erased with
+no copy.
 
 On the board:
 
@@ -95,7 +136,9 @@ so USB DFU recovery keeps working. Every later update goes to the other slot
 and is protected.
 
 The U-Boot boot scripts were run in U-Boot's sandbox build for every state
-(fresh, pending, counting, rollback, failed load). The `fw-update` flash
+(fresh, pending, counting, rollback, failed load; 2026-10-01 also: confirmed
+slot failing with the other slot good, both failing, the kernel command line
+of a fallback boot, and the watchdog register values). The `fw-update` flash
 writes were tested against simulated MTD devices for both layouts. Neither
 has run on a real board yet.
 

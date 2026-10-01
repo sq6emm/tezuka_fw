@@ -93,8 +93,7 @@ for f in gpsmon gpsdecode gpsctl cgps gpsrinex lcdgps gpxlogger ntpshmmon gpssnm
 done
 rm -f "${TARGET_DIR}"/usr/lib/libgfortran.so* "${TARGET_DIR}"/usr/lib/libgomp.so* \
       "${TARGET_DIR}"/usr/lib/libatomic.so* "${TARGET_DIR}"/usr/lib/libgpiodcxx.so* \
-      "${TARGET_DIR}"/usr/lib/libstdc++.so* \
-      "${TARGET_DIR}"/usr/lib/libmosquittopp.so*
+      "${TARGET_DIR}"/usr/lib/libstdc++.so*
 rm -f "${TARGET_DIR}/sbin/tc" "${TARGET_DIR}/sbin/ss" "${TARGET_DIR}/sbin/bridge" \
       "${TARGET_DIR}/sbin/dcb" "${TARGET_DIR}/sbin/devlink" "${TARGET_DIR}/sbin/rdma" \
       "${TARGET_DIR}/sbin/tipc" "${TARGET_DIR}/sbin/vdpa"

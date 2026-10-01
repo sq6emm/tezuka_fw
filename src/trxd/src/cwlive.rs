@@ -96,7 +96,7 @@ impl Finder {
     /// Feed audio; `Some(hz)` when a tone has stood out twice in a row.
     fn push(&mut self, audio: &[f32]) -> Option<f32> {
         for &a in audio {
-            self.ring[self.pos] = a;
+            self.ring[self.pos] = if a.is_finite() { a } else { 0.0 };
             self.pos = (self.pos + 1) % FIND_N;
         }
         self.filled = (self.filled + audio.len()).min(FIND_N);
@@ -114,7 +114,8 @@ impl Finder {
             *a = 0.6 * *a + 0.4 * z.norm_sqr();
         }
         let bin = self.rate as f32 / FIND_N as f32;
-        let lo = ((self.band.0 + FIND_EDGE_HZ) / bin).ceil() as usize;
+        // At least bin 1: the peak's interpolation reads the bin below it.
+        let lo = (((self.band.0 + FIND_EDGE_HZ) / bin).ceil() as usize).max(1);
         let hi = (((self.band.1 - FIND_EDGE_HZ) / bin).floor() as usize).min(FIND_N / 2 - 2);
         if hi <= lo + 8 {
             return None;
@@ -150,7 +151,7 @@ pub struct CwLive {
     scratch: Vec<f32>,
     text: String,
     pending: String,
-    /// Text committed since the last [`CwLive::take_committed`] (for MQTT).
+    /// Text committed since the last [`CwLive::take_committed`].
     fresh: String,
     dirty: bool,
     /// The rain-scatter decoder, when that is the engine ([`crate::rscw`]).
@@ -221,6 +222,7 @@ impl CwLive {
 
     /// The CW filter's audio passband: where the finder looks.
     pub fn set_band(&mut self, lo: f32, hi: f32) {
+        let (lo, hi) = if lo.is_finite() && hi.is_finite() { (lo, hi) } else { (300.0, 2700.0) };
         self.finder.band = (lo.min(hi), lo.max(hi));
         self.band = self.finder.band;
         if let Some(r) = self.rs.as_mut() {
@@ -401,7 +403,12 @@ struct Shared {
 /// changed. The tone tracking and resampling cost a third of a Cortex-A9 core
 /// at 48 kHz, more than the engine can spare.
 pub struct CwLiveThread {
+    /// Audio, bounded: dropped when the decoder is behind.
     tx: Sender<Msg>,
+    /// Control, unbounded and read first: a restart or engine switch is
+    /// never lost behind queued audio.
+    ctl: Sender<Msg>,
+    gone: bool,
     shared: Arc<Mutex<Shared>>,
     seen: u64,
     warned: bool,
@@ -414,6 +421,7 @@ impl CwLiveThread {
         let neural = engine == "neural";
         // 5 s of 10 ms blocks: a busy moment on the CPU must not cost audio.
         let (tx, rx) = bounded::<Msg>(512);
+        let (ctl, ctl_rx) = crossbeam_channel::unbounded::<Msg>();
         let shared = Arc::new(Mutex::new(Shared::default()));
         let sh = shared.clone();
         std::thread::Builder::new()
@@ -424,19 +432,23 @@ impl CwLiveThread {
                 unsafe {
                     libc::setpriority(libc::PRIO_PROCESS, libc::syscall(libc::SYS_gettid) as libc::id_t, -5);
                 }
-                run(CwLive::new(rate, pitch_hz, neural), rx, sh)
+                run(CwLive::new(rate, pitch_hz, neural), rx, ctl_rx, sh)
             })
             .expect("spawn cw-live");
         if engine == "rs" {
-            let _ = tx.try_send(Msg::Rs(true));
+            let _ = ctl.send(Msg::Rs(true));
         }
-        CwLiveThread { tx, shared, seen: 0, warned: false, band: None }
+        CwLiveThread { tx, ctl, gone: false, shared, seen: 0, warned: false, band: None }
     }
 
     /// Audio in; dropped (not queued, and said once) if the decoder falls
     /// seconds behind.
     pub fn audio(&mut self, a: &[f32]) {
-        match self.tx.try_send(Msg::Audio(a.to_vec())) {
+        if self.gone {
+            return;
+        }
+        let a = a.iter().map(|&x| if x.is_finite() { x } else { 0.0 }).collect();
+        match self.tx.try_send(Msg::Audio(a)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 if !self.warned {
@@ -444,30 +456,33 @@ impl CwLiveThread {
                     warn!("live CW decoder behind: audio dropped");
                 }
             }
-            Err(TrySendError::Disconnected(_)) => warn!("live CW thread gone"),
+            Err(TrySendError::Disconnected(_)) => {
+                self.gone = true;
+                warn!("live CW thread gone");
+            }
         }
     }
     pub fn restart(&self) {
-        let _ = self.tx.try_send(Msg::Restart);
+        let _ = self.ctl.send(Msg::Restart);
     }
     pub fn flush(&self) {
-        let _ = self.tx.try_send(Msg::Flush);
+        let _ = self.ctl.send(Msg::Flush);
     }
     pub fn clear(&self) {
-        let _ = self.tx.try_send(Msg::Clear);
+        let _ = self.ctl.send(Msg::Clear);
     }
     pub fn set_neural(&self, on: bool) {
-        let _ = self.tx.try_send(Msg::Neural(on));
+        let _ = self.ctl.send(Msg::Neural(on));
     }
     /// "rs" (rain scatter), "neural" (DeepCW) or anything else (timing).
     pub fn set_engine(&self, engine: &str) {
         match engine {
             "rs" => {
-                let _ = self.tx.try_send(Msg::Rs(true));
+                let _ = self.ctl.send(Msg::Rs(true));
             }
             e => {
-                let _ = self.tx.try_send(Msg::Rs(false));
-                let _ = self.tx.try_send(Msg::Neural(e == "neural"));
+                let _ = self.ctl.send(Msg::Rs(false));
+                let _ = self.ctl.send(Msg::Neural(e == "neural"));
             }
         }
     }
@@ -478,7 +493,7 @@ impl CwLiveThread {
     /// The CW filter passband (audio Hz); sent on only when it changed.
     pub fn set_band(&mut self, lo: f32, hi: f32) {
         let b = (lo, hi);
-        if self.band != Some(b) && self.tx.try_send(Msg::Band(b.0, b.1)).is_ok() {
+        if self.band != Some(b) && self.ctl.send(Msg::Band(b.0, b.1)).is_ok() {
             self.band = Some(b);
         }
     }
@@ -508,21 +523,37 @@ impl CwLiveThread {
     }
 }
 
-fn run(mut c: CwLive, rx: Receiver<Msg>, shared: Arc<Mutex<Shared>>) {
+fn handle(c: &mut CwLive, m: Msg) {
+    match m {
+        Msg::Audio(a) => c.process(&a),
+        Msg::Restart => c.restart(),
+        Msg::Flush => c.flush(),
+        Msg::Clear => c.clear(),
+        Msg::Neural(on) => c.set_neural(on),
+        Msg::Rs(on) => c.set_rs(on),
+        Msg::Band(lo, hi) => c.set_band(lo, hi),
+    }
+}
+
+fn run(mut c: CwLive, rx: Receiver<Msg>, ctl: Receiver<Msg>, shared: Arc<Mutex<Shared>>) {
     let mut n = 0u32;
     // Poll the model at least every 250 ms even with no audio (it finishes
     // on its own worker thread).
     loop {
-        match rx.recv_timeout(std::time::Duration::from_millis(250)) {
-            Ok(Msg::Audio(a)) => c.process(&a),
-            Ok(Msg::Restart) => c.restart(),
-            Ok(Msg::Flush) => c.flush(),
-            Ok(Msg::Clear) => c.clear(),
-            Ok(Msg::Neural(on)) => c.set_neural(on),
-            Ok(Msg::Rs(on)) => c.set_rs(on),
-            Ok(Msg::Band(lo, hi)) => c.set_band(lo, hi),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+        // Control first, so it is never stuck behind seconds of audio.
+        while let Ok(m) = ctl.try_recv() {
+            handle(&mut c, m);
+        }
+        crossbeam_channel::select! {
+            recv(ctl) -> m => match m {
+                Ok(m) => handle(&mut c, m),
+                Err(_) => return,
+            },
+            recv(rx) -> m => match m {
+                Ok(m) => handle(&mut c, m),
+                Err(_) => return,
+            },
+            default(std::time::Duration::from_millis(250)) => {}
         }
         n = n.wrapping_add(1);
         let changed = c.poll();
@@ -546,6 +577,41 @@ fn run(mut c: CwLive, rx: Receiver<Msg>, shared: Arc<Mutex<Shared>>) {
 mod tests {
     use super::*;
     use crate::keyer::CwKeyer;
+
+    #[test]
+    fn finder_survives_odd_bands_and_nan() {
+        let mut f = Finder::new(12_000.0);
+        // A band reaching below 0 Hz from a client: no index underflow.
+        f.band = (-500.0, 800.0);
+        let tone: Vec<f32> = (0..24_000).map(|i| (std::f32::consts::TAU * 600.0 * i as f32 / 12_000.0).sin()).collect();
+        for c in tone.chunks(600) {
+            f.push(c);
+        }
+        // NaN samples do not stick in the average.
+        let mut bad = tone.clone();
+        bad[10] = f32::NAN;
+        for c in bad.chunks(600) {
+            f.push(c);
+        }
+        assert!(f.avg.iter().all(|x| x.is_finite()));
+        let mut c = timing(12_000.0, 600.0);
+        c.set_band(f32::NAN, 900.0);
+        assert!(c.band.0.is_finite());
+    }
+
+    #[test]
+    fn control_is_not_dropped_when_audio_is_full() {
+        let mut t = CwLiveThread::start(12_000.0, 600.0, "timing");
+        for _ in 0..2000 {
+            t.audio(&[0.0; 4800]);
+        }
+        t.set_engine("rs");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while t.engine() != "rs" && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(t.engine(), "rs");
+    }
 
     /// The timing decoder alone (tests carry no DeepCW model).
     fn timing(rate: f64, pitch: f32) -> CwLive {

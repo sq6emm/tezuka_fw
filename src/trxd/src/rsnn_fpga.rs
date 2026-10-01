@@ -56,7 +56,13 @@ pub struct FpgaFront {
     out: Vec<u32>,
     /// The temporal layers run here too.
     temporal: bool,
+    /// The engine stayed busy past [`WAIT_LIMIT`]: given up on.
+    dead: bool,
 }
+
+/// Longest a frame or a reset may keep the engine busy (a frame takes
+/// well under a millisecond).
+const WAIT_LIMIT: Duration = Duration::from_millis(500);
 
 /// What a row gave: the front's outputs (frame n - 3), or with the
 /// temporal layers in the FPGA the last one's (a frame 2 x the dilations
@@ -90,6 +96,10 @@ impl FpgaFront {
                 f.load(&w, &b);
                 if let Some(t) = temporal {
                     f.load_temporal(c1, &t);
+                }
+                if f.dead {
+                    // stuck from the start: the CPU runs the network
+                    return None;
                 }
                 tracing::info!(temporal = f.temporal, "rsnn: in the FPGA ({c2}/{c1} channels, ~{} us a frame)", f.frame_us);
                 Some(f)
@@ -127,6 +137,7 @@ impl FpgaFront {
             row: [0; 32],
             out: vec![0; c1],
             temporal: false,
+            dead: false,
         };
         // A bitstream without the engine has nothing at this address: the
         // read raises a bus error. Look from a child process first.
@@ -166,22 +177,43 @@ impl FpgaFront {
         unsafe { std::ptr::write_volatile(self.ptr.add(off / 4), v) }
     }
 
+    // Word by word with volatile accesses: memcpy may merge, split or
+    // reorder accesses, which an AXI-Lite window does not take.
     fn write_words(&self, off: usize, v: &[u32]) {
         assert!(off % 4 == 0 && off + 4 * v.len() <= 0x1_0000);
-        // SAFETY: see map(); both sides word-aligned, inside the window.
-        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), self.ptr.add(off / 4), v.len()) }
+        for (i, &w) in v.iter().enumerate() {
+            self.wr(off + 4 * i, w);
+        }
     }
 
     fn read_words(&self, off: usize, v: &mut [u32]) {
         assert!(off % 4 == 0 && off + 4 * v.len() <= 0x1_0000);
-        // SAFETY: see map().
-        unsafe { std::ptr::copy_nonoverlapping(self.ptr.add(off / 4), v.as_mut_ptr(), v.len()) }
+        for (i, w) in v.iter_mut().enumerate() {
+            *w = self.rd(off + 4 * i);
+        }
     }
 
-    fn wait(&self) {
+    /// Wait for the engine to go idle; false (and the front marked dead,
+    /// said once) if it stays busy past [`WAIT_LIMIT`].
+    fn wait(&mut self) -> bool {
+        if self.dead {
+            return false;
+        }
+        let t0 = std::time::Instant::now();
         while self.rd(0xFF04) & 1 != 0 {
+            if t0.elapsed() > WAIT_LIMIT {
+                self.dead = true;
+                tracing::error!("rsnn: FPGA engine stuck busy; rain-scatter decoding stops");
+                return false;
+            }
             std::thread::sleep(Duration::from_micros(100));
         }
+        true
+    }
+
+    /// The engine hung and was given up on (no more output).
+    pub fn dead(&self) -> bool {
+        self.dead
     }
 
     fn load(&mut self, w: &[i16], b: &[i32]) {
@@ -223,7 +255,10 @@ impl FpgaFront {
         let words: Vec<u32> = w.chunks(2).map(|p| (p[0] as u16 as u32) | (p.get(1).map_or(0, |&v| v as u16 as u32) << 16)).collect();
         // SAFETY: inside the mapping (2 w.len() <= W_BYTES), word-aligned.
         unsafe {
-            std::ptr::copy_nonoverlapping(words.as_ptr(), p.cast::<u32>(), words.len());
+            let d = p.cast::<u32>();
+            for (i, &w) in words.iter().enumerate() {
+                std::ptr::write_volatile(d.add(i), w);
+            }
             libc::munmap(p, W_BYTES);
         }
         self.wait();
@@ -271,10 +306,15 @@ impl FpgaFront {
             let b = row.get(2 * k + 1).map_or(0, |&v| q(v));
             *w = a | b << 16;
         }
+        if self.dead {
+            return None;
+        }
         self.write_words(0x9400, &self.row);
         self.wr(0xFF00, self.cfg | 1);
         std::thread::sleep(Duration::from_micros(self.frame_us));
-        self.wait();
+        if !self.wait() {
+            return None;
+        }
         let st = self.rd(0xFF04);
         let at = if self.temporal {
             if st & 4 == 0 {

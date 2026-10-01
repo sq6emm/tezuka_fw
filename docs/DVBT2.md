@@ -6,11 +6,11 @@ DVB-T2 option's profile, received by the Ryde, the Knucker and the Lynx
 
 | | |
 |---|---|
-| Channel | 1.7 MHz (standard, 131/71 MS/s), or 2.0 / 1.35 MHz (amateur, not in EN 302 755: sample rate 8/7 x bandwidth, receivers must be set to that clock) |
+| Channel | 1.7 MHz (standard, 131/71 MS/s), or 2.0 / 1.35 MHz (non-standard: not in EN 302 755, sample rate 8/7 x bandwidth, nothing in P1 or L1 says so; only receivers whose elementary clock can be set freely decode them, not Sony CXD2880-based ones (Raspberry Pi TV HAT and similar) or TV tuners: use 1.7 MHz for third-party receivers) |
 | OFDM | 2K, normal carriers, guard 1/8, pilot pattern PP2, SISO |
 | Frame | P1, 8 P2 symbols, 190 data symbols (248 ms at 1.7 MHz, 200 ms at 2.0 MHz); 1.35 MHz: 145 data symbols, 7 QPSK / 14 16QAM blocks (230 ms: 190 made 297 ms, over T2's 250 ms); 2 frames a super-frame |
 | PLP | one, TS, normal FEC frames (64800), QPSK or 16QAM, 1/2 or 3/4, rotated constellation (29 / 16.8 degrees), one TI block, 9 (QPSK) or 18 (16QAM) FEC blocks a frame (1.35 MHz: 7 / 14) |
-| L1 | L1-pre BPSK, L1-post QPSK 1/2 (16K LDPC), version 1.1.1 |
+| L1 | L1-pre BPSK, L1-post QPSK 1/2 (16K LDPC), version 1.1.1; L1-post FREQUENCY the real centre frequency (`Mode::with_frequency`; 32 bits, saturated above 4.29 GHz, so 5.76 GHz cannot be signalled) |
 | TS rate at 1.7 MHz | QPSK 1.164 (1/2) / 1.751 (3/4) Mbit/s, 16QAM 2.328 / 3.502 Mbit/s |
 
 UI: DATV panel, code rate list: "DVB-T2 1.7 MHz QPSK 1/2" and friends
@@ -353,6 +353,35 @@ next symbol would start ends the frame; `test_short_frames`), and
 capacity and decodes a 1.35 MHz frame. Not yet confirmed by an independent
 receiver: the spectrum's orientation on air (a Libre-to-Libre link would
 not notice an inversion).
+
+## Receiver's L1 check (2026-10-01)
+
+Every frame the receiver decodes L1-pre and L1-post (`l1::PreDecoder`,
+`PostDecoder`: BCH on the hard decisions, the 16K LDPC when that fails,
+then the CRC-32) and compares the fields its fixed layout depends on (S1,
+S2, guard, PAPR, L1 modulation and size, pilot pattern, data symbols, T2
+version; PLP count, type, code rate, modulation, rotation, FEC type,
+blocks, time interleaving) with what it is set for. A frame that signals
+something else is not taken (`l1_mismatch`, logged once per change):
+another transmitter's frames would otherwise be read with the wrong
+layout. NETWORK_ID, T2_SYSTEM_ID and FREQUENCY are the other station's
+own and do not count. `t2_loopback` and `t2_through_the_front_end`
+require every frame's L1 to decode.
+
+## Receiver limits (review 2026-10-01)
+
+The channel comes from the P2 pilots once a frame (about 248 ms); the
+scattered and continual pilots of the data symbols give each symbol's
+common phase and timing slope only. Equalization is zero-forcing, the LLRs
+carry one noise level for the frame (no per-cell channel state) and
+rotated cells are de-rotated and sliced per axis. Fine on a static path;
+fragile on a moving one (aircraft scatter, portable). Improving it is FPGA
+work: the equalizer (`t2eq`) runs in the fabric and the cells go from it to
+DDR and the LDPC engine without the A9 (the cell router), so time
+interpolation over the scattered pilots, a per-cell CSI word next to each
+cell and a CSI-weighted (per-component for rotated QPSK/16QAM) demapper in
+the LDPC engine's LLR stage all need HDL (t2eq, t2router, ldpc_dma), with
+the software model (`fe.rs`, `stream.rs`) changed to match.
 
 ## Not done
 

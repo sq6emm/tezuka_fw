@@ -17,6 +17,15 @@
 //! write the decisions back packed (bit j of word k: RAM variable 32 k + j)
 //! at +64 KiB; 0xFF10 / 0xFF14 the addresses, 0xFF18 words in, 0xFF1C words
 //! out (a multiple of 32).
+//!
+//! Newer cores (0xFF30 features, 0 on older ones): bit 0 status 31:24
+//! counts finished decodes, bit 1 status bit 2 is a sticky AXI error of the
+//! DDR engine (a burst answered SLVERR/DECERR), bit 2 configuration writes
+//! are ignored while busy. Whatever the core, a decode is never started (nor
+//! its registers or buffers written) while the engine is busy: a decode
+//! that times out keeps the decoder until it is idle again, and an engine
+//! that stays busy is left alone ([`STUCK`]) with the frames decoded by the
+//! model in software, slowly, until it comes back.
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
@@ -39,6 +48,13 @@ const DT_DMA: &str = "/proc/device-tree/reserved-memory/ldpc_buffers@16300000";
 /// One decoder in the FPGA (and one pair of DDR buffers): one frame at a time.
 static DECODER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const MAX_ITER: u32 = 50;
+/// The engine stayed busy past every deadline: no start until it is idle.
+static STUCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Waiting for a decode (2.5 ms an iteration, 63 at most: 160 ms).
+const DECODE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+/// After that, how long a late decode may take to end before the engine
+/// counts as stuck.
+const LATE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 /// Time in the FPGA decoder's stages (ns): LLRs in, waiting, decisions out.
 pub static PROF_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
@@ -54,6 +70,8 @@ pub struct Window {
     dma: Option<*mut u32>,
     /// LDP6: the cells path takes 16QAM too.
     qam16: bool,
+    /// 0xFF30 (0 on older cores): bit 0 finished counter, bit 1 AXI error.
+    feat: u32,
 }
 
 // SAFETY: owned by the decoding thread alone.
@@ -75,7 +93,7 @@ impl Window {
         if p == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error().to_string());
         }
-        let mut w = Window { _mem: mem, ptr: p.cast(), lanes: 0, dma: None, qam16: false };
+        let mut w = Window { _mem: mem, ptr: p.cast(), lanes: 0, dma: None, qam16: false, feat: 0 };
         // A bitstream without the decoder has nothing at this address: the
         // read raises a bus error. Look from a child process first.
         static LANES: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -85,6 +103,7 @@ impl Window {
         }
         w.lanes = lanes.min(4);
         w.qam16 = lanes == 6;
+        w.feat = w.rd(0xFF30) & 7;
         if lanes >= 5 && std::path::Path::new(DT_DMA).exists() && std::env::var_os("TRXD_NO_LDPC_DMA").is_none() {
             // SAFETY: MAP_SHARED of the reserved (no-map) buffer memory;
             // accessed below as aligned words inside it, unmapped on drop.
@@ -138,6 +157,17 @@ impl Window {
         // SAFETY: see open().
         unsafe { std::ptr::write_volatile(self.ptr.add(off / 4), v) }
     }
+    /// Busy (0xFF04 bit 0) low within `limit`?
+    fn wait_idle(&self, limit: std::time::Duration) -> bool {
+        let t0 = std::time::Instant::now();
+        while self.rd(0xFF04) & 1 == 1 {
+            if t0.elapsed() > limit {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(500));
+        }
+        true
+    }
 }
 
 impl Drop for Window {
@@ -178,8 +208,22 @@ fn pack(q: &mut [u32], perm: &[u32], k: usize, v: impl Fn(usize) -> u32) {
 /// `ddr_in`: the words are in DDR there already (the cell router's frame
 /// buffer; `q` only gives their count).
 #[allow(clippy::too_many_arguments)]
-fn run_fpga(win: &Window, rate: LongRate, q: &mut [u32], max_iter: u32, need: usize, bits: &mut [u8], t_q: std::time::Instant, cells: Option<&crate::dvbt2::stream::CellParams>, ddr_in: Option<u32>) -> Option<usize> {
+fn run_fpga(win: &Window, rate: LongRate, q: &mut [u32], max_iter: u32, need: usize, bits: &mut [u8], t_q: std::time::Instant, cells: Option<&crate::dvbt2::stream::CellParams>, ddr_in: Option<u32>) -> Result<Option<usize>, Stuck> {
+    use std::sync::atomic::Ordering::Relaxed;
     let _one = DECODER.lock().unwrap_or_else(|e| e.into_inner());
+    // Never touch the registers or the buffers of a decode still running.
+    let stuck = STUCK.load(Relaxed);
+    if !win.wait_idle(if stuck { std::time::Duration::from_millis(1) } else { LATE_WAIT }) {
+        if !STUCK.swap(true, Relaxed) {
+            tracing::error!("LDPC: the FPGA decoder stays busy: decoding in software until it is idle");
+        }
+        return Err(Stuck);
+    }
+    if stuck {
+        STUCK.store(false, Relaxed);
+        tracing::warn!("LDPC: the FPGA decoder is idle again");
+    }
+    let done0 = win.rd(0xFF04) >> 24;
     let out_words = need.div_ceil(32).div_ceil(32) * 32;
     let mut ctl = 1 | ((rate == LongRate::R3_4) as u32) << 1 | max_iter << 8;
     if let Some(d) = win.dma {
@@ -213,15 +257,28 @@ fn run_fpga(win: &Window, rate: LongRate, q: &mut [u32], max_iter: u32, need: us
     win.wr(0xFF00, ctl);
     // 2.5 ms an iteration: sleep in small steps until done.
     let t0 = std::time::Instant::now();
-    while win.rd(0xFF04) & 1 == 1 {
-        if t0.elapsed() > std::time::Duration::from_millis(500) {
-            tracing::warn!("LDPC: the FPGA decoder did not finish");
-            return None;
+    if !win.wait_idle(DECODE_WAIT) {
+        // Keep the decoder (the lock) until this decode is over: the next
+        // frame's registers and buffers must not go in under it.
+        let late = win.wait_idle(LATE_WAIT);
+        tracing::warn!(late_end = late, "LDPC: the FPGA decoder did not finish in time (frame dropped)");
+        if !late {
+            STUCK.store(true, Relaxed);
+            tracing::error!("LDPC: the FPGA decoder stays busy: decoding in software until it is idle");
         }
-        std::thread::sleep(std::time::Duration::from_micros(500));
+        return Ok(None);
     }
     let t_out = std::time::Instant::now();
     let st = win.rd(0xFF04);
+    // This start really ran (the busy edge counted once).
+    if win.feat & 1 != 0 && (st >> 24) != (done0 + 1) & 0xFF {
+        warn_every("LDPC: the FPGA decoder did not run this frame (start not taken)");
+        return Ok(None);
+    }
+    if win.feat & 2 != 0 && st & 4 != 0 {
+        warn_every("LDPC: AXI error in the FPGA decoder's DDR engine (frame dropped)");
+        return Ok(None);
+    }
     // Decisions: the sign bits of the BCH codeword part (the
     // parity bits after it are never read).
     if let Some(d) = win.dma {
@@ -242,11 +299,27 @@ fn run_fpga(win: &Window, rate: LongRate, q: &mut [u32], max_iter: u32, need: us
             }
         }
     }
-    use std::sync::atomic::Ordering::Relaxed;
     PROF_NS[0].fetch_add((t_in - t_q).as_nanos() as u64, Relaxed);
     PROF_NS[1].fetch_add((t_out - t0).as_nanos() as u64, Relaxed);
     PROF_NS[2].fetch_add(t_out.elapsed().as_nanos() as u64, Relaxed);
-    ((st >> 1) & 1 == 1).then_some(((st >> 8) & 0x3F) as usize)
+    Ok(((st >> 1) & 1 == 1).then_some(((st >> 8) & 0x3F) as usize))
+}
+
+/// The FPGA engine is stuck busy: nothing was started.
+pub struct Stuck;
+
+/// A warning at most every 10 s (the rest counted).
+fn warn_every(msg: &'static str) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static SKIPPED: AtomicU64 = AtomicU64::new(0);
+    let now = crate::stream::unix_now() as u64;
+    if now >= LAST.load(Relaxed) + 10 {
+        LAST.store(now, Relaxed);
+        tracing::warn!(more = SKIPPED.swap(0, Relaxed), "{msg}");
+    } else {
+        SKIPPED.fetch_add(1, Relaxed);
+    }
 }
 
 /// The four-lane decoder's parity layout: for each parity byte of its RAM
@@ -260,6 +333,18 @@ pub fn parity_layout(rate: LongRate) -> Vec<u32> {
         *v = (c * q + r) as u32;
     }
     perm
+}
+
+/// Before the PL is reloaded (fpgamode): no decode running and none to
+/// start (the decoder kept until the process exits).
+pub fn quiesce() {
+    if let Ok(w) = Window::open() {
+        let one = DECODER.lock().unwrap_or_else(|e| e.into_inner());
+        if !w.wait_idle(std::time::Duration::from_secs(1)) {
+            tracing::warn!("LDPC: the FPGA decoder still busy before the reload");
+        }
+        std::mem::forget(one);
+    }
 }
 
 /// Is the FPGA decoder there?
@@ -285,7 +370,8 @@ pub enum Ldpc {
     /// `need`: decisions read back (the BCH codeword's Kbch + 192 bits).
     /// `perm` (four-lane decoder): for each parity byte of the RAM in
     /// order, its parity bit.
-    Fpga { win: Window, rate: LongRate, q: Vec<u32>, max_iter: u32, need: usize, perm: Vec<u32> },
+    /// `model`: the software decoder, made when the engine is stuck.
+    Fpga { win: Window, rate: LongRate, q: Vec<u32>, max_iter: u32, need: usize, perm: Vec<u32>, model: Option<Box<FpgaDecoder>> },
 }
 
 impl Ldpc {
@@ -298,7 +384,7 @@ impl Ldpc {
             Ok(win) => {
                 tracing::info!(?rate, lanes = win.lanes, dma = win.dma.is_some(), "LDPC: the FPGA decoder");
                 let perm = if win.lanes == 4 { parity_layout(rate) } else { Vec::new() };
-                Ldpc::Fpga { win, rate, q: vec![0; N / 4], max_iter: MAX_ITER, need: (spec.kbch + 192).min(N), perm }
+                Ldpc::Fpga { win, rate, q: vec![0; N / 4], max_iter: MAX_ITER, need: (spec.kbch + 192).min(N), perm, model: None }
             }
             Err(e) => {
                 tracing::info!(?rate, "LDPC: FPGA decoder unavailable ({e}); its model in software");
@@ -331,7 +417,9 @@ impl Ldpc {
                     *w = (c[0][0] as u8 as u32) | (c[0][1] as u8 as u32) << 8 | (c[1][0] as u8 as u32) << 16 | (c[1][1] as u8 as u32) << 24;
                 }
                 let words = cells.len() / 2;
-                return run_fpga(win, *rate, &mut q[..words], *max_iter, *need, bits, t_q, Some(p), None);
+                if let Ok(r) = run_fpga(win, *rate, &mut q[..words], *max_iter, *need, bits, t_q, Some(p), None) {
+                    return r;
+                }
             }
         }
         let llr = crate::dvbt2::stream::cell_llrs(cells, p);
@@ -345,7 +433,8 @@ impl Ldpc {
             if win.dma.is_some() && (p.qam16.is_none() || win.qam16) {
                 let t_q = std::time::Instant::now();
                 let words = if p.qam16.is_some() { N / 8 } else { N / 4 };
-                return run_fpga(win, *rate, &mut q[..words], *max_iter, *need, bits, t_q, Some(p), Some(addr));
+                // (stuck: the cells are only in DDR, the block is lost)
+                return run_fpga(win, *rate, &mut q[..words], *max_iter, *need, bits, t_q, Some(p), Some(addr)).ok().flatten();
             }
         }
         None
@@ -358,10 +447,13 @@ impl Ldpc {
                 self.decode(&f, bits)
             }
             Ldpc::Model(d) => d.decode(llr, bits),
-            Ldpc::Fpga { win, rate, q, max_iter, need, perm } => {
+            Ldpc::Fpga { win, rate, q, max_iter, need, perm, model } => {
                 let t_q = std::time::Instant::now();
                 pack(q, perm, rate.k(), |i| llr[i] as u8 as u32);
-                run_fpga(win, *rate, q, *max_iter, *need, bits, t_q, None, None)
+                match run_fpga(win, *rate, q, *max_iter, *need, bits, t_q, None, None) {
+                    Ok(r) => r,
+                    Err(Stuck) => soft(model, *rate, *max_iter, llr, bits),
+                }
             }
         }
     }
@@ -375,16 +467,30 @@ impl Ldpc {
                 let q: Vec<i8> = llr.iter().map(|&l| quantize_llr(l, LLR_SCALE)).collect();
                 d.decode(&q, bits)
             }
-            Ldpc::Fpga { win, rate, q, max_iter, need, perm } => {
+            Ldpc::Fpga { win, rate, q, max_iter, need, perm, model } => {
                 let t_q = std::time::Instant::now();
                 // Four 6-bit LLRs a word, then one bulk copy into the
                 // window (word writes one at a time cost 10 ms a frame).
                 let b = |l: f32| quantize_llr(l, LLR_SCALE) as u8 as u32;
                 pack(q, perm, rate.k(), |i| b(llr[i]));
-                run_fpga(win, *rate, q, *max_iter, *need, bits, t_q, None, None)
+                match run_fpga(win, *rate, q, *max_iter, *need, bits, t_q, None, None) {
+                    Ok(r) => r,
+                    Err(Stuck) => {
+                        let q: Vec<i8> = llr.iter().map(|&l| quantize_llr(l, LLR_SCALE)).collect();
+                        soft(model, *rate, *max_iter, &q, bits)
+                    }
+                }
             }
         }
     }
+}
+
+/// The model decodes while the FPGA engine is stuck (the same decisions,
+/// tens of times slower).
+fn soft(model: &mut Option<Box<FpgaDecoder>>, rate: LongRate, max_iter: u32, llr: &[i8], bits: &mut [u8]) -> Option<usize> {
+    let d = model.get_or_insert_with(|| Box::new(FpgaDecoder::new(rate)));
+    d.max_iter = max_iter as usize;
+    d.decode(llr, bits)
 }
 
 #[cfg(test)]

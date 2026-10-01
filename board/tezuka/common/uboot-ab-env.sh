@@ -10,7 +10,7 @@
 # resolved as mkenvimage does (`\"` -> `"`), since fw_setenv stores values verbatim.
 #   uboot-ab-env.sh [uboot-env.txt]
 ENV="${1:-$(dirname "$0")/uboot-env.txt}"
-awk -v want=" ab_count slot_select sdboot_ram qspi_slot_select qspiboot stdin stdout stderr dfu_sf preboot_main " '
+awk -v want=" ab_count slot_select sdboot_ram qspi_slot_select qspi_try qspiboot wdt_start stdin stdout stderr dfu_sf preboot_main " '
 	function flush() { if (name != "" && index(want, " " name " ")) print name " " val; name = "" }
 	cont { l = $0; sub(/^[ \t]+/, "", l); c = sub(/\\$/, "", l); val = val " " l; cont = c; if (!cont) flush(); next }
 	/^[A-Za-z_][A-Za-z0-9_]*=/ {

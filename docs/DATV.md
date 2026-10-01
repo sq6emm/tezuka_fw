@@ -47,19 +47,33 @@ Repetition follows ISO/IEC 13818-1 and ETSI TR 101 290 (since 2026-09-30):
 PAT and PMT every 0.5 s, the SDT within 2 s, a PCR within 100 ms (90 ms
 below 200 kbit/s) and every 40 ms from 200 kbit/s up. Every video packet
 reserves an 8-byte adaptation field that takes the PCR when one is due; a
-PCR-only packet goes first when audio or tables hold the queue. The lean
-profile below 40 kbit/s is a deliberate exception (tables every second, a
-PCR every 0.5 s): the standard rates would leave its picture about 4
-kbit/s, and only MiniTiouner-class receivers work there anyway.
-`repetition_meets_tr101290` checks the intervals at five rates with video
-at its budget; TSDuck (`tsp -P continuity -P pcrverify -P analyze`, image
+PCR-only packet goes first when audio or tables hold the queue. PCR
+intervals are whole packet slots, never under 3 (so data moves between
+them): from 45.1 kbit/s (30 packets a second) up 3 slots are within
+100 ms. The lean profile below that is a deliberate exception (tables
+every second, a PCR every 0.5 s, PTS up to 1.4 s after the data where
+13818-1's T-STD allows 1 s): the standard rates would leave it no
+picture, and only MiniTiouner-class receivers work there anyway. (Until
+2026-10-01 the boundary was 40 kbit/s: from 40 to about 50 kbit/s PCRs
+every 2 slots and 12 kbit/s audio took nearly every packet and almost all
+video was dropped. The 45-80 kbit/s profile now has 8 kbit/s audio, 300 ms
+to a PES; the mux's lateness estimate counts the table, PCR-only and audio
+slots.) EIT sections are at least 25 ms apart (TS 101 211). When the
+modulator says (`Mux::with_delivery`), the NIT carries the
+satellite_delivery_system_descriptor (S2: frequency, symbol rate,
+roll-off, modulation, FEC) or the T2_delivery_system_descriptor (T2: at
+1.7 MHz with bandwidth, guard, FFT and centre frequency; the other channel
+widths have no code and get the short form). The mux adds an access unit
+delimiter only when the access unit has none (after a 3- or 4-byte start
+code). `repetition_meets_tr101290` checks the intervals at nine rates
+with video at its budget; TSDuck (`tsp -P continuity -P pcrverify -P analyze`, image
 tsduck:1) finds no continuity errors, every PCR within 27 us of the constant
 rate, service type 0x16 and network id 0xFF01.
 
 Each table's version_number changes when its content does (the EIT's at the
 hour, as its present event moves): receivers cache by version.
-T-STD timing: every PES is in whole before its PTS, and a stream's PTS
-never steps back. Audio has its own queue and goes before video (its PES
+T-STD timing: every PES is in whole before its PTS, at most 1 s after its
+first byte (lean profile 1.4 s), and a stream's PTS never steps back. Audio has its own queue and goes before video (its PES
 are few and small). A video frame that would come in after its PTS is
 dropped (a keyframe asked for); a late keyframe drops the video queued
 before it, and if still late takes a later PTS (the timeline moves on).
@@ -82,7 +96,27 @@ every 25 s; the PAT names the NIT's PID and the SDT flags the EIT. trxd's
 own receiver reads the SDT, NIT, EIT and TDT back (`ts::Si`) and the DATV
 panel shows them: service and provider, network, the event on air, and the
 transmitter's clock against the browser's. TSDuck's `tstables` decodes all
-of them. Opus is not a
+of them.
+
+The receiver (`rx.rs`, `ts::Demux`):
+- PLFRAMEs it does not decode are stepped over by their own length, told
+  apart by the PLS code (all share the SOF, which alone passes the header
+  metric): dummy frames (EN 302 307-1 5.5.1; the TS continues across them)
+  and frames of another MODCOD or size (VCM: counted, the packet
+  straddling one is lost). Only the configured MODCOD is decoded.
+- BBFRAMEs whose MATYPE is not TS / single stream / no ISSY / no
+  null-packet deletion, whose UPL is not 188 bytes, or whose DFL or SYNCD
+  is impossible are not taken (counted, logged once); SYNCD 0xFFFF (no
+  packet starts in the frame) continues the packet.
+- Each user packet's CRC-8 (in the next packet's first byte) is checked: a
+  mismatch sets the transport_error_indicator and the demux drops the
+  packet (its PES then too).
+- Sections may span packets and follow each other in one; the PMT PID (from
+  the PAT) and the streams (from the PMT) follow changes; one duplicate
+  packet is ignored as 13818-1 allows; PTS are unwrapped over the 33-bit
+  wrap.
+
+Opus is not a
 DVB broadcast codec (TS 101 154): TVs and set-top boxes show the picture
 without sound; players and DATV receivers decode it.
 Opus in TS follows ffmpeg (registration descriptor "Opus", control header per

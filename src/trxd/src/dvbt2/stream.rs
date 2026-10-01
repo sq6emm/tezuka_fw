@@ -58,6 +58,11 @@ pub struct Stats {
     /// Front end: frames moved to where P1 really was, NCO retunes.
     pub resched: u64,
     pub retunes: u64,
+    /// L1-pre and L1-post (EN 302 755 7.2): decoded and as expected /
+    /// decoded but another configuration (frame not taken) / not decoded.
+    pub l1_ok: u64,
+    pub l1_mismatch: u64,
+    pub l1_failed: u64,
 }
 
 /// With the cell router: the MER from every 4th data symbol's pilots.
@@ -79,8 +84,23 @@ pub enum T2Block {
     Llr(Vec<i8>),
     Cells(Vec<[i8; 2]>, CellParams),
     /// The block's cells already in DDR (the FPGA's cell router put them
-    /// there): their physical address.
-    Ddr(u32, CellParams),
+    /// there): their physical address, and the router buffer holding them
+    /// (checked around the decoding: reused meanwhile, the block is lost).
+    Ddr(u32, CellParams, Option<DdrTag>),
+}
+
+/// Which router buffer and frame a [`T2Block::Ddr`] is in.
+#[derive(Clone)]
+pub struct DdrTag {
+    pub tags: Arc<super::router::Tags>,
+    pub buffer: usize,
+    pub f21: u32,
+}
+
+impl DdrTag {
+    pub fn holds(&self) -> bool {
+        self.tags.holds(self.buffer, self.f21)
+    }
 }
 
 /// The LLRs' parameters (a frame's): rotated (word j: I of cell j, Q of
@@ -175,6 +195,7 @@ pub struct Demod {
     /// The FPGA's cell router ([`Self::enable_router`]): equalized symbols'
     /// data cells go straight to DDR; blocks out as [`T2Block::Ddr`].
     router: Option<super::router::Router>,
+    router_tags: Option<Arc<super::router::Tags>>,
     /// The P2 symbols' data cells: (place in `cells`, place in the frame's
     /// FEC blocks), written to DDR by the A9.
     p2_dests: Vec<(u32, u32)>,
@@ -197,6 +218,12 @@ pub struct Demod {
     /// Where each symbol's data cells start in `flat`.
     data_at: Vec<usize>,
     pre_ref: Vec<f32>,
+    /// L1-pre and L1-post decoding and check, and the fields that
+    /// differed last.
+    l1: super::l1::PreDecoder,
+    l1_post: super::l1::PostDecoder,
+    post_gather: Vec<u32>,
+    l1_bad: Option<Vec<&'static str>>,
     bins: Vec<usize>,
     /// Per carrier: undoes the FFT window's early start, and the scaling.
     early_rot: Vec<Complex32>,
@@ -312,7 +339,7 @@ impl Demod {
         let ci = CellInterleaver::new(&p);
         let idx: Vec<Vec<u32>> = (0..nsym).map(|j| (data_at[j] as u32..data_at[j + 1] as u32).collect()).collect();
         let cells = fi.unframe(&idx);
-        let (pre_gather, _post, dcells) = fm.unmap(&cells);
+        let (pre_gather, post_gather, dcells) = fm.unmap(&cells);
         let gather = ci.deinterleave(&dcells, p.fec_blocks);
         // Cells go only through the time deinterleaver here: data cell d
         // (row d / cols, column d % cols of it) to rows column + row, FEC
@@ -341,6 +368,10 @@ impl Demod {
             flat: vec![[0; 2]; at],
             data_at,
             pre_ref,
+            l1: super::l1::PreDecoder::new(&p),
+            l1_post: super::l1::PostDecoder::new(&p),
+            post_gather,
+            l1_bad: None,
             bins,
             early_rot,
             early,
@@ -353,6 +384,7 @@ impl Demod {
             cells_out: false,
             cells16_out: false,
             router: None,
+            router_tags: None,
             p2_dests: Vec::new(),
             frame_f: 0,
             router_const: Vec::new(),
@@ -768,6 +800,8 @@ impl Demod {
         }
         let Some(mut rt) = Router::open() else { return false };
         let nsym = self.p.symbols();
+        let n = self.p.cells();
+        let np = super::router::block_stride(n);
         let mut table = vec![SKIP; nsym * ROW];
         self.p2_dests.clear();
         for j in 0..nsym {
@@ -776,7 +810,9 @@ impl Demod {
                 if g == u32::MAX {
                     continue;
                 }
-                let d = self.ci.deinterleaved_index(g as usize) as u32;
+                // (block r at r x the padded stride: aligned for the LDPC engine)
+                let d = self.ci.deinterleaved_index(g as usize);
+                let d = (d / n * np + d % n) as u32;
                 if j < N_P2 {
                     self.p2_dests.push((g, d));
                 } else {
@@ -784,9 +820,10 @@ impl Demod {
                 }
             }
         }
-        if !rt.start(&table, nsym, N_P2, self.cells.len() * 2) {
+        if !rt.start(&table, nsym, N_P2, self.p.fec_blocks * np * 2) {
             return false;
         }
+        self.router_tags = rt.tags().map(Arc::new);
         self.router = Some(rt);
         true
     }
@@ -859,6 +896,33 @@ impl Demod {
         }
         self.stats.frames += 1;
         let sigma2 = (err / self.pre_gather.len() as f32).max(1e-6);
+        // L1-pre and L1-post decoded (CRC-32) and checked against what these
+        // parameters send: another transmitter's frames (another pilot
+        // pattern, guard, size, modulation, code rate, rotation) would be
+        // read with the wrong layout. Not taken.
+        let l1llr: Vec<f32> = self.pre_gather.iter().map(|&i| (4.0 * cell(i).re / sigma2).clamp(-64.0, 64.0)).collect();
+        let k = 2.0 * std::f32::consts::SQRT_2 / sigma2;
+        let post_llr: Vec<f32> = self.post_gather.iter().flat_map(|&i| [(k * cell(i).re).clamp(-64.0, 64.0), (k * cell(i).im).clamp(-64.0, 64.0)]).collect();
+        let l1 = match self.l1.decode(&l1llr) {
+            super::l1::PreOutcome::Ok => self.l1_post.decode(&post_llr),
+            other => other,
+        };
+        match l1 {
+            super::l1::PreOutcome::Ok => {
+                self.stats.l1_ok += 1;
+                self.l1_bad = None;
+            }
+            super::l1::PreOutcome::Failed => self.stats.l1_failed += 1,
+            super::l1::PreOutcome::Mismatch(f) => {
+                self.stats.l1_mismatch += 1;
+                if self.l1_bad.as_ref() != Some(&f) {
+                    tracing::warn!(fields = ?f, "DVB-T2: L1-pre signals another configuration: frames not taken");
+                    self.l1_bad = Some(f);
+                }
+                self.prof[3] += t0.elapsed().as_secs_f64();
+                return;
+            }
+        }
         // Rotated constellations: word j's I is in cell j, its Q in cell
         // j + 1 (cyclically in the block); rotate back.
         let angle: f32 = match p.constellation {
@@ -910,16 +974,18 @@ impl Demod {
                         for (r, ti) in self.cells.chunks(n).enumerate() {
                             self.ci.block_gather(r, ti, &mut blk);
                             for (q, &c) in blk.iter().enumerate() {
-                                if rt.read_cell(b, r * n + q) != c {
+                                let at = r * super::router::block_stride(n) + q;
+                                if rt.read_cell(b, at) != c {
                                     bad += 1;
-                                    first.get_or_insert((r, q, c, rt.read_cell(b, r * n + q)));
+                                    first.get_or_insert((r, q, c, rt.read_cell(b, at)));
                                 }
                             }
                         }
                         tracing::info!(frame = self.stats.frames, buffer = b, bad, ?first, "DVB-T2 cell router check");
                     }
+                    let tag = self.router_tags.as_ref().map(|t| DdrTag { tags: t.clone(), buffer: b, f21: self.frame_f as u32 });
                     for r in 0..p.fec_blocks {
-                        out.push(T2Block::Ddr(rt.addr(b, r * n), cp));
+                        out.push(T2Block::Ddr(rt.addr(b, r * super::router::block_stride(n)), cp, tag.clone()));
                     }
                     self.stats.blocks += p.fec_blocks as u64;
                 }

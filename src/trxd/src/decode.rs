@@ -1,5 +1,5 @@
 //! Period decoders: each takes one T/R slot of 12 kHz audio (Q65, PI4)
-//! or 3.2 kHz audio (DeepCW) and returns [`Decode`] records ready for MQTT.
+//! or 3.2 kHz audio (DeepCW) and returns [`Decode`] records (logged and shown in the web UI).
 //!
 //! All run on a worker thread ([`DecodeWorker`]) so a decode that takes a
 //! second or two on the Cortex-A9 never stalls the receive chain.

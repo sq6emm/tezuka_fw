@@ -30,6 +30,13 @@
 //! step, 0x54 next frame start, 0x58 counter, 0x5C status (21:0 frames, 22
 //! word FIFO overflow, 23 resampler input FIFO overflow). With it on the ring carries its tagged words.
 //!
+//! Newer cores: 0x1C recorder_wraps (bit 31 set: present; 15:0 the times
+//! committed_address wrapped since the start), so a reader the DMA lapped
+//! is seen for what it is (older cores: from the time between reads and
+//! the ring's rate); a stop completes a burst the stream left half full
+//! and always ends in `finished`; 0x74 t2eq_status bit 16, the G bank the
+//! equalizer took at the last symbol header (with gshift).
+//!
 //! Only a core that says it is the ring one (platform 0xD5) is touched, and
 //! only when the device tree reserves the ring: any other Maia core's
 //! recorder writes 128 MB of RAM Linux owns.
@@ -59,7 +66,10 @@ static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 const REG_ID: usize = 0x00;
 const REG_VERSION: usize = 0x04;
 const REG_REC_CONTROL: usize = 0x10;
+const REG_CONTROL: usize = 0x08;
 const REG_REC_COMMITTED: usize = 0x18;
+const REG_REC_WRAPS: usize = 0x1C;
+const WRAPS_PRESENT: u32 = 1 << 31;
 const REG_COEFF_ADDR: usize = 0x24;
 const REG_COEFF: usize = 0x28;
 const REG_DECIMATION: usize = 0x2C;
@@ -84,6 +94,8 @@ const REG_T2EQ_PILOTS: usize = 0x64;
 const REG_T2EQ_REC: usize = 0x68;
 const REG_T2EQ_GADDR: usize = 0x6C;
 const REG_T2EQ_GDATA: usize = 0x70;
+const REG_T2EQ_STATUS: usize = 0x74;
+const GBANK_USED: u32 = 1 << 16;
 const T2_ENABLE: u32 = 1;
 const T2_SCHEDULED: u32 = 1 << 1;
 const T2_LOAD: u32 = 1 << 2;
@@ -130,6 +142,16 @@ impl Drop for Mapping {
     }
 }
 
+/// Before the PL is reloaded (fpgamode): the ring recorder stopped and its
+/// last burst in memory (a DMA cut off mid-burst can wedge the HP port).
+pub fn quiesce() {
+    if let Ok((_mem, regs)) = FrontEnd::open_regs() {
+        if is_datv_core(&regs) {
+            stop_recorder(&regs);
+        }
+    }
+}
+
 /// Is the FPGA front end there (right core, ring reserved)? Cheap; no side effects.
 pub fn available() -> bool {
     std::path::Path::new(DT_RING).exists() && FrontEnd::open_regs().is_ok_and(|(_, r)| is_datv_core(&r))
@@ -159,6 +181,19 @@ pub struct FrontEnd {
     /// one, and the G bank in use.
     t2_eq: Option<u32>,
     eq_bank: std::cell::Cell<u32>,
+    /// The equalizer reports the bank it took (newer cores; cleared after a
+    /// wait for it timed out: an older core reads 0 there).
+    eq_bank_seen: std::cell::Cell<bool>,
+    /// Ring bytes a second (lap detection without the wrap counter).
+    ring_rate: f64,
+    /// The recorder counts its wraps (0x1C).
+    wraps_hw: bool,
+    /// Bytes read since the start (with the wrap counter: the DMA's bytes
+    /// committed when last read).
+    total: u64,
+    last_read: std::time::Instant,
+    overruns: u64,
+    overrun_log: Option<std::time::Instant>,
 }
 
 impl FrontEnd {
@@ -192,8 +227,8 @@ impl FrontEnd {
         // Stop a ring left running by a previous instance before rewriting
         // the filters under it (a stop while stopped is harmless here: the
         // DMA just stays idle).
-        regs.wr32(REG_REC_CONTROL, 1 << 1);
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        stop_recorder(&regs);
+        out_of_reset(&regs);
         for &(addr, c) in &r.coeffs {
             regs.wr32(REG_COEFF_ADDR, addr as u32);
             regs.wr32(REG_COEFF, 1 | (((c as u32) & 0x3_FFFF) << 1));
@@ -229,7 +264,8 @@ impl FrontEnd {
         }
         // 16-bit mode (0), start: the ring fills from RING_START.
         regs.wr32(REG_REC_CONTROL, 1);
-        Ok(FrontEnd { _mem: mem, regs, ring, fs_out: design.fs_out(), rd: RING_START, center_hz, generation, symbols, flagged, t2_fe: false, t2_eq: None, eq_bank: std::cell::Cell::new(0) })
+        let ring_rate = 4.0 * if symbols { rs } else { design.fs_out() };
+        Ok(FrontEnd::new(mem, regs, ring, design.fs_out(), center_hz, generation, symbols, flagged, false, None, ring_rate))
     }
 
     /// DVB-T2: the recorder takes the T2 resampler's samples at (about)
@@ -246,8 +282,8 @@ impl FrontEnd {
             return Err(format!("the FPGA has no DATV ring recorder (version {:#010x})", regs.rd32(REG_VERSION)));
         }
         let ring = Mapping::new(&mem, RING_BYTES, RING_START as u64).map_err(|e| format!("map DATV ring: {e}"))?;
-        regs.wr32(REG_REC_CONTROL, 1 << 1);
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        stop_recorder(&regs);
+        out_of_reset(&regs);
         // The T2 bits must read back: older bitstreams have no resampler.
         regs.wr32(REG_SYMSYNC, T2_COEFF);
         if regs.rd32(REG_SYMSYNC) & T2_COEFF == 0 {
@@ -274,8 +310,9 @@ impl FrontEnd {
         regs.wr32(REG_SYMSYNC, 0); // resets the resampler
         // The OFDM front end, if there (its layout reads back), off until
         // the resampler runs, then sending every sample (searching).
-        use crate::dvbt2::fe::{EARLY, TRACK};
-        let layout = p.symbols() as u32 | (p.guard.samples() as u32) << 8 | EARLY << 18;
+        use crate::dvbt2::fe::{TRACK, early};
+        let gi = p.guard.samples();
+        let layout = p.symbols() as u32 | (gi as u32) << 8 | early(gi) << 18;
         regs.wr32(REG_T2_CONTROL, 0);
         regs.wr32(REG_T2_LAYOUT, layout);
         let t2_fe = regs.rd32(REG_T2_LAYOUT) == layout
@@ -309,20 +346,90 @@ impl FrontEnd {
             regs.wr32(REG_T2_CONTROL, T2_ENABLE);
         }
         regs.wr32(REG_REC_CONTROL, 1);
-        Ok(FrontEnd {
+        let fs_out = resamp::rate_out(FS_IN, step);
+        Ok(FrontEnd::new(mem, regs, ring, fs_out, 0.0, generation, false, false, t2_fe, t2_eq, 4.0 * fs_out))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new(mem: File, regs: Mapping, ring: Mapping, fs_out: f64, center_hz: f64, generation: u64, symbols: bool, flagged: bool, t2_fe: bool, t2_eq: Option<u32>, ring_rate: f64) -> FrontEnd {
+        let wraps_hw = regs.rd32(REG_REC_WRAPS) & WRAPS_PRESENT != 0;
+        FrontEnd {
             _mem: mem,
             regs,
             ring,
-            fs_out: resamp::rate_out(FS_IN, step),
+            fs_out,
             rd: RING_START,
-            center_hz: 0.0,
+            center_hz,
             generation,
-            symbols: false,
-            flagged: false,
+            symbols,
+            flagged,
             t2_fe,
             t2_eq,
             eq_bank: std::cell::Cell::new(0),
-        })
+            eq_bank_seen: std::cell::Cell::new(true),
+            ring_rate,
+            wraps_hw,
+            total: 0,
+            last_read: std::time::Instant::now(),
+            overruns: 0,
+            overrun_log: None,
+        }
+    }
+
+    /// The DMA's position: bytes committed since the start (wrap counter
+    /// cores) and the committed address, read consistently.
+    fn position(&self) -> Option<(u64, u32)> {
+        for _ in 0..4 {
+            let w0 = self.regs.rd32(REG_REC_WRAPS);
+            let c = self.regs.rd32(REG_REC_COMMITTED);
+            let w1 = self.regs.rd32(REG_REC_WRAPS);
+            if !(RING_START..RING_END).contains(&c) {
+                return None;
+            }
+            if w0 == w1 {
+                return Some(((w0 & 0xFFFF) as u64 * RING_BYTES as u64 + (c - RING_START) as u64, c));
+            }
+        }
+        None
+    }
+
+    /// The bytes the DMA committed since the reader's last position, and
+    /// whether it lapped the reader (the ring holds no more than its size:
+    /// what lay between is lost or overwritten). Without the wrap counter
+    /// the time since the last read tells (a lap at the ring's rate).
+    fn check_lap(&mut self, c: u32) -> bool {
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.last_read).as_secs_f64();
+        self.last_read = now;
+        let lapped = if self.wraps_hw {
+            match self.position() {
+                Some((pos, _)) => {
+                    // 16-bit wrap counter: positions modulo 65536 rings
+                    let span = 65536 * RING_BYTES as u64;
+                    let ahead = (pos + span - self.total % span) % span;
+                    self.total += ahead;
+                    ahead > RING_BYTES as u64
+                }
+                None => false,
+            }
+        } else {
+            let _ = c;
+            dt * self.ring_rate > 0.9 * RING_BYTES as f64
+        };
+        if lapped {
+            self.overruns += 1;
+            let log = self.overrun_log.is_none_or(|t| now.duration_since(t).as_secs() >= 10);
+            if log {
+                tracing::warn!(overruns = self.overruns, gap_ms = (dt * 1e3) as u64, ring_ms = (RING_BYTES as f64 / self.ring_rate * 1e3) as u64, "DATV ring: the reader was lapped (samples lost)");
+                self.overrun_log = Some(now);
+            }
+        }
+        lapped
+    }
+
+    /// Times the DMA lapped the reader (data lost) since the start.
+    pub fn overruns(&self) -> u64 {
+        self.overruns
     }
 
     /// DVB-T2: the ring carries the OFDM front end's words ([`Self::read_words`]).
@@ -347,9 +454,24 @@ impl FrontEnd {
             Ctl::Freq(f) => self.regs.wr32(REG_T2_FREQ, f),
             Ctl::EqTable { g, gshift } => {
                 let Some(base) = self.t2_eq else { return };
-                // into the bank not in use, then flip (taken at the next
-                // symbol's start)
+                // into the bank not in use, then flip (taken, with gshift,
+                // at the next symbol's start). The bank written now was in
+                // use until the last flip was taken: wait for that (newer
+                // cores report it), else a second table within a symbol
+                // overwrites the bank the equalizer still reads.
                 let bank = self.eq_bank.get() ^ 1;
+                if self.eq_bank_seen.get() {
+                    let t0 = std::time::Instant::now();
+                    let in_use = || (self.regs.rd32(REG_T2EQ_STATUS) & GBANK_USED != 0) as u32;
+                    while in_use() == bank {
+                        if t0.elapsed() > std::time::Duration::from_millis(20) {
+                            // no symbols coming, or an older core (bit 16 is 0)
+                            self.eq_bank_seen.set(false);
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    }
+                }
                 for (k, &v) in g.iter().enumerate() {
                     self.regs.wr32(REG_T2EQ_GDATA, v);
                     self.regs.wr32(REG_T2EQ_GADDR, k as u32 | bank << 11 | 1 << 12);
@@ -370,6 +492,11 @@ impl FrontEnd {
     pub fn read_words(&mut self, out: &mut Vec<u32>) {
         let c = self.regs.rd32(REG_REC_COMMITTED);
         if !(RING_START..RING_END).contains(&c) {
+            return;
+        }
+        if self.check_lap(c) {
+            // the words between are a mix of laps: start again at the DMA
+            self.rd = c;
             return;
         }
         let mut copy = |from: u32, to: u32| {
@@ -432,6 +559,10 @@ impl FrontEnd {
         if !(RING_START..RING_END).contains(&c) {
             return;
         }
+        if self.check_lap(c) {
+            self.rd = c;
+            return;
+        }
         let (a, b) = (self.rd, c);
         if b >= a {
             self.copy(a, b, out, flags.as_deref_mut());
@@ -460,6 +591,37 @@ impl FrontEnd {
                 f.push(w & (1 << 16) != 0);
             }
         }
+    }
+}
+
+/// Stop the ring recorder and wait until its last burst is in memory: the
+/// next start resets the address counters, and a write response still to
+/// come would land in the new run's (committed one burst ahead of the data,
+/// for good). Newer cores complete a half-filled burst on stop; with older
+/// ones it waits for data, so the input is left running here.
+fn stop_recorder(regs: &Mapping) {
+    regs.wr32(REG_REC_CONTROL, 1 << 1);
+    let t0 = std::time::Instant::now();
+    let mut last = regs.rd32(REG_REC_COMMITTED);
+    let mut still = 0;
+    while still < 3 && t0.elapsed() < std::time::Duration::from_millis(50) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let c = regs.rd32(REG_REC_COMMITTED);
+        still = if c == last { still + 1 } else { 0 };
+        last = c;
+    }
+    if still < 3 {
+        tracing::warn!("DATV ring: the recorder did not settle after stop");
+    }
+}
+
+/// The Maia core's sdr_reset (control bit 0) holds the DDC, the recorder
+/// and the T2 front end; the spectrometer's start (maia.rs) clears it, but
+/// the DATV front end must not depend on that having run.
+fn out_of_reset(regs: &Mapping) {
+    if regs.rd32(REG_CONTROL) & 1 != 0 {
+        tracing::info!("Maia core held in sdr_reset: releasing it for the DATV front end");
+        regs.wr32(REG_CONTROL, 0);
     }
 }
 

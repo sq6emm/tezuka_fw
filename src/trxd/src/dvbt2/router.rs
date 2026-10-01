@@ -31,6 +31,43 @@ pub const SKIP: u32 = u32::MAX;
 /// Table entries a symbol (8 KB).
 pub const ROW: usize = 2048;
 
+/// FEC block `r` starts at cell `r * block_stride(cells)`: a multiple of 64
+/// cells (128 bytes), so the LDPC engine's 128-byte bursts are aligned and
+/// never cross a 4 KB boundary (AXI3). 9 QPSK blocks (32448 cells) and 18
+/// 16QAM (16256) still fit a buffer (STRIDE).
+pub fn block_stride(cells: usize) -> usize {
+    (cells + 63) & !63
+}
+
+/// The buffers' tags, readable from another thread: the decoding thread
+/// checks a block's buffer still holds its frame (the router has four and
+/// reuses them about a second later).
+pub struct Tags {
+    _mem: File,
+    regs: *const u32,
+}
+
+// SAFETY: a read-only mapping of the router's registers, read with volatile
+// word loads only.
+unsafe impl Send for Tags {}
+unsafe impl Sync for Tags {}
+
+impl Tags {
+    /// Buffer `b` complete with frame `f21` (its start, low 21 bits).
+    pub fn holds(&self, b: usize, f21: u32) -> bool {
+        // SAFETY: word 0x20 + 4 b (b < 4) inside the 64 KiB mapping.
+        let v = unsafe { std::ptr::read_volatile(self.regs.add((0x20 + 4 * (b & 3)) / 4)) };
+        v & 0x1F_FFFF == f21 & 0x1F_FFFF && v >> 31 == 1
+    }
+}
+
+impl Drop for Tags {
+    fn drop(&mut self) {
+        // SAFETY: unmapping what Router::tags mapped.
+        unsafe { libc::munmap(self.regs as *mut libc::c_void, 0x1_0000) };
+    }
+}
+
 pub struct Router {
     _mem: File,
     regs: *mut u32,
@@ -128,6 +165,18 @@ impl Router {
             }
             std::thread::sleep(std::time::Duration::from_micros(500));
         }
+    }
+
+    /// A second, read-only mapping of the registers for [`Tags`].
+    pub fn tags(&self) -> Option<Tags> {
+        let mem = OpenOptions::new().read(true).custom_flags(libc::O_SYNC).open("/dev/mem").ok()?;
+        // SAFETY: MAP_SHARED, read-only, of the router's 64 KiB window (the
+        // router was probed in open()).
+        let regs = unsafe { libc::mmap(std::ptr::null_mut(), 0x1_0000, libc::PROT_READ, libc::MAP_SHARED, mem.as_raw_fd(), REGS as libc::off_t) };
+        if regs == libc::MAP_FAILED {
+            return None;
+        }
+        Some(Tags { _mem: mem, regs: regs.cast() })
     }
 
     /// A cell the A9 made (a P2 symbol's) into buffer `b` at `dest`.

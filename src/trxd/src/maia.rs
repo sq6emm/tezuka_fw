@@ -144,10 +144,24 @@ pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Receiver<Vec<f32>>> {
         .name("maia-scope".into())
         .spawn(move || {
             let mut last: Option<usize> = None;
+            let mut quiet_logged = false;
             loop {
                 if uio.write_all(&1u32.to_ne_bytes()).is_err() {
                     break;
                 }
+                // The interrupt with a timeout: a PL that stopped (reloaded,
+                // held in reset) is said once instead of a silent hang.
+                let mut pfd = libc::pollfd { fd: uio.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                // SAFETY: one valid pollfd for the duration of the call.
+                let r = unsafe { libc::poll(&mut pfd, 1, 5000) };
+                if r == 0 {
+                    if !quiet_logged {
+                        warn!(sdr_reset = regs.rd32(REG_CONTROL) & 1, "Maia spectrometer: no row for 5 s");
+                        quiet_logged = true;
+                    }
+                    continue;
+                }
+                quiet_logged = false;
                 let mut n = [0u8; 4];
                 if uio.read_exact(&mut n).is_err() {
                     break;

@@ -1,16 +1,53 @@
 #!/bin/sh
 #
 # Confirm a freshly installed firmware slot (see /usr/sbin/fw-update) once
-# the board is demonstrably usable over the network: an IPv4 address on a
-# non-loopback interface, dropbear listening, and trxd running. Without that
-# within CONFIRM_TIMEOUT seconds, reboot: U-Boot counts it, and the third
-# unconfirmed boot rolls back to the previous slot.
+# the board is demonstrably usable over the network: an IPv4 address on the
+# uplink, dropbear running, and the same trxd process alive for 20 s. Without
+# that within CONFIRM_TIMEOUT seconds, reboot: U-Boot counts it, and the
+# third unconfirmed boot rolls back to the previous slot.
+#
+# The uplink: usb0 always has its static 192.168.2.1, so it proves nothing.
+# Every healthy boot records which other interfaces had an IPv4 address in
+# UPLINKS; a new slot must bring up at least one of them (broken Ethernet in
+# a new image is then caught). An empty record means a USB-only board: usb0
+# is accepted. With no record yet, any interface but lo and usb0 counts, and
+# usb0 only when eth0 exists and has no cable.
 
 CONFIRM_TIMEOUT=240
 LOG=/mnt/jffs2/fw-update.log
+UPLINKS=/mnt/jffs2/fw-uplinks
+
+# Interfaces other than lo and usb0 with an IPv4 address, one per line.
+uplinks_now() {
+	ip -4 -o addr show 2>/dev/null | awk '$2 != "lo" && $2 != "usb0" {print $2}' | sort -u
+}
+
+uplink_ok() {
+	now=$(uplinks_now)
+	if [ -f "$UPLINKS" ]; then
+		if [ -s "$UPLINKS" ]; then
+			for i in $now; do grep -qx "$i" "$UPLINKS" && return 0; done
+			return 1
+		fi
+		ip -4 -o addr show dev usb0 2>/dev/null | grep -q inet
+		return
+	fi
+	[ -n "$now" ] && return 0
+	[ "$(cat /sys/class/net/eth0/carrier 2>/dev/null)" = "0" ] &&
+		ip -4 -o addr show dev usb0 2>/dev/null | grep -q inet
+}
+
+# Save the uplinks of a healthy boot (only when they changed: jffs2 wear).
+record_uplinks() {
+	grep -q ' /mnt/jffs2 ' /proc/mounts || return 0
+	uplinks_now > "$UPLINKS.new"
+	# Never turn a known uplink into "USB only" (an unplugged cable).
+	if [ ! -s "$UPLINKS.new" ] && [ -s "$UPLINKS" ]; then rm -f "$UPLINKS.new"; return 0; fi
+	if cmp -s "$UPLINKS.new" "$UPLINKS"; then rm -f "$UPLINKS.new"; else mv "$UPLINKS.new" "$UPLINKS"; fi
+}
 
 healthy() {
-	ip -4 addr show 2>/dev/null | grep -v ' lo$' | grep -q 'inet ' || return 1
+	uplink_ok || return 1
 	pidof dropbear >/dev/null || return 1
 	pidof trxd >/dev/null || return 1
 }
@@ -19,11 +56,14 @@ confirm_loop() {
 	i=0
 	while [ $i -lt $CONFIRM_TIMEOUT ]; do
 		if healthy; then
-			# Healthy once is not enough: trxd must survive its first seconds.
+			# Healthy once is not enough: trxd must survive its first
+			# seconds (S80trxd restarts it, so the pid must stay the same).
+			pid=$(pidof trxd)
 			sleep 20
-			if healthy; then
+			if healthy && [ "$(pidof trxd)" = "$pid" ]; then
 				/usr/sbin/fw-update --confirm >/dev/null
 				logger -t fwconfirm "firmware slot confirmed"
+				record_uplinks
 				return
 			fi
 		fi
@@ -41,6 +81,13 @@ start)
 	if [ "$(fw_printenv -n upgrade_available 2>/dev/null)" = "1" ]; then
 		echo "Unconfirmed firmware slot: checking health in the background"
 		confirm_loop </dev/null >/dev/null 2>&1 &
+	else
+		# A confirmed slot: note its uplinks once the network had time.
+		( sleep 60; healthy && record_uplinks ) </dev/null >/dev/null 2>&1 &
+	fi
+	if grep -q 'UBOOT_FALLBACK=1' /proc/cmdline; then
+		echo "WARNING: slot $(fw_printenv -n slot 2>/dev/null) failed to boot; running the other slot (fw-update --status)"
+		logger -t fwconfirm "booted the other slot: slot $(fw_printenv -n slot 2>/dev/null) failed to load"
 	fi
 	if [ "$(fw_printenv -n rolled_back 2>/dev/null)" = "1" ]; then
 		echo "WARNING: the last firmware update was rolled back (fw-update --status)"

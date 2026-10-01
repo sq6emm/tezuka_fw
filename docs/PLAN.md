@@ -3,7 +3,7 @@
 A stripped fork of tezuka_fw that turns a Zynq-7020/AD936x board into a
 headless, remotely controlled narrowband transceiver (SSB / CW / FT8 / Q65)
 and, selected by config, into an IARU-R1 MGM beacon transmitter or beacon
-receiver/decoder publishing to MQTT.
+receiver/decoder (results to the log; MQTT was removed 2026-10-01).
 
 Boards: `plutoskyr2`, `libre` (both xc7z020). Everything else from tezuka_fw is
 removed.
@@ -18,7 +18,7 @@ removed.
 | Rootfs | Dashboard, IQEngine, Maia overlay, DATV overlay, api_controller.sh, sweep/LNB/classifier/bandplan scripts, NFS |
 
 Kept: ADI kernel + u-boot, libiio/iiod (network backend, handy for
-debugging), dropbear, avahi, mosquitto, gpsd + chrony (beacon timing),
+debugging), dropbear, avahi, gpsd + chrony (beacon timing),
 wireguard, SD-boot image flow, `board-fpga`.
 
 ## FPGA (`maia-sdr` fork, `maia-hdl/projects/simple`)
@@ -46,21 +46,13 @@ mass-storage `config.txt` style path is `/etc/trxd.toml`):
     TX: 48 kS/s audio -> SSB (Weaver/phasing) or CW keyer -> interpolate to 192 kS/s.
   * **TCI server** (WebSocket, port 40001): CAT + RX audio + TX audio + IQ.
   * **rigctld server** (TCP 4532, Hamlib `rigctl -m 2` compatible).
-  * **Decoders** (on-board, results to MQTT and TCI `spot:`):
+  * **Decoders** (on-board, results to the web UI and TCI `spot:`):
     FT8 (mfsk-core), Q65-60A..E (mfsk-core), CW skimmer (DeepCW Conformer-CTC, rten).
 * `role = "beacon-tx"` — GPS/NTP-timed MGM beacon:
   even minute digital mode (PI4 / Q65-60x) + carrier, odd minute CW + carrier
   (same cycle as MGMBeacon.ino / BeaconModes).
 * `role = "beacon-rx"` — fixed frequency, records each minute, decodes
-  PI4 / Q65 / CW, measures carrier SNR + frequency offset, publishes JSON to MQTT.
-
-MQTT topics (`<prefix>` defaults to `trxd/<hostname>`):
-
-| Topic | Payload |
-|---|---|
-| `<prefix>/state` | JSON: role, freq, mode, ptt, rx gain, tx power, time sync |
-| `<prefix>/decode/<mode>` | JSON per decode: utc, freq, dt, df, snr, message |
-| `<prefix>/cmd/<name>` | control: `freq`, `mode`, `ptt`, `rxgain`, `txatt`, `role` |
+  PI4 / Q65 / CW, measures carrier SNR + frequency offset, writes both to the log.
 
 ## Constraints / honest limits
 
@@ -102,7 +94,7 @@ boots roll back. Host side: `tools/fw-push.sh <ip> build/<board>.zip`.
 1. Strip firmware tree, two defconfigs. **Done.**
 2. Minimal FPGA project (`simple`), bitstreams for both boards. **Done**: timing met;
    PlutoSky R2 LUTs 43% -> 13%.
-3. trxd core: IIO, DSP, rigctld, TCI, MQTT, simulated radio. **Done** (host-tested).
+3. trxd core: IIO, DSP, rigctld, TCI, simulated radio (MQTT removed 2026-10-01). **Done** (host-tested).
 4. Decoders: FT8, Q65-60A..E, PI4, DeepCW skimmer. **Done** (round-trip tests; the
    skimmer needed VHF+ CW segments in sdroxide, see CLAUDE.md).
 5. Beacon TX / RX roles. **Done** (TX->RX loopback tests for Q65, PI4, CW, carrier).

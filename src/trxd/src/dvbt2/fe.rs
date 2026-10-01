@@ -25,6 +25,13 @@ pub const CARRIERS: usize = 1705;
 pub const TRACK: u32 = 64;
 /// FFT windows start this far before each symbol's useful part.
 pub const EARLY: u32 = 64;
+
+/// [`EARLY`] for a guard interval of `gi` samples: never past half the
+/// guard (t2ofdm.py places the window at gi - early: a guard shorter than
+/// EARLY would put it before the symbol, in the previous one).
+pub fn early(gi: usize) -> u32 {
+    EARLY.min(gi as u32 / 2)
+}
 /// FFT truncation stages (1/2 each): the carriers come out scaled by 1/64.
 pub const FFT_SCALE: f32 = 1.0 / 64.0;
 /// An equalized cell's unit (t2eq.py: z unit 1280 >> 6).
@@ -293,7 +300,7 @@ pub mod model {
                                 if q < gi || q >= N as i64 {
                                     raw = true;
                                 }
-                                let lo = gi - EARLY as i64;
+                                let lo = gi - early(gi as usize) as i64;
                                 if q >= lo && q < lo + N as i64 {
                                     in_win = true;
                                 }

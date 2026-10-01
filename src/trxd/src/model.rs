@@ -161,8 +161,16 @@ static INSTALLED: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mut
 pub fn install_background(source: String) {
     STARTED.store(true, std::sync::atomic::Ordering::Release);
     let spawned = std::thread::Builder::new().name("model".into()).spawn(move || {
+        // Marked done however install ends, a panic included (with
+        // panic = "abort" a panic ends trxd anyway; this is for unwinding).
+        struct Done;
+        impl Drop for Done {
+            fn drop(&mut self) {
+                mark_installed();
+            }
+        }
+        let _done = Done;
         install(&source);
-        mark_installed();
     });
     if spawned.is_err() {
         mark_installed();
@@ -170,7 +178,7 @@ pub fn install_background(source: String) {
 }
 
 fn mark_installed() {
-    *INSTALLED.0.lock().unwrap() = true;
+    *INSTALLED.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
     INSTALLED.1.notify_all();
 }
 
@@ -179,11 +187,21 @@ pub fn wait_installed() {
     if !STARTED.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
-    let mut done = INSTALLED.0.lock().unwrap();
+    // A backstop: reading the flash takes ~5 s; past this something is
+    // wrong and the caller runs on without the model.
+    let deadline = std::time::Instant::now() + INSTALL_WAIT;
+    let mut done = INSTALLED.0.lock().unwrap_or_else(|e| e.into_inner());
     while !*done {
-        done = INSTALLED.1.wait(done).unwrap();
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            tracing::warn!("DeepCW model install still not done after {:?}; going on without it", INSTALL_WAIT);
+            return;
+        }
+        done = INSTALLED.1.wait_timeout(done, left).unwrap_or_else(|e| e.into_inner()).0;
     }
 }
+
+const INSTALL_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -261,6 +279,14 @@ pub fn pack_cli(input: &str, output: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_installed_returns_when_install_fails() {
+        install_background("/nonexistent/model.bin".into());
+        let t0 = std::time::Instant::now();
+        wait_installed();
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10));
+    }
 
     #[test]
     fn pack_unpack_round_trip_and_corruption() {

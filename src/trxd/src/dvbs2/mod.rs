@@ -1,5 +1,5 @@
 //! DVB-S2 transmitter (EN 302 307-1), the low-rate subset trxd needs: MPEG-TS
-//! in, QPSK short FECFRAMEs (rates 1/4 .. 2/3), CCM, optional pilots, PL
+//! in, QPSK short FECFRAMEs (rates 1/4 .. 3/4), CCM, optional pilots, PL
 //! scrambling code 0, root-raised-cosine shaping at an integer number of
 //! samples per symbol. Checked bit-exact against leandvbtx and decoded by
 //! leandvb (see the tests and `--dvbs2-mod`).
@@ -10,7 +10,8 @@
 //!            -> PLFRAME (SOF + PLS code, pilots, PL scrambling) -> RRC
 //! ```
 
-// 3/4 is generated with the others but not offered (leansdr encodes it wrong).
+// (Short 3/4 is offered too; leansdr's own 3/4 encoder is wrong, so it is
+// checked against the LDPC parity checks, not against leandvbtx.)
 #[allow(dead_code)]
 pub mod ddc;
 pub mod fpga;
@@ -71,7 +72,7 @@ impl Rate {
         }
     }
     /// MODCOD number (QPSK).
-    fn modcod(self) -> u8 {
+    pub fn modcod(self) -> u8 {
         match self {
             Rate::R1_4 => 1,
             Rate::R1_3 => 2,
