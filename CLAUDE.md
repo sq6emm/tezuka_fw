@@ -12,7 +12,7 @@ neural CW skimmer) or an IARU-R1 MGM beacon transmitter/receiver with MQTT
 output. See `docs/PLAN.md` for architecture, `docs/REFERENCE.md` for the
 frequency-reference design and `docs/DATV.md` for DVB-S2 video (trxd
 `src/dvbs2/`: TX, RX, TS mux/demux; web UI DATV panel) and `docs/DATV-FPGA.md`
-for its FPGA front end (Maia DDC + ring DMA, maia-sdr branch `datv-ddc`).
+for its FPGA front end (Maia DDC + ring DMA, maia-sdr branch `datv-ddc`); `docs/DATV-OTA.md` has every DATV mode over the air on every band.
 
 Boards: `plutoskyr2`, `libre` (both xc7z020). `boards.json` is the single
 source of truth for `build.sh` and CI.

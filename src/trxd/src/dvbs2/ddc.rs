@@ -626,6 +626,11 @@ mod tests {
     /// rate: pulse-shaped at 3.072 MS/s from the continuous RRC, then the
     /// DDC (fractional samples per symbol out) and the long-frame receiver.
     fn long_link_ddc(rs: f64, mode: super::super::fpga_tx::LongMode, esn0_db: f32, frames: usize, symsync: bool) -> (super::super::rx::Stats, usize) {
+        long_link_ddc_at(rs, mode, esn0_db, frames, symsync, 300.0, 0.0)
+    }
+
+    /// [`long_link_ddc`] with the carrier `err` Hz off, moving `drift` Hz/s.
+    fn long_link_ddc_at(rs: f64, mode: super::super::fpga_tx::LongMode, esn0_db: f32, frames: usize, symsync: bool, err: f64, drift: f64) -> (super::super::rx::Stats, usize) {
         use super::super::{FrameSpec, rrc_at, rx::tests::{counter_packets, long_symbols}};
         let spec = FrameSpec::long(mode);
         let mut next = counter_packets();
@@ -648,7 +653,7 @@ mod tests {
             let v = (seed >> 11) as f64 / (1u64 << 53) as f64;
             ((-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()) as f32
         };
-        let (center, err) = (100e3, 300.0);
+        let center = 100e3;
         let amp = 1200.0 / (e.sqrt() + 1.0);
         let mut rx = None;
         let mut ss: Option<SymSync> = None;
@@ -668,7 +673,8 @@ mod tests {
                     z += syms[i] * tab[x];
                 }
             }
-            let ph = std::f64::consts::TAU * (center + err) * k as f64 / FS;
+            let tk = k as f64 / FS;
+            let ph = std::f64::consts::TAU * ((center + err) * tk + drift * tk * tk / 2.0);
             let v = (z * Complex32::new(ph.cos() as f32, ph.sin() as f32) + Complex32::new(sigma * g(), sigma * g())) * amp;
             adc.push([v.re.round().clamp(-2048.0, 2047.0) as i16, v.im.round().clamp(-2048.0, 2047.0) as i16]);
             if adc.len() == 30_720 || k + 1 == n_out {
@@ -698,7 +704,9 @@ mod tests {
         let rx = rx.unwrap();
         let data: Vec<_> = out.iter().filter(|p| p[1..3] != [0x1F, 0xFF]).collect();
         let f0 = data.first().map_or(0, |p| u32::from_be_bytes(p[1..5].try_into().unwrap()));
-        for (i, p) in data.iter().enumerate() {
+        // (In order, with no gap: lost frames show in the stats. Under drift
+        // the probe below wants the stats.)
+        for (i, p) in data.iter().enumerate().filter(|_| drift == 0.0) {
             assert_eq!(u32::from_be_bytes(p[1..5].try_into().unwrap()), f0 + i as u32, "{mode:?} packet {i}; {:?}", rx.stats);
         }
         (rx.stats, data.len())
@@ -800,6 +808,40 @@ mod tests {
         if hdr {
             eprintln!("hdrdet: {nflags} flags in {nsyms} symbols ({:.3} %)", 100.0 * nflags as f64 / nsyms.max(1) as f64);
         }
+    }
+
+    /// A carrier offset of a few percent of the symbol rate (a 0.2 ppm
+    /// crystal at 3.4 GHz is 650 Hz, 2 % of 33 kS/s): the 90-symbol header
+    /// turns through more than a cycle while acquisition holds the NCO.
+    /// Measured as it came, its phase flipped and the receiver settled an
+    /// alias (rs / 1476, 22 Hz) off, locked with nothing decoding (seen on
+    /// air, 8PSK 3/4 33 kS/s at 2330 and 3410 MHz).
+    #[test]
+    fn psk8_slow_rate_large_offset() {
+        use super::super::fpga_tx::LongMode;
+        for err in [650.0, 1000.0] {
+            let (s, n) = long_link_ddc_at(33e3, LongMode::Psk8_34, 20.0, 14, true, err, 0.0);
+            eprintln!("{err} Hz: {n} packets, {} bad, freq {:.1}, Es/N0 {:.1}", s.frames_bad, s.freq_hz, s.esn0_db);
+            assert!(s.locked && (s.freq_hz as f64 - err).abs() < 3.0 && n >= 10 * 32, "{err} Hz: {n} packets, {s:?}");
+        }
+        // And drifting as a transmitter just keyed does (5 Hz/s seen at
+        // 3.4 GHz): acquisition ends early on a strong signal, tracking
+        // learns the drift.
+        let (s, n) = long_link_ddc_at(33e3, LongMode::Psk8_34, 20.0, 30, true, 700.0, -5.0);
+        eprintln!("-5 Hz/s: {n} packets, {} bad of {}", s.frames_bad, s.frames);
+        assert!(s.locked && s.frames_bad <= 2 && n >= 26 * 32, "-5 Hz/s: {n} packets, {s:?}");
+    }
+
+    /// Probe: 8PSK 3/4 at 33 kS/s, 700 Hz off, drifting DATV_DRIFT Hz/s
+    /// (default -5). Before the fixes -5 Hz/s lost 17 of 29 frames; now
+    /// -10 Hz/s loses 5 (acquisition), -20 Hz/s still fails.
+    #[test]
+    #[ignore]
+    fn psk8_slow_drift() {
+        use super::super::fpga_tx::LongMode;
+        let drift: f64 = std::env::var("DATV_DRIFT").map_or(-5.0, |v| v.parse().unwrap());
+        let (s, n) = long_link_ddc_at(33e3, LongMode::Psk8_34, 20.0, 30, true, 700.0, drift);
+        eprintln!("drift {drift} Hz/s: {n} packets, {} bad of {}, freq {:.1}, Es/N0 {:.1}, data {:.1}", s.frames_bad, s.frames, s.freq_hz, s.esn0_db, s.data_esn0_db);
     }
 
     /// The amateur standard symbol rates through the DDC and the FPGA's

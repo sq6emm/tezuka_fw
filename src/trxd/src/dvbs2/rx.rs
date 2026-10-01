@@ -32,6 +32,9 @@ const TRACK_SLACK: usize = 3;
 /// Frames whose header lag correlations are summed before the carrier
 /// estimate is trusted (about 1/sqrt(N) of the single-frame noise).
 const ACQ_FRAMES: u32 = 16;
+/// Known-block Es/N0 (dB) that ends acquisition early (after 3 frames, two
+/// of them this clean).
+const ACQ_CLEAN_DB: f32 = 10.0;
 /// Header lags for the coarse carrier estimate (+-rs/2 down to +-rs/80).
 const LAGS: [usize; 3] = [1, 8, 40];
 
@@ -101,8 +104,15 @@ pub struct Receiver {
     candidate: Option<usize>,
     missed: u32,
     freq_est: f64,
+    /// Tracking: how far the carrier moves a frame (Hz), learned.
+    drift_hz: f64,
     /// Frames since lock, for the frequency acquisition.
     frames_locked: u32,
+    /// Frames this acquisition takes ([`ACQ_FRAMES`], fewer for a strong
+    /// signal), and acquisition frames in a row whose known blocks came out
+    /// clean.
+    acq_frames: u32,
+    acq_good: u32,
     /// Header lag correlations summed over the acquisition frames.
     acq: [Complex32; 3],
     /// Frames in a row that failed to decode while tracking.
@@ -292,7 +302,10 @@ impl Receiver {
             candidate: None,
             missed: 0,
             freq_est: 0.0,
+            drift_hz: 0.0,
             frames_locked: 0,
+            acq_frames: ACQ_FRAMES,
+            acq_good: 0,
             acq: [Complex32::default(); 3],
             fails: 0,
             noise_frames: 0,
@@ -523,14 +536,23 @@ impl Receiver {
                     let end = need - SLOT;
                     let (best, m) = self.search(start, end);
                     if m >= SYNC_MIN {
-                        if self.candidate.is_some() {
+                        if let Some(first) = self.candidate.and(best.checked_sub(l)) {
                             // Two headers one frame apart: locked.
-                            self.locked_at = Some(best - l);
+                            self.locked_at = Some(first);
                             self.missed = 0;
                             self.frames_locked = 0;
                             self.acq = [Complex32::default(); 3];
+                            self.acq_frames = ACQ_FRAMES;
+                            self.acq_good = 0;
                             self.stats.locked = true;
                         } else {
+                            // (Or the second header came early, symbols lost
+                            // between, and a frame back from it lies before
+                            // the buffer: a candidate in the first
+                            // TRACK_SLACK symbols. That wrapped, and the
+                            // receiver thread died indexing at usize::MAX
+                            // (seen on 2 m, 8PSK 500 kS/s in interference).
+                            // It starts over from the second.)
                             self.candidate = Some(best);
                         }
                     } else {
@@ -578,12 +600,20 @@ impl Receiver {
         }
     }
 
-    /// Phase of a known block (header at `at` with the reference, or a pilot).
-    fn block(&self, base: usize, at: usize, len: usize) -> Complex32 {
+    /// Phase of a known block (header at `at` with the reference, or a
+    /// pilot) at its centre, `f` Hz (the frequency so far) taken out inside
+    /// it. Averaged as it comes, a block turning through more than a cycle
+    /// (the 90-symbol header from rs / 90 on: 367 Hz at 33 kS/s, which
+    /// acquisition sees with the NCO held) comes out with its phase flipped,
+    /// and the frame's fit an alias (rs / 1476) off for good.
+    fn block(&self, base: usize, at: usize, len: usize, f: f64) -> Complex32 {
         let mut acc = Complex32::default();
         let a = std::f32::consts::FRAC_1_SQRT_2;
+        let w = -std::f64::consts::TAU * f / self.rs;
+        let mid = (len - 1) as f64 / 2.0;
         for i in 0..len {
-            let s = self.syms[base + at + i];
+            let ph = w * (i as f64 - mid);
+            let s = self.syms[base + at + i] * Complex32::new(ph.cos() as f32, ph.sin() as f32);
             let r = if at == 0 {
                 self.header[i]
             } else {
@@ -624,7 +654,7 @@ impl Receiver {
         // with the NCO held, then resolved coarse to fine (lag 1: +-rs/2, lag
         // 40: +-rs/80) and applied once. One frame alone is too noisy (+-15 Hz
         // at 8 dB) to unwrap phase across the 1476 symbols between pilots.
-        let acquiring = self.frames_locked < ACQ_FRAMES;
+        let acquiring = self.frames_locked < self.acq_frames;
         let mut f = self.freq_est;
         if acquiring {
             for (a, &lag) in self.acq.iter_mut().zip(&LAGS) {
@@ -644,11 +674,11 @@ impl Receiver {
         let mut pts: Vec<(f64, f64, f32)> = Vec::new(); // (centre symbol, phase, weight)
         let with_next = next + SLOT <= self.syms.len();
         for &(at, len) in &self.known {
-            let c = self.block(p, at, len);
+            let c = self.block(p, at, len, f);
             pts.push(((at + len / 2) as f64, c.arg() as f64, c.norm() * len as f32));
         }
         if with_next {
-            let c = self.block(next, 0, SLOT);
+            let c = self.block(next, 0, SLOT, f);
             pts.push(((next - p + SLOT / 2) as f64, c.arg() as f64, c.norm() * SLOT as f32));
         }
         // Unwrap against a predicted frequency, fit a line (weighted least
@@ -696,16 +726,29 @@ impl Receiver {
         self.frames_locked = self.frames_locked.saturating_add(1);
         self.stats.freq_hz = (self.afc_hz + f) as f32;
         if acquiring {
-            if self.frames_locked == ACQ_FRAMES {
-                // Acquired: the NCO takes the averaged estimate in one step.
+            // A strong signal need not wait for the average: once the known
+            // blocks came out clean on two frames, this frame's own fit is
+            // right. Waiting 16 frames (11 s at 33 kS/s 8PSK) let a drifting
+            // carrier (a transmitter just keyed, a few Hz/s at 3.4 GHz) leave
+            // the average an alias behind, again after every restart.
+            if self.frames_locked >= self.acq_frames || (self.frames_locked >= 3 && self.acq_good >= 2) {
+                // Acquired: the NCO takes the estimate in one step.
                 self.retune(f, next);
                 self.freq_est = 0.0;
+                self.drift_hz = 0.0;
+                self.acq_frames = self.frames_locked;
             }
         } else {
             // Tracking: move the NCO slowly toward the estimate; what remains
-            // is followed inside each frame by the phases above.
+            // is followed inside each frame by the phases above. Second
+            // order: it also moves by the drift learned from how far each
+            // frame's estimate missed the prediction (a transmitter just
+            // keyed moves a few Hz/s; at 33 kS/s a frame lasts 0.7-1 s and a
+            // pilot alias is only 22 Hz away).
+            let miss = f - self.freq_est;
+            self.drift_hz = (self.drift_hz + 0.2 * miss).clamp(-alias / 4.0, alias / 4.0);
             self.freq_est = 0.8 * f;
-            self.retune(0.2 * f, next);
+            self.retune(0.2 * f + self.drift_hz, next);
         }
 
         // Phase for every symbol: linear between neighbouring known blocks.
@@ -744,6 +787,9 @@ impl Receiver {
         }
         let sigma2 = (noise / n_known as f32).max(1e-9);
         self.stats.esn0_db = 10.0 * (amp * amp / sigma2).log10();
+        if acquiring {
+            self.acq_good = if self.stats.esn0_db >= ACQ_CLEAN_DB { self.acq_good + 1 } else { 0 };
+        }
         // Data symbols: derotate, descramble, LLRs (positive = 0).
         let scale = 2.0 * std::f32::consts::SQRT_2 * amp / sigma2 * a * std::f32::consts::SQRT_2;
         let (mut dd_sig, mut dd_err) = (0f32, 0f32);
@@ -854,11 +900,14 @@ impl Receiver {
             }
         };
         self.fails = fails;
-        if self.fails >= 3 && self.frames_locked >= ACQ_FRAMES {
+        if self.fails >= 3 && self.frames_locked >= self.acq_frames {
             // Carrier wrong, or gone: acquire again from where the AFC is.
             self.frames_locked = 0;
             self.acq = [Complex32::default(); 3];
+            self.acq_frames = ACQ_FRAMES;
+            self.acq_good = 0;
             self.freq_est = 0.0;
+            self.drift_hz = 0.0;
             self.fails = 0;
             if let FecMode::Thread { fails, .. } = &self.fec {
                 fails.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1477,6 +1526,11 @@ impl RxThread {
         }
     }
 
+    /// Through the FPGA's DDC (not the stream IQ).
+    pub fn through_fpga(&self) -> bool {
+        self.fpga_center.is_some()
+    }
+
     /// The DVB service information received so far.
     pub fn si(&self) -> super::ts::Si {
         self.shared.lock().unwrap().si.clone()
@@ -1596,6 +1650,28 @@ pub(crate) mod tests {
             }
         }
         out
+    }
+
+    /// A candidate header right at the start of the buffer and the next one
+    /// two symbols early (symbols lost between): the frame before the second
+    /// would start before the buffer. It used to wrap and index at
+    /// usize::MAX; now the second header is the new candidate, and the
+    /// frames after it decode.
+    #[test]
+    fn early_second_header_at_the_buffer_start() {
+        use super::super::fpga_tx::LongMode;
+        let spec = FrameSpec::long(LongMode::Qpsk12);
+        let mut next = counter_packets();
+        let syms = long_symbols(LongMode::Qpsk12, 5, &mut next);
+        let mut x = vec![Complex32::new(0.01, -0.01)];
+        x.extend_from_slice(&syms[..1000]);
+        x.extend_from_slice(&syms[1002..]);
+        let mut rx = Receiver::new_symbols_spec(spec, 250e3, 0.0);
+        let mut out = Vec::new();
+        for c in x.chunks(4096) {
+            rx.process(c, &mut out);
+        }
+        assert!(rx.stats.locked && out.len() >= 21, "{} packets, {:?}", out.len(), rx.stats);
     }
 
     pub(crate) fn counter_packets() -> impl FnMut() -> [u8; TS_LEN] {

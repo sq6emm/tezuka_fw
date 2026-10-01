@@ -257,6 +257,8 @@ pub struct Trx {
     /// receiver starves the modulator) and resumes afterwards.
     datv_rx_req: Option<(f64, String, bool)>,
     datv_rx_stats: crate::dvbs2::rx::Stats,
+    /// Frames decoded, and frames seen, when the decoded count last moved.
+    datv_rx_watch: (u64, u64, Instant),
     /// Automatic receive (symbol rate "0"): the blind scan while no
     /// receiver runs, what it found last, the receiver's last progress.
     datv_scan: Option<crate::dvbs2::scan::Scanner>,
@@ -474,6 +476,7 @@ impl Trx {
             datv_rx: None,
             datv_rx_req: None,
             datv_rx_stats: Default::default(),
+            datv_rx_watch: (0, 0, Instant::now()),
             datv_scan: None,
             datv_auto: false,
             datv_auto_sr: None,
@@ -911,6 +914,16 @@ impl Trx {
         if self.tx_on.is_none() && self.datv_rx.as_ref().is_some_and(|r| r.t2_bw.is_some()) {
             return Some(0.0);
         }
+        // Receiving DVB-S2 through the FPGA's DDC (and not sending): the LO
+        // just below the signal, as for sending. Straddling the LO, a wide
+        // signal meets its own mirror image: the AD936x's image rejection
+        // falls off away from the LO (frequency-dependent I/Q mismatch that
+        // quadrature tracking does not remove), below 1 GHz badly: 500 kS/s
+        // at 436 MHz gave MER 6 dB with the LO in the middle, 15 dB 100 kHz
+        // below, 27 dB with the signal on one side (docs/DATV-OTA.md).
+        if let Some(half) = self.datv_rx_half() {
+            return Some((half + 10e3).min(crate::dvbs2::fpga::FS_IN * 0.4 - half).max(0.0));
+        }
         let d = self.datv.as_ref().filter(|_| matches!(self.tx_on, Some(TxSource::Datv(_))))?;
         if d.fpga.is_some() || d.t2.is_some() {
             // The FPGA's samples go to the DAC as they are: LO on the signal.
@@ -918,6 +931,22 @@ impl Trx {
         }
         let half = d.sr * (1.0 + d.rolloff as f64) / 2.0;
         Some((half + 10e3).min(self.rate * 0.38 - half).max(0.0))
+    }
+
+    /// Receiving DVB-S2 through the FPGA's DDC and not sending: half the
+    /// widest signal it may meet (the scan's fastest rate while it looks
+    /// for one, and in automatic mode throughout, so the LO stays put).
+    fn datv_rx_half(&self) -> Option<f64> {
+        if self.tx_on.is_some() || !self.datv_mode {
+            return None;
+        }
+        let widest = crate::dvbs2::scan::RATES.iter().cloned().fold(0.0, f64::max);
+        let sr = if self.datv_scan.is_some() || (self.datv_auto && self.datv_rx.is_some()) {
+            widest
+        } else {
+            self.datv_rx.as_ref().filter(|r| r.t2_bw.is_none() && r.through_fpga())?.sr
+        };
+        Some(sr * 1.35 / 2.0)
     }
 
     /// DATV reception can run now: nothing sent, or sent by the FPGA's
@@ -1093,6 +1122,8 @@ impl Trx {
             self.datv_auto_note = "scanning".into();
             self.datv_scan = Some(crate::dvbs2::scan::Scanner::start(self.rx_eff() - self.center, self.datv_auto_sr));
             info!("DATV receive: automatic (scanning the standard symbol rates)");
+            // The LO onto the signal (datv_lo_offset).
+            self.retune(false);
             return;
         }
         let sps = self.rate / sr;
@@ -1106,6 +1137,7 @@ impl Trx {
             }
             info!(sr, rate, "DATV receive on");
             self.datv_rx = Some(crate::dvbs2::rx::RxThread::start_spec(FrameSpec::long(mode), mode.label().to_string(), self.rate, sr, center));
+            self.retune(false);
             return;
         }
         match Rate::parse(rate) {
@@ -1113,6 +1145,7 @@ impl Trx {
                 let p = Params { rate, pilots, rolloff: 0.35 };
                 info!(sr, rate = rate.label(), "DATV receive on");
                 self.datv_rx = Some(crate::dvbs2::rx::RxThread::start(p, self.rate, sr, center));
+                self.retune(false);
             }
             _ => warn!(sr, rate, "DATV receive: symbol rate or code rate not offered"),
         }
@@ -1134,6 +1167,35 @@ impl Trx {
             self.unkey();
         }
         info!("DATV mode off");
+    }
+
+    /// A receiver that holds lock while nothing decodes starts again: its
+    /// frame headers keep matching but the pilots do not (their Es/N0 far
+    /// below the data's decision-directed figure). A safety net: the case
+    /// seen (8PSK 3/4 at 33 kS/s, the carrier more than rs / 90 off, an
+    /// alias off after acquisition) is fixed in the receiver. A restart also
+    /// resets the FPGA's timing recovery.
+    fn datv_rx_watchdog(&mut self) {
+        let s = &self.datv_rx_stats;
+        // (DVB-T2 counts FEC blocks and has no such figures.)
+        let s2 = self.datv_rx.as_ref().is_some_and(|r| r.t2_bw.is_none());
+        if !s2 || self.datv_auto || s.frames < self.datv_rx_watch.1 {
+            self.datv_rx_watch = (0, 0, Instant::now());
+            return;
+        }
+        let good = s.frames.saturating_sub(s.frames_bad);
+        if !s.locked || good != self.datv_rx_watch.0 || self.datv_rx_watch.1 == 0 {
+            self.datv_rx_watch = (good, s.frames.max(1), Instant::now());
+            return;
+        }
+        if s.frames >= self.datv_rx_watch.1 + 8 && self.datv_rx_watch.2.elapsed() >= Duration::from_secs(3) && s.esn0_db < s.data_esn0_db - 3.0 {
+            warn!(frames = s.frames - self.datv_rx_watch.1, esn0 = s.esn0_db, mer = s.data_esn0_db, "DATV receive: locked but nothing decodes; starting again");
+            if let Some((sr, rate, pilots)) = self.datv_rx_req.clone() {
+                self.datv_rx = None;
+                self.datv_rx_start(sr, &rate, pilots);
+            }
+            self.datv_rx_watch = (0, 0, Instant::now());
+        }
     }
 
     /// Automatic receive: a scan that found something starts the receiver
@@ -1568,7 +1630,9 @@ impl Trx {
         // DVB-T2 reception: the RX filter opens to 1.3 x the channel (its
         // default, about 1 MHz, cut the outer carriers by up to 15 dB and
         // left no P1 to find), and closes again after.
-        let want = self.datv_rx.as_ref().and_then(|r| r.t2_bw).filter(|_| std::env::var_os("TRXD_NO_RXBW").is_none()).map_or(self.cfg.radio.rf_bandwidth, |bw| {
+        // DVB-S2 beside the LO (datv_lo_offset): open it over both.
+        let s2 = self.datv_rx_half().zip(self.datv_lo_offset()).map(|(half, off)| 2.0 * (half + off));
+        let want = self.datv_rx.as_ref().and_then(|r| r.t2_bw).or(s2).filter(|_| std::env::var_os("TRXD_NO_RXBW").is_none()).map_or(self.cfg.radio.rf_bandwidth, |bw| {
             self.cfg.radio.rf_bandwidth.max((bw * 1.3) as u32)
         });
         if want != self.rx_bw {
@@ -2147,6 +2211,7 @@ impl Trx {
             self.apply_web(c.client, &c.msg);
         }
         self.datv_auto_step();
+        self.datv_rx_watchdog();
         let Some(w) = &self.web else { return };
         if let Some(r) = &self.datv_rx {
             let (stats, msgs) = r.take();

@@ -111,6 +111,14 @@ access unit); ffprobe, ffmpeg and VLC read it.
 - Decoder alone (ideal LLRs): frames clean from Es/N0 -2.5 dB (1/4),
   0 dB (1/3), +0.5 dB (1/2), about 4 dB (2/3).
 
+## Every mode on every band
+
+DATV-OTA.md: all DVB-S2 rates and modes and all DVB-T2 modes, both
+directions, 145 MHz to 5.7 GHz (2026-09-30), and what it found: the LO
+now goes beside a DVB-S2 signal being received (the AD936x's image below
+1 GHz), slow 8PSK with a large carrier offset or drift, a receive thread
+crash; DVB-T2 below 1 GHz is still open.
+
 ## Over the air (2026-09-26, Libre 2 -> Libre 1, 1255.000 MHz, indoors)
 
 64 kS/s, QPSK 1/2, pilots, Libre 2 at 0 dB TX attenuation (DATV runs 6 dB
