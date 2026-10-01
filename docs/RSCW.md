@@ -198,10 +198,27 @@ Results (b2 network), shown text / at least half / at least 80 % / mean:
 | other half, gated | 38 % | 23 % | 14 % | 23 % |
 | other half, rain-scatter-decoder | 0 % | 23 % | 9 % | 23 % |
 
-On the other half three voice recordings still show a letter or three
-(O TK, S AJ, K): a Morse rhythm test is the next step. The 55-token
-score: 34 ungated, 32 gated (it counts words anywhere and costs nothing
-for junk).
+On the other half three voice recordings still showed a letter or three
+(O TK, S AJ, K).
+
+Then a Morse rhythm test (`morse_fit`, a port of rain-scatter-decoder's
+`_quant_fit`): over the last 4 s of the network's key decisions, how well
+the run lengths fit one time unit (elements 1 and 3, gaps 1, 3, 7 with a
+fitted stretch, gaps only penalised when short), 0..1. Text is shown only
+at 0.45 or above (`RSCW_MORSE`): just above every fragment without Morse
+in the tuning half (their highest 0.42; Morse mostly 0.65-0.96). With it
+the character gate eased to 4. Chosen on the tuning half before the other
+half was looked at again:
+
+| | invents | half+ | 80%+ | mean |
+|---|---|---|---|---|
+| other half, gate 5 (before) | 38 % | 23 % | 14 % | 23 % |
+| other half, gate 4 + rhythm | 12 % | 23 % | 14 % | 22 % |
+| all 62, gate 4 + rhythm | 6 % | 27 % | 20 % | 28 % |
+| all 62, rain-scatter-decoder | 0 % | 27 % | 16 % | 26 % |
+
+The one left: a "T" in an FM voice fragment. The 55-token score with
+the defaults: 34 (as ungated).
 
 ## Not done
 
