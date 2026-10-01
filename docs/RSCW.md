@@ -168,6 +168,41 @@ The misses left: weak beacons with no keying the network finds
 (SR6NCI, OE5XBM, S51ZO, S56BD, SR6KBL, IW5DHN), single-element slips
 (SP6GW6, OK1TES, E0FGB for DB0FGB), and SSB-only recordings.
 
+## Against operators' labels (2026-10-01)
+
+62 fragments of the same recordings that operators labelled (SP5BIN,
+SQ6EMM; from the separate rain-scatter-decoder project): 45 with CW and
+the text heard, 17 voice, weak or empty. Scored as that project does:
+the longest run of the operator's text found in the output, and whether
+anything is shown on a fragment without CW. The decoder runs over the
+whole recording and the characters inside the fragment's time window
+count (`rscw_nntimed`, characters with times). Fragments are split in
+two halves: gates tuned on one, the other looked at once.
+
+Found and fixed:
+- The last 2.7 s of a recording were never decoded: the network gives a
+  frame's output once it has its context after it (`RsNn::latency`).
+  `finish()` now pushes that much silence through. Fragments decoded
+  alone: mean 20 -> 32 %.
+- Text on noise and voice (E, T, TE ... on 88 % of the fragments without
+  CW). Two gates (defaults; `RSCW_CHARCONF`, `RSCW_JUNK`): a character is
+  shown only if the network's LLRs agree with the path's key states over
+  it by at least 5 per frame on average, and a word of at most two of the
+  shortest codes (E T I A N M) is dropped (only such a word's start waits).
+
+Results (b2 network), shown text / at least half / at least 80 % / mean:
+
+| | invents | half+ | 80%+ | mean |
+|---|---|---|---|---|
+| tuning half, gated | 0 % | 35 % | 26 % | 36 % |
+| other half, gated | 38 % | 23 % | 14 % | 23 % |
+| other half, rain-scatter-decoder | 0 % | 23 % | 9 % | 23 % |
+
+On the other half three voice recordings still show a letter or three
+(O TK, S AJ, K): a Morse rhythm test is the next step. The 55-token
+score: 34 ungated, 32 gated (it counts words anywhere and costs nothing
+for junk).
+
 ## Not done
 
 - A language model (callsign structure, repeated calls combined): the

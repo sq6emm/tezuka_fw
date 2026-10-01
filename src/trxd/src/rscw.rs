@@ -1188,6 +1188,25 @@ pub struct RsNnStream {
     fresh: String,
     /// Seconds in the network (features included) and in the banks.
     pub prof: (f64, f64),
+    /// Decoder frames so far, squelched ones included (for times).
+    frames: usize,
+    /// The LLRs of the frames not yet committed (as the banks saw them).
+    recent: std::collections::VecDeque<f32>,
+    /// The character being read: its frames' agreement with the path's
+    /// key states (LLR signed by key down / up), summed, and their count.
+    span: (f32, usize),
+    /// A character is shown only if its mean agreement per network frame
+    /// is at least this (RSCW_CHARCONF; -inf: every character).
+    char_conf: f32,
+    /// Every shown character (and word gap) with its time in seconds.
+    pub timed: Vec<(f32, char)>,
+    /// A word of at most this many characters, all of the shortest codes
+    /// (E T I A N M: what noise decodes as), is not shown (RSCW_JUNK; 0:
+    /// off). Only such a word's start waits, until a longer or another
+    /// letter shows it is real.
+    junk_len: usize,
+    hold: Vec<(usize, char)>,
+    word_ok: bool,
 }
 
 impl RsNnStream {
@@ -1223,6 +1242,16 @@ impl RsNnStream {
             text: String::new(),
             fresh: String::new(),
             prof: (0.0, 0.0),
+            frames: 0,
+            recent: std::collections::VecDeque::new(),
+            span: (0.0, 0),
+            // (both gates tuned on half of 62 fragments operators labelled,
+            // 2026-10-01: text on noise and voice from 78 % of them to 0 %)
+            char_conf: std::env::var("RSCW_CHARCONF").ok().and_then(|v| v.parse().ok()).unwrap_or(5.0),
+            timed: Vec::new(),
+            junk_len: std::env::var("RSCW_JUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(2),
+            hold: Vec::new(),
+            word_ok: false,
         }
     }
 
@@ -1249,6 +1278,7 @@ impl RsNnStream {
             }
             let l = self.acc.0;
             self.acc = (0.0, 0);
+            self.frames += 1;
             self.quiet = if l > self.sure * self.dec as f32 { 0 } else { self.quiet.saturating_add(1) };
             // Squelched (no confident key-down for a while): nothing would
             // be shown, so the banks rest (on noise the beam prunes little
@@ -1260,6 +1290,8 @@ impl RsNnStream {
                     self.pending = 0;
                     self.since = 0;
                     self.prev = 0;
+                    self.recent.clear();
+                    self.span = (0.0, 0);
                     self.idle = true;
                 }
                 continue;
@@ -1268,6 +1300,7 @@ impl RsNnStream {
             for b in &mut self.banks {
                 b.step(l);
             }
+            self.recent.push_back(l);
             self.pending += 1;
             self.since += 1;
             if self.since >= self.every && self.pending > self.lag {
@@ -1283,20 +1316,73 @@ impl RsNnStream {
         let b = (0..self.banks.len()).max_by(|&a, &b| self.banks[a].fit.total_cmp(&self.banks[b].fit)).unwrap_or(0);
         let path = self.banks[b].path(self.pending);
         let n = n.min(path.len());
+        // the first committed frame's number (pending frames are the latest)
+        let start = self.frames - self.pending;
+        let llrs: Vec<f32> = self.recent.drain(..n.min(self.recent.len())).collect();
         let m = &self.banks[b].m;
-        let mut out = String::new();
-        let prev = if (self.prev as usize) < m.chains.len() { self.prev } else { m.wg as u16 };
-        self.prev = m.text(&path[..n], prev, &mut out);
+        let mut prev = if (self.prev as usize) < m.chains.len() { self.prev } else { m.wg as u16 };
+        let mut span = self.span;
+        let mut events: Vec<(usize, char)> = Vec::new();
+        // as CharModel::text, with each character's agreement and time
+        for (i, &c) in path[..n].iter().enumerate() {
+            let ch = &m.chains[c as usize];
+            let l = llrs.get(i).copied().unwrap_or(0.0);
+            span = (span.0 + if ch.on { l } else { -l }, span.1 + 1);
+            if c != prev {
+                let (pk, ck) = (m.chains[prev as usize].kind, ch.kind);
+                if pk == 0 && (ck == 2 || ck == 3) {
+                    if let Some(x) = m.ch[m.chains[prev as usize].node] {
+                        if span.0 / (span.1.max(1) * self.dec) as f32 >= self.char_conf {
+                            events.push((start + i, x));
+                        }
+                    }
+                    span = (0.0, 0);
+                    if ck == 3 {
+                        events.push((start + i, ' '));
+                    }
+                }
+                prev = c;
+            }
+        }
+        self.prev = prev;
+        self.span = span;
         self.pending -= n;
         // squelch: the network has been unsure for over 4 s
         if self.quiet as f32 > self.squelch_s * self.fps + self.lag as f32 {
             return;
         }
-        if out.starts_with(' ') && self.text.ends_with(' ') {
-            out.remove(0);
+        self.show(events);
+    }
+
+    fn show(&mut self, events: Vec<(usize, char)>) {
+        for (f, x) in events {
+            if x == ' ' {
+                // a word that never showed itself real is dropped
+                self.hold.clear();
+                self.word_ok = false;
+                if !(self.text.is_empty() || self.text.ends_with(' ')) {
+                    self.put(f, ' ');
+                }
+                continue;
+            }
+            if self.word_ok || self.junk_len == 0 {
+                self.put(f, x);
+                continue;
+            }
+            self.hold.push((f, x));
+            if self.hold.len() > self.junk_len || !"ETIANM".contains(x) {
+                self.word_ok = true;
+                for (f, x) in std::mem::take(&mut self.hold) {
+                    self.put(f, x);
+                }
+            }
         }
-        self.text += &out;
-        self.fresh += &out;
+    }
+
+    fn put(&mut self, f: usize, x: char) {
+        self.text.push(x);
+        self.fresh.push(x);
+        self.timed.push((f as f32 / self.fps, x));
     }
 
     /// What was committed since the last call.
@@ -1305,9 +1391,28 @@ impl RsNnStream {
     }
 
     pub fn finish(&mut self) {
+        // the network's last frames wait for context after them (about
+        // 2.7 s for the larger networks): silence releases them, as the
+        // zero padding at a batch's end would (the endings were lost)
+        let tail = vec![0f32; self.nn.latency()];
+        self.process(&tail);
         let n = self.pending;
         if n > 0 {
             self.commit(n);
+        }
+        // the character still being read when the audio stops (as
+        // viterbi_chars does): it had no gap after it to end it
+        let b = (0..self.banks.len()).max_by(|&a, &b| self.banks[a].fit.total_cmp(&self.banks[b].fit)).unwrap_or(0);
+        let m = &self.banks[b].m;
+        if self.idle || (self.prev as usize) >= m.chains.len() {
+            return;
+        }
+        let c = &m.chains[self.prev as usize];
+        if c.kind <= 1 && self.span.1 > 0 && self.span.0 / (self.span.1 * self.dec) as f32 >= self.char_conf {
+            if let Some(x) = m.ch[c.node] {
+                self.span = (0.0, 0);
+                self.show(vec![(self.frames, x)]);
+            }
         }
     }
 }
@@ -1859,6 +1964,32 @@ mod tests {
             eprintln!("{:36} {:4.0} WPM {mark:6} | {}", &name[..name.len().min(36)], d.wpm(), d.text.trim());
         }
         eprintln!("nn stream score: {got} of {all}; {:.2} s of CPU for {:.0} s of audio (network {:.1} s, banks {:.1} s)", t0.elapsed().as_secs_f64(), audio_s, prof.0, prof.1);
+    }
+
+    /// RSCW_DIR=<wavs> RSCW_OUT=<file.jsonl>: every recording's shown
+    /// characters with their times (one JSON line a file), for scoring
+    /// against labelled time windows.
+    #[test]
+    #[ignore]
+    fn rscw_nntimed() {
+        let dir = std::env::var("RSCW_DIR").expect("RSCW_DIR");
+        let out = std::env::var("RSCW_OUT").expect("RSCW_OUT");
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        files.sort();
+        let mut lines = String::new();
+        for f in files {
+            let (x, rate) = read_wav(f.to_str().unwrap());
+            let mut d = RsNnStream::new(rate);
+            for c in x.chunks(1200) {
+                d.process(c);
+            }
+            d.finish();
+            let timed: Vec<(f32, String)> = d.timed.iter().map(|&(t, c)| ((t * 100.0).round() / 100.0, c.to_string())).collect();
+            let name = f.file_name().unwrap().to_string_lossy().to_string();
+            lines += &serde_json::json!({"name": name, "text": d.text, "timed": timed}).to_string();
+            lines.push('\n');
+        }
+        std::fs::write(&out, lines).unwrap();
     }
 
     /// The classic narrowband decoder (sdroxide CwRx, as trxd's live CW

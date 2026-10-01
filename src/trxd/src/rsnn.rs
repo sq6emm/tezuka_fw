@@ -1006,6 +1006,12 @@ impl RsNn {
         self.stream.net().hop
     }
 
+    /// Audio (samples) the output trails the input by: a frame's LLR comes
+    /// out once the network has its context after it.
+    pub fn latency(&self) -> usize {
+        (self.stream.net().reach() + 1) * self.stream.net().hop
+    }
+
     /// Audio in (12 kHz); LLRs of the frames now final appended to `out`.
     pub fn process(&mut self, audio: &[f32], out: &mut Vec<f32>) {
         self.rows.clear();
