@@ -26,6 +26,9 @@ pub mod symsync;
 mod tables;
 pub mod ldpc;
 pub mod rx;
+pub mod s2cells;
+pub mod s2ring;
+pub mod bbout;
 pub mod ts;
 
 use num_complex::Complex32;

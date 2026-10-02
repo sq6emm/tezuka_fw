@@ -110,7 +110,17 @@ enum Out {
 struct Client {
     id: u64,
     tx: Sender<Out>,
+    /// DATV video/audio: its own, deeper queue. A DVB-S2 frame at the low
+    /// rates decodes a second of stream at once (40 audio packets, video,
+    /// SI), more than the 64 of `tx` that spectrum rows and state share;
+    /// those overflowed and dropped most of the sound.
+    media: Sender<Vec<u8>>,
 }
+
+/// DATV media messages queued per browser.
+const MEDIA_QUEUE: usize = 1024;
+/// Media messages dropped because a browser stopped reading (logged).
+static MEDIA_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct Shared {
     clients: Mutex<Vec<Client>>,
@@ -172,9 +182,21 @@ impl WebHandle {
         self.broadcast(|| Out::Bin(b.clone()));
     }
 
-    /// Any binary message to every browser (DATV video/audio).
+    /// Any binary message to every browser (DATV video/audio), on the media
+    /// queue: never silently dropped while the browser keeps reading.
     pub fn send_bin(&self, b: Vec<u8>) {
-        self.broadcast(|| Out::Bin(b.clone()));
+        let mut clients = self.shared.clients.lock().unwrap();
+        clients.retain(|c| match c.media.try_send(b.clone()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                let n = MEDIA_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n % 100 == 0 {
+                    warn!(client = c.id, dropped = n + 1, "web: DATV media dropped (the browser is not reading)");
+                }
+                true
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        });
     }
 
     /// 12 kHz audio, -1..1.
@@ -630,7 +652,8 @@ fn run_ws(stream: Tls, shared: Arc<Shared>, cmd_tx: Sender<WebCmd>, joined_tx: S
     let _ = stream.sock.tcp.set_read_timeout(Some(Duration::from_millis(15)));
     let mut ws = WebSocket::from_raw_socket(stream, Role::Server, None);
     let (tx, rx) = bounded::<Out>(64);
-    shared.clients.lock().unwrap().push(Client { id, tx });
+    let (media_tx, media_rx) = bounded::<Vec<u8>>(MEDIA_QUEUE);
+    shared.clients.lock().unwrap().push(Client { id, tx, media: media_tx });
     let _ = joined_tx.send(id);
     info!(client = id, "web client connected");
     let mut last_ping = Instant::now();
@@ -675,6 +698,11 @@ fn run_ws(stream: Tls, shared: Arc<Shared>, cmd_tx: Sender<WebCmd>, joined_tx: S
                     break;
                 }
                 Err(_) => break 'outer,
+            }
+        }
+        for b in media_rx.try_iter().take(256) {
+            if ws.write(Message::binary(b)).is_err() {
+                break 'outer;
             }
         }
         for out in rx.try_iter().take(64) {

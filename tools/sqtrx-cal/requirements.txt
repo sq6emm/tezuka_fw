@@ -1,0 +1,7 @@
+# Board web API
+websocket-client>=1.6
+# HP generator through the xyphro UsbGpib v2 (USBTMC): pyvisa with the
+# pure-Python backend and libusb access (on Windows NI-VISA works too).
+pyvisa>=1.13
+pyvisa-py>=0.7
+pyusb>=1.2

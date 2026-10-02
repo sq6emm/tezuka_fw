@@ -53,6 +53,10 @@ const REGS_PHYS: u64 = 0x7C46_0000;
 pub const RING_START: u32 = 0x1610_0000;
 pub const RING_END: u32 = 0x1620_0000;
 const RING_BYTES: usize = (RING_END - RING_START) as usize;
+/// Ring words (one symbol each with the FPGA's timing recovery).
+pub const RING_WORDS: u64 = RING_BYTES as u64 / 4;
+/// Absolute ring positions as the wrap counter gives them: modulo 65536 rings.
+pub const RING_SPAN_WORDS: u64 = 65536 * RING_WORDS;
 /// The DDC's input: the AD936x rate before the x8 decimator.
 pub const FS_IN: f64 = 3_072_000.0;
 const PLATFORM_DATV: u32 = 0xD5;
@@ -408,7 +412,7 @@ impl FrontEnd {
                     let span = 65536 * RING_BYTES as u64;
                     let ahead = (pos + span - self.total % span) % span;
                     self.total += ahead;
-                    ahead > RING_BYTES as u64
+                    ahead >= RING_BYTES as u64
                 }
                 None => false,
             }
@@ -543,6 +547,31 @@ impl FrontEnd {
         self.regs.rd32(REG_REC_CONTROL) & (1 << 4) != 0
     }
 
+    /// The recorder counts its wraps (needed to follow absolute positions).
+    pub fn wraps_hw(&self) -> bool {
+        self.wraps_hw
+    }
+
+    /// Everything the DMA has committed since the last call, as the ring's
+    /// raw words (one bulk copy, nothing converted): `Some(at)`, the absolute
+    /// word (since the start) of the first one, or None when the DMA lapped
+    /// the reader (the words between are gone; reading resumes at the DMA).
+    pub fn read_raw(&mut self, out: &mut Vec<u32>) -> Option<u64> {
+        let mut cur = RingCursor { rd: self.rd, total: self.total };
+        let mut hw = HwRing { fe: self };
+        let r = cur.read(&mut hw, out);
+        self.rd = cur.rd;
+        self.total = cur.total;
+        r
+    }
+
+    /// A watch on the recorder's position for another thread (the decoder:
+    /// is a frame still in the ring?).
+    pub fn watch(&self) -> Option<RingWatch> {
+        let (mem, regs) = Self::open_regs().ok()?;
+        Some(RingWatch { _mem: mem, regs })
+    }
+
     /// Everything the DMA has committed since the last call, as complex
     /// samples (full scale 1.0). Call often: the ring holds 0.5 s at 512 kS/s.
     pub fn read(&mut self, out: &mut Vec<Complex32>) {
@@ -592,6 +621,116 @@ impl FrontEnd {
             }
         }
     }
+}
+
+/// What [`RingCursor`] reads: the recorder's registers and the ring.
+pub trait RingHw {
+    /// Absolute bytes committed (wrap counter) and the committed address, consistently.
+    fn position(&mut self) -> Option<(u64, u32)>;
+    /// Ring bytes [from, to) (both inside the ring, from <= to) to `out` as words.
+    fn copy(&mut self, from: u32, to: u32, out: &mut Vec<u32>);
+    fn lapped(&mut self, _gap_bytes: u64) {}
+}
+
+struct HwRing<'a> {
+    fe: &'a mut FrontEnd,
+}
+
+impl RingHw for HwRing<'_> {
+    fn position(&mut self) -> Option<(u64, u32)> {
+        self.fe.position()
+    }
+    fn copy(&mut self, from: u32, to: u32, out: &mut Vec<u32>) {
+        let (s, e) = ((from - RING_START) as usize, (to - RING_START) as usize);
+        let k = out.len();
+        out.resize(k + (e - s) / 4, 0);
+        // SAFETY: [s, e) is inside the mapping; `out` has room.
+        unsafe { std::ptr::copy_nonoverlapping(self.fe.ring.ptr.add(s), out[k..].as_mut_ptr().cast::<u8>(), e - s) };
+    }
+    fn lapped(&mut self, gap: u64) {
+        self.fe.overruns += 1;
+        let now = std::time::Instant::now();
+        if self.fe.overrun_log.is_none_or(|t| now.duration_since(t).as_secs() >= 10) {
+            tracing::warn!(overruns = self.fe.overruns, gap_bytes = gap, "DATV ring: the reader was lapped (samples lost)");
+            self.fe.overrun_log = Some(now);
+        }
+    }
+}
+
+/// The reader's place in the ring: `rd` the next address, `total` its
+/// absolute byte position (the wrap counter's scale, modulo 65536 rings).
+pub struct RingCursor {
+    pub rd: u32,
+    pub total: u64,
+}
+
+impl RingCursor {
+    /// Everything committed since the last call to `out`: Some(the absolute
+    /// word of the first), None when the DMA lapped the reader.
+    ///
+    /// The absolute position and the address to copy up to come from one
+    /// consistent read of the recorder (wrap counter, committed address,
+    /// wrap counter): `total` is always the absolute position of `rd`. (The
+    /// committed address read apart from the wrap counter, the DMA having
+    /// moved between the two, put every block a few words off: the
+    /// receiver saw a gap each time, lost lock and half the frames.)
+    pub fn read(&mut self, hw: &mut impl RingHw, out: &mut Vec<u32>) -> Option<u64> {
+        let Some((pos, c)) = hw.position() else { return Some(self.total / 4) };
+        let span = 65536 * RING_BYTES as u64;
+        let ahead = (pos + span - self.total % span) % span;
+        let at = self.total / 4;
+        if ahead >= RING_BYTES as u64 {
+            hw.lapped(ahead);
+            self.rd = c;
+            self.total += ahead;
+            return None;
+        }
+        // (ahead == the bytes from rd to c)
+        if c >= self.rd {
+            hw.copy(self.rd, c, out);
+        } else {
+            hw.copy(self.rd, RING_END, out);
+            hw.copy(RING_START, c, out);
+        }
+        self.rd = c;
+        self.total += ahead;
+        Some(at)
+    }
+}
+
+/// The recorder's position, read from any thread.
+pub struct RingWatch {
+    _mem: File,
+    regs: Mapping,
+}
+
+// SAFETY: only reads two registers.
+unsafe impl Send for RingWatch {}
+unsafe impl Sync for RingWatch {}
+
+impl RingWatch {
+    /// Words the DMA has committed past the absolute word `at` (modulo the
+    /// wrap counter's span); None when the registers do not read sanely.
+    pub fn ahead_of(&self, at: u64) -> Option<u64> {
+        for _ in 0..4 {
+            let w0 = self.regs.rd32(REG_REC_WRAPS);
+            let c = self.regs.rd32(REG_REC_COMMITTED);
+            let w1 = self.regs.rd32(REG_REC_WRAPS);
+            if !(RING_START..RING_END).contains(&c) {
+                return None;
+            }
+            if w0 == w1 {
+                let pos = ((w0 & 0xFFFF) as u64 * RING_BYTES as u64 + (c - RING_START) as u64) / 4;
+                return Some((pos + RING_SPAN_WORDS - at % RING_SPAN_WORDS) % RING_SPAN_WORDS);
+            }
+        }
+        None
+    }
+}
+
+/// The ring's physical address of absolute word `at`.
+pub fn ring_addr(at: u64) -> u32 {
+    RING_START + ((at % RING_WORDS) * 4) as u32
 }
 
 /// Stop the ring recorder and wait until its last burst is in memory: the

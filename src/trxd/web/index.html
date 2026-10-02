@@ -229,15 +229,13 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <button class="k" id="call-save">SAVE</button>
       <span class="note">used in the header and the CW macros; empty = trxd.toml's</span>
     </div>
-    <h3>S-METER CALIBRATION <span class="note">IARU: S9 = -73 dBm below 30 MHz, -93 dBm above; 6 dB per S unit</span></h3>
-    <div class="note">Band <b id="cal-band">—</b> · points <b id="cal-n">0</b> · reading <b id="cal-read">—</b> · shows <b id="cal-dbm">—</b></div>
-    <div class="note">Feed a known level into the antenna input (CW carrier in the passband), then store it. Several levels
-      (S1 ... S9+60) make the whole scale right, not only S9.</div>
-    <div class="row">
-      <select id="cal-s"></select>
-      <input type="text" id="cal-level" placeholder="dBm, e.g. -93" style="max-width:130px;text-transform:none">
-      <button class="k" id="cal-store">STORE</button><button class="k" id="cal-clear">CLEAR BAND</button>
-    </div>
+    <h3>LEVEL CALIBRATION <span class="note">S-meter and readout in dBm at the antenna socket, the same in every mode, filter and AGC state.
+      IARU: S9 = -73 dBm below 30 MHz, -93 dBm above; 6 dB per S unit</span></h3>
+    <div class="note">Now: <b id="cal-now">—</b> · socket pair in use <b id="cal-port">—</b></div>
+    <div class="note">Measured with the calibration tool (tools/sqtrx-cal: signal generator / tracking generator), one table per
+      RX socket pair. Calibrated: inside the measured frequencies; extrapolated: outside them (above 3.2 GHz, from the
+      highest points); none: no table (old S-meter points if this band had some, else a nominal figure). See docs/DBM.md.</div>
+    <div id="cal-body" class="row"></div>
     <h3>TRANSVERTERS <span class="note">RF range on the air and the IF that RF from lands on; tick LO above for a mirrored band</span></h3>
     <table id="xv-table" class="xv"><thead><tr><th>Name</th><th>RF from MHz</th><th>RF to MHz</th><th>IF at RF from, MHz</th><th>LO above</th><th>TX</th><th></th></tr></thead><tbody id="xv-body"></tbody></table>
     <div class="row"><button class="k" id="xv-add">ADD</button><button class="k" id="xv-save">SAVE</button></div>
@@ -406,6 +404,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
         <div>
           <h3>RECEIVE <span class="note">on the RX frequency, while in DATV mode</span></h3>
           <canvas id="datv-rxview" width="320" height="240"></canvas>
+          <button class="k warn" id="datv-sound" hidden title="The browser keeps the sound off until the page is clicked">SOUND OFF: click to hear it</button>
           <div class="row" style="align-items:flex-start;flex-wrap:nowrap;max-width:320px">
             <canvas id="datv-const" width="120" height="120" title="Constellation: four tight clusters = clean signal; clouds that merge = about to fail"></canvas>
             <div class="note" id="datv-rxstat">—</div>
@@ -545,6 +544,8 @@ function onBinary(buf) {
 function onJson(m) {
   if (m.type === "state") { S.st = m; renderState(); }
   else if (m.type === "meter") renderMeter(m);
+  else if (m.type === "calib") renderCalib(m);
+  else if (m.type === "calib_ack") { if (!m.ok) alert("Calibration: " + (m.error || "refused")); }
   else if (m.type === "decode") addDecode(m);
   else if (m.type === "cw") renderCw(m);
   else if (m.type === "datv_key") DATV.keyframe();
@@ -681,13 +682,10 @@ function buildBands(xvtrs) {
 function setupSettings() {
   $("setbtn").onclick = () => { const m = $("setmenu"); m.classList.toggle("hidden"); if (!m.classList.contains("hidden")) openSettings(); };
   $("set-close").onclick = () => $("setmenu").classList.add("hidden");
-  $("cal-s").onchange = () => { const v = $("cal-s").value; if (v) $("cal-level").value = v; };
-  $("cal-store").onclick = () => {
-    const d = parseFloat($("cal-level").value.replace(",", "."));
-    if (!isFinite(d) || d > 20 || d < -170) { alert("Level in dBm, for example -93"); return; }
-    send({ cmd: "smeter_cal", dbm: d });
+  $("cal-body").onclick = (e) => {
+    const p = e.target.dataset.calClear;
+    if (p && confirm(`Remove the level calibration of RX${p}? The readout falls back to nominal figures.`)) send({ cmd: "calib_clear", port: +p });
   };
-  $("cal-clear").onclick = () => { if (confirm("Remove every calibration point of this band?")) send({ cmd: "smeter_clear" }); };
   $("xv-add").onclick = () => addXvRow({ name: "", rf_min: 0, rf_max: 0, lo_hz: 0, inverted: false, tx: true });
   $("xv-body").onclick = (e) => { if (e.target.dataset.del !== undefined) e.target.closest("tr").remove(); };
   $("xv-save").onclick = () => {
@@ -717,15 +715,11 @@ function addXvRow(t) {
 }
 function openSettings() {
   const st = S.st; if (!st) return;
-  const s9 = curFreq() < 30e6 ? -73 : -93;
-  const opts = [["", "S unit…"]].concat([1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => [s9 + (n - 9) * 6, "S" + n]),
-    [10, 20, 30, 40, 50, 60].map((n) => [s9 + n, "S9+" + n]));
-  $("cal-s").innerHTML = opts.map(([v, l]) => `<option value="${v}">${l}${v !== "" ? " (" + v + " dBm)" : ""}</option>`).join("");
+  send({ cmd: "calib_get" });
   $("set-call").value = st.call || "";
   $("xv-body").innerHTML = "";
   (st.xvtrs || []).forEach(addXvRow);
   renderPorts(st);
-  renderCal(st);
 }
 // Band -> sockets. Keys as the board names bands (upper case) or the transverter's name.
 function renderPorts(st) {
@@ -737,9 +731,22 @@ function renderPorts(st) {
     <select data-port-band="${escHtml(k)}">${[[0, "manual"], [1, "RX1·TX1"], [2, "RX2·TX2"]].map(([v, l]) => `<option value="${v}"${(map[k] || 0) === v ? " selected" : ""}>${l}</option>`).join("")}</select></label>`).join("");
   box.querySelectorAll("select").forEach((sel) => sel.onchange = () => send({ cmd: "port_map", band: sel.dataset.portBand, port: +sel.value }));
 }
-function renderCal(st) {
-  $("cal-band").textContent = st.cal_band || "—";
-  $("cal-n").textContent = st.cal_points || 0;
+// Level calibration status per RX socket pair (from the board's calib_get).
+function renderCalib(m) {
+  S.calib = m;
+  $("cal-port").textContent = "RX" + m.port;
+  const word = { calibrated: "calibrated", extrapolated: "extrapolated" };
+  $("cal-body").innerHTML = (m.ports || []).map((p) => {
+    const head = `<b>RX${p.port}</b>` + (p.note ? ` <span class="note">${escHtml(p.note)}</span>` : "");
+    if (!p.status) {
+      const legacy = (m.legacy_bands || []).length ? ` (old S-meter points: ${m.legacy_bands.map(escHtml).join(", ")})` : "";
+      return `<div class="note" style="width:100%">${head}: no table${legacy}</div>`;
+    }
+    const rows = p.status.map((b) => `<tr><td>${escHtml(b.band)}</td><td class="${b.status === "calibrated" ? "" : "warn"}">${word[b.status] || "none"}</td>
+      <td>${b.points}</td><td>${escHtml(b.date || "")}</td><td>${escHtml(b.src || "")}</td><td>${b.gain_table ? "yes" : "—"}</td></tr>`).join("");
+    return `<div style="width:100%">${head} <button class="k" data-cal-clear="${p.port}">CLEAR RX${p.port}</button>
+      <table class="xv"><thead><tr><th>Band</th><th>Status</th><th>Points</th><th>Date</th><th>Source</th><th>Gain table</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  }).join("");
 }
 
 // ============================================================ state rendering
@@ -788,7 +795,6 @@ function renderState() {
   if (document.activeElement !== $("hang")) { $("hang").value = st.cw_hang_ms; $("hang-v").textContent = st.cw_hang_ms + " ms"; }
   $("mute-tx").classList.toggle("on", st.mute_at_tx !== false);
   $("scope-ctr").textContent = st.scope_center ? "CTR" : "FIX"; $("scope-ctr").classList.toggle("on", !!st.scope_center);
-  if (!$("setmenu").classList.contains("hidden")) renderCal(st);
   const decs = st.decoders || [];
   document.querySelectorAll("#decoders [data-dec]").forEach((b) => b.classList.toggle("on", decs.includes(b.dataset.dec)));
   $("ptt").classList.toggle("on", !!st.ptt && st.tx_source !== "tune");
@@ -825,9 +831,9 @@ function setSlider(id, v) {
 const S_SCALE = ["1", "3", "5", "7", "9", "+20", "+40", "+60"];
 function renderMeter(m) {
   DATV.meter(m.datv, m.datv_rx);
-  // S-meter from dBFS at the channel and the hardware gain: -73 dBm = S9
-  // needs a per-board calibration; this reads S9 at -73 dBm with a nominal
-  // 0 dBFS = -10 dBm at 0 dB gain front end. Good for relative readings.
+  // S-meter: dBm at the antenna socket from the board's level meter
+  // (docs/DBM.md): calibrated per board and socket pair, the same in every
+  // mode, filter and AGC state. IARU R1: S9 = -73 dBm below 30 MHz, -93 above.
   const tx = m.tx;
   let frac, val;
   if (tx) {
@@ -839,15 +845,21 @@ function renderMeter(m) {
   } else {
     $("m-name").textContent = "S";
     // Calibrated level from the board (IARU: S9 = -73 dBm below 30 MHz, -93 above).
-    const dbm = m.dbm !== undefined ? m.dbm : m.s_dbfs - m.rx_gain_db - 10;
+    const dbm = m.dbm;
     const s9 = curFreq() < 30e6 ? -73 : -93;
     const s = 9 + (dbm - s9) / 6;
     frac = s <= 9 ? clamp(s / 9, 0, 1) * 0.6 : 0.6 + clamp((dbm - s9) / 60, 0, 1) * 0.4;
-    val = `${m.s || ("S" + Math.max(0, s).toFixed(0))}  ${dbm.toFixed(0)} dBm`;
+    // dBm marked by how far it can be trusted: * extrapolated, ~ old points or nominal.
+    const mark = { calibrated: "", extrapolated: "*", legacy: "~", none: "~" }[m.cal] ?? "~";
+    val = `${m.s || ("S" + Math.max(0, s).toFixed(0))}  ${dbm.toFixed(0)} dBm${mark}` + (m.clip ? " CLIP" : "");
+    const why = { calibrated: "calibrated", extrapolated: "extrapolated (outside the measured frequencies)",
+      legacy: "old S-meter points (no calibration table)", none: "not calibrated (nominal)" }[m.cal] || "";
+    $("m-val").title = `${dbm.toFixed(1)} dBm in the passband, ${why}` +
+      (m.dbm_hz != null ? `; noise ${m.dbm_hz.toFixed(1)} dBm/Hz` : "") + (m.noise ? "; mostly noise" : "") +
+      (m.clip ? "; converter near full scale: reading too low, reduce gain" : "");
     S.lastMeter = m;
     if (!$("setmenu").classList.contains("hidden")) {
-      $("cal-read").textContent = m.reading !== undefined ? m.reading.toFixed(1) + " dB" : "—";
-      $("cal-dbm").textContent = dbm.toFixed(1) + " dBm (" + (m.s || "") + ")";
+      $("cal-now").textContent = `${dbm.toFixed(1)} dBm (${m.s || ""}, ${why})` + (m.dbm_hz != null ? `, noise ${m.dbm_hz.toFixed(1)} dBm/Hz` : "");
     }
     $("m-scale").innerHTML = S_SCALE.map((x, i) => `<span class="${i > 4 ? "hi" : ""}">${x}</span>`).join("");
   }
@@ -946,9 +958,13 @@ function drawSpectrum() {
   // grid: dB lines every 10 dB, frequency ticks
   c.strokeStyle = "rgba(95,212,255,.10)"; c.lineWidth = 1; c.fillStyle = "rgba(127,139,153,.9)";
   c.font = `${Math.round(10 * (window.devicePixelRatio || 1))}px ui-monospace, Menlo, monospace`;
+  // Level labels: dBm (a carrier's level) where the board is calibrated,
+  // else dBFS.
+  const off = S.lastMeter && S.lastMeter.scope_dbm_off != null ? S.lastMeter.scope_dbm_off : null;
   for (let db = Math.ceil((S.refDb - S.rangeDb) / 10) * 10; db <= S.refDb; db += 10) {
     const y = (S.refDb - db) / S.rangeDb * h;
     c.beginPath(); c.moveTo(0, y); c.lineTo(w, y); c.stroke();
+    if (y > 12 && y < h - 14) c.fillText(off != null ? Math.round(db + off) + " dBm" : db + " dBFS", 3, y - 3);
   }
   if (S.rowSpan > 1) {
     const raw = S.rowSpan / 8, mag = 10 ** Math.floor(Math.log10(raw));
@@ -1170,10 +1186,24 @@ async function audioDevices() {
   if (!canOut) $("aout").title = "This browser plays through the system's output only";
 }
 // AUDIO switches this browser's receive audio on and off (MUTE only silences it).
+// Switched off with the AUDIO button: a click elsewhere does not bring it back.
+let audioUserOff = false;
 async function audioToggle() {
-  if (actx && actx.state === "running") { await actx.suspend(); $("audio").classList.remove("on"); return; }
+  if (actx && actx.state === "running") { audioUserOff = true; await actx.suspend(); $("audio").classList.remove("on"); return; }
+  audioUserOff = false;
   await audioStart();
 }
+// Browsers keep audio output suspended until the page gets a click or a key
+// (autoplay rules): every such gesture resumes it, unless switched off. DATV
+// reception starts it too (its sound arrives without any other click).
+function audioGesture() {
+  if (audioUserOff) return;
+  if (actx && actx.state !== "running") actx.resume().catch(() => {});
+  else if (!actx && DATV.receiving) audioStart().catch(() => {});
+  if (outEl && outEl.paused) outEl.play().catch(() => {});
+}
+document.addEventListener("pointerdown", audioGesture, true);
+document.addEventListener("keydown", audioGesture, true);
 function audioIn(u8) {
   if (!rxNode || actx.state !== "running") return;
   const f = new Float32Array(u8.length);
@@ -1265,7 +1295,7 @@ function buildStatic() {
   $("modes").onclick = (e) => {
     const b = e.target.closest("[data-mode]"); if (!b) return;
     const m = b.dataset.mode;
-    if (m === "DATV") { DATV.enter(); return; }
+    if (m === "DATV") { if (!audioUserOff) audioStart().catch(() => {}); DATV.enter(); return; }
     // CW-RS: CW with the rain-scatter decoder, a wide filter and slow AGC
     // (its filter kept apart from CW's, as FIL "CWRS").
     if (m === "CWRS") {
@@ -1364,6 +1394,7 @@ function buildStatic() {
   $("port").onclick = () => { if (S.st && S.st.port != null) send({ cmd: "port", port: S.st.port === 1 ? 2 : 1 }); };
   $("rfg-auto").onclick = () => send(S.st && S.st.rx_gain_mode !== "manual" ? { cmd: "rxgain", mode: "manual", db: +$("rfg").value } : { cmd: "rxgain", mode: "slow" });
   $("audio").onclick = () => audioToggle();
+$("datv-sound").onclick = () => { audioUserOff = false; audioStart().then(() => { $("datv-sound").hidden = true; }).catch(() => {}); };
 
   // PTT: hold (mouse/touch/space) or Shift-click to latch.
   const pttDown = async (latch) => {
@@ -1720,16 +1751,50 @@ const DATV = (() => {
   }
 
   // ---- receive (runs while the board is in DATV mode)
-  let rxOn = false, vdec = null, adec = null, nextT = 0, needKey = true, rxFrames = 0;
+  let rxOn = false, vdec = null, adec = null, nextT = 0, needKey = true, rxFrames = 0, aLead = 0.15;
+  // A/V sync: avOff maps the stream's clock (PTS, s) onto the sound card's
+  // (AudioContext time): set by each audio frame scheduled. Pictures wait
+  // for their PTS on that clock. avErr: recent picture timing errors, ms.
+  let avOff = null, avTimers = [], avErr = [];
   function rxReset() {
     for (const d of [vdec, adec]) if (d && d.state !== "closed") try { d.close(); } catch { /* closed */ }
-    vdec = adec = null; needKey = true; nextT = 0;
+    vdec = adec = null; needKey = true; nextT = 0; aLead = 0.15;
+    avOff = null; avErr = []; for (const t of avTimers) clearTimeout(t); avTimers = [];
   }
   function newVdec() {
     vdec = new VideoDecoder({
-      output: (f) => { $("datv-rxview").getContext("2d").drawImage(f, 0, 0, 320, 240); f.close(); rxFrames++; },   // scaled up if 160x120
+      output: showFrame,
       error: (e) => { console.warn("DATV video", e); vdec = null; needKey = true; } });
     vdec.configure({ codec: "avc1.42E01E", optimizeForLatency: true });
+  }
+  function draw(img) { $("datv-rxview").getContext("2d").drawImage(img, 0, 0, 320, 240); rxFrames++; }   // scaled up if 160x120
+  // A decoded picture: at once without sound playing, else when its PTS
+  // comes up on the sound card's clock (copied out first: a decoder whose
+  // frames are all held stalls).
+  function showFrame(f) {
+    const pts = f.timestamp / 1e6;
+    const live = actx && actx.state === "running" && avOff !== null;
+    const due = live ? pts + avOff - actx.currentTime : 0;
+    if (!live || due < 0.02 || due > 6) {
+      if (live) noteAv(-due);
+      draw(f); f.close(); return;
+    }
+    createImageBitmap(f).then((bm) => {
+      const t = setTimeout(() => {
+        avTimers = avTimers.filter((x) => x !== t);
+        if (avOff !== null && actx) noteAv(actx.currentTime - (pts + avOff));
+        draw(bm); bm.close();
+      }, due * 1000);
+      avTimers.push(t);
+    }).catch(() => {});
+    f.close();
+  }
+  // How late (+) or early (-) a picture came against its sound, ms.
+  function noteAv(s) { avErr.push(Math.round(s * 1000)); if (avErr.length > 30) avErr.shift(); }
+  function avText() {
+    if (!avErr.length) return "";
+    const v = [...avErr].sort((a, b) => a - b), med = v[v.length >> 1];
+    return `<br>A/V sync ${med >= 0 ? "+" : ""}${med} ms`;
   }
   function rxVideo(u8) {
     if (!rxOn) return;
@@ -1740,7 +1805,12 @@ const DATV = (() => {
     catch (e) { console.warn(e); vdec = null; needKey = true; }
   }
   function rxAudio(u8) {
-    if (!rxOn || !actx) return;
+    if (!rxOn) return;
+    // Sound arriving while the browser holds the output: say so (dropped
+    // meanwhile, rather than a burst of stale audio when it resumes).
+    const live = actx && actx.state === "running";
+    $("datv-sound").hidden = live || audioUserOff;
+    if (!live) return;
     if (!adec || adec.state === "closed") {
       adec = new AudioDecoder({ output: play, error: (e) => { console.warn("DATV audio", e); adec = null; } });
       adec.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1 });
@@ -1750,14 +1820,24 @@ const DATV = (() => {
   }
   function play(ad) {
     if (!actx || !gain) { ad.close(); return; }
-    const n = ad.numberOfFrames, buf = actx.createBuffer(1, n, ad.sampleRate), ch = new Float32Array(n);
+    // (Everything read before close(): a closed AudioData reports 0 for its
+    // sample rate, which once made every frame of a PES start at once.)
+    const n = ad.numberOfFrames, pts = ad.timestamp / 1e6, buf = actx.createBuffer(1, n, ad.sampleRate), ch = new Float32Array(n);
     ad.copyTo(ch, { planeIndex: 0, format: "f32-planar" }); ad.close();
     buf.copyToChannel(ch, 0);
     const src = actx.createBufferSource(); src.buffer = buf; src.connect(gain);   // AF and AUDIO apply
-    // A short jitter buffer: late means dropped, not delayed for ever.
+    // Adaptive jitter buffer. The audio comes a PES at a time, and at the
+    // low rates a DVB-S2 frame (about a second of stream) at a time, so it
+    // arrives in irregular bursts: each time the buffer runs dry it starts
+    // again further ahead (0.15 s, up to 2.5 s). Never two frames on top of
+    // each other: one that would land more than 4 s ahead is dropped.
     const now = actx.currentTime;
-    if (nextT < now + 0.05 || nextT > now + 0.6) nextT = now + 0.15;
-    src.start(nextT); nextT += n / ad.sampleRate;
+    if (nextT < now + 0.02) {
+      if (nextT > 0) aLead = Math.min(aLead + 0.25, 2.5);
+      nextT = now + aLead;
+    }
+    if (nextT > now + 4.0) return;
+    src.start(nextT); avOff = nextT - pts; nextT += buf.duration;
   }
   // Constellation: fade the previous frames a little, draw this one's points.
   function rxConst(u8) {
@@ -1811,7 +1891,7 @@ const DATV = (() => {
     keyframe() { forceKey = true; },
     meter(d, r) {
       if (rxOn && r && r.auto && !r.rx) { $("datv-rxstat").innerHTML = `<b>AUTO</b> ${r.auto}`; }
-      else if (rxOn && r) $("datv-rxstat").innerHTML = (r.auto ? `auto: ${r.auto}<br>` : "") + `<b>${r.locked ? "LOCK" : "searching"}</b><br>MER ${r.mer.toFixed(1)} dB · Es/N0 ${r.esn0.toFixed(1)} dB<br>carrier ${r.freq >= 0 ? "+" : ""}${r.freq} Hz<br>frames ${r.frames - r.bad}/${r.frames} · shown ${rxFrames}<br>dropped: IQ ${r.dropped}, frames ${r.busy}<br>CPU: demod ${r.demod_pct} %, FEC ${r.fec_pct} %${S.st && S.st.datv_rx && S.st.datv_rx.fpga ? " · front end: FPGA" : ""}` + siHtml(r.si);
+      else if (rxOn && r) $("datv-rxstat").innerHTML = (r.auto ? `auto: ${r.auto}<br>` : "") + `<b>${r.locked ? "LOCK" : "searching"}</b><br>MER ${r.mer.toFixed(1)} dB · Es/N0 ${r.esn0.toFixed(1)} dB<br>carrier ${r.freq >= 0 ? "+" : ""}${r.freq} Hz<br>frames ${r.frames - r.bad}/${r.frames} · shown ${rxFrames}<br>dropped: IQ ${r.dropped}, frames ${r.busy}<br>CPU: demod ${r.demod_pct} %, FEC ${r.fec_pct} %${S.st && S.st.datv_rx && S.st.datv_rx.fpga ? " · front end: FPGA" : ""}` + avText() + siHtml(r.si);
       if (!on || !cfg) return;
       $("datv-stat").textContent = `${cfg.width}x${cfg.height} ${cfg.fps} fps · video ${(cfg.video_bps / 1000).toFixed(0)}k · audio ${(cfg.audio_bps / 1000).toFixed(0)}k` +
         (d ? ` · queue ${d.backlog.toFixed(1)} s · dropped ${d.dropped}` : "") + ` · sent ${(sent / 1024).toFixed(0)} KiB` +

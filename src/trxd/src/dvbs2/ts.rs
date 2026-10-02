@@ -1299,6 +1299,45 @@ mod tests {
         assert_eq!(crc32(b"123456789"), 0x0376_E6E7);
     }
 
+    /// Every audio packet the browser hands the mux comes out of the
+    /// receiver's demux, at every profile's rate, with video at its budget
+    /// (OTA at 33k: about half the sound was missing).
+    #[test]
+    fn audio_survives_the_mux_at_every_rate() {
+        for rate in [31_856.0, 64_000.0, 120_000.0, 241_332.0] {
+            let mut m = Mux::new(rate, "SQ6EMM");
+            let p = m.profile;
+            let pps = rate / (TS_LEN as f64 * 8.0);
+            let frame_bytes = (p.video_budget(rate) / 8.0 / p.fps) as usize;
+            let opus = (p.audio_bps / 8.0 * 0.02) as usize;
+            let (mut next_v, mut next_a, mut vi, mut sent) = (0.0f64, 0.0f64, 0u64, 0usize);
+            let mut d = Demux::default();
+            let mut got = Vec::new();
+            let secs = 60.0;
+            for n in 0..(secs * pps) as usize {
+                let t = n as f64 / pps;
+                while next_v <= t {
+                    let key = vi % 50 == 0;
+                    let data = [vec![0, 0, 0, 1, if key { 0x65 } else { 0x41 }], vec![(vi % 251) as u8; frame_bytes.max(20)]].concat();
+                    m.push(Media::Video { ts_us: (next_v * 1e6) as i64, key, data });
+                    vi += 1;
+                    next_v += 1.0 / p.fps;
+                }
+                while next_a <= t {
+                    m.push(Media::Audio { ts_us: (next_a * 1e6) as i64, data: vec![(sent % 251) as u8; opus] });
+                    sent += 1;
+                    next_a += 0.02;
+                }
+                let pkt = m.next();
+                d.push(&pkt, &mut got);
+            }
+            let audio = got.iter().filter(|b| b.first() == Some(&7)).count();
+            // What may still be queued at the end: the mux delay plus a PES.
+            let tail = ((DELAY_MAX_S.max(p.tstd_max_s) + p.audio_per_pes as f64 * 0.02) / 0.02) as usize + p.audio_per_pes;
+            assert!(audio + tail >= sent, "rate {rate}: {audio} of {sent} audio packets came out (tail allowance {tail})");
+        }
+    }
+
     /// A stream at each profile's rate, loaded with video at its budget and
     /// audio: the repetition intervals TR 101 290 checks (PCR, PAT, PMT,
     /// SDT), the SDT's service type and network id. TS_DUMP=<dir>: also

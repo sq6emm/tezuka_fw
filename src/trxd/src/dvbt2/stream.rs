@@ -114,12 +114,18 @@ pub struct CellParams {
     pub s14: i32,
     pub qam16: Option<crate::dvbs2::ldpc_fpga::LongRate>,
     pub a14: i32,
+    /// DVB-S2 8PSK cells (three LLRs a cell, max-log, the 3-column bit
+    /// deinterleaver: [`crate::dvbs2::s2cells`]); never with `rot`/`qam16`.
+    pub psk8: bool,
 }
 
 /// A block's LLRs in codeword order (QPSK: [`qpsk_llrs`]; 16QAM: four a
 /// cell, max-log per axis, through the bit deinterleaver), bit for bit as
 /// the FPGA's engine makes them.
 pub fn cell_llrs(blk: &[[i8; 2]], p: &CellParams) -> Vec<i8> {
+    if p.psk8 {
+        return crate::dvbs2::s2cells::psk8_llrs(blk, p.kq);
+    }
     let Some(rate) = p.qam16 else {
         let mut v = vec![0i8; 2 * blk.len()];
         qpsk_llrs(blk, p, &mut v);
@@ -956,7 +962,7 @@ impl Demod {
             let v = ((z14 >> 7) * kq + (1 << 16)) >> 17;
             (if v > 31 { 31 } else if v < -31 { -31 } else { v }) as i8
         };
-        let cp = CellParams { rot, kq, c14, s14, qam16: (p.constellation == Constellation::Qam16).then_some(p.rate), a14 };
+        let cp = CellParams { rot, kq, c14, s14, qam16: (p.constellation == Constellation::Qam16).then_some(p.rate), a14, psk8: false };
         if let Some(rt) = self.router.as_ref() {
             // the equalized symbols' cells are in DDR already (once the
             // router has the whole frame); the P2 symbols' go there now

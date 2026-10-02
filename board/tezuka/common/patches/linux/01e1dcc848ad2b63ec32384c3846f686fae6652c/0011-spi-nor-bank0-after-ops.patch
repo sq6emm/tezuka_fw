@@ -1,0 +1,61 @@
+spi-nor: back to bank 0 after every operation on a 3-byte >16 MiB part
+
+The W25Q256 on the LibreSDR is used with 3-byte addresses and an extended
+address register (EAR) selecting the 16 MiB bank. The EAR is only reset
+to 0 at an orderly shutdown; after a watchdog reset or a hang that ends
+in one, it keeps the last bank used (the upper one after a read of the B
+slot, the model partition or the fpga bitstream), the BootROM reads the
+wrong bank and the board stays dead until a power cycle. Return to bank
+0 at the end of every read, write and erase.
+
+--- a/drivers/mtd/spi-nor/core.c	2026-10-02 06:51:37.555522175 +0000
++++ b/drivers/mtd/spi-nor/core.c	2026-10-02 06:51:37.546521955 +0000
+--- a/drivers/mtd/spi-nor/core.c	2026-10-02 06:51:37.555522175 +0000
++++ b/drivers/mtd/spi-nor/core.c	2026-10-02 06:56:56.023326314 +0000
+@@ -1950,6 +1950,22 @@
+  * Erase an address range on the nor chip.  The address range may extend
+  * one or more erase sectors. Return an error if there is a problem erasing.
+  */
++/*
++ * Back to bank 0 of a 3-byte-address part bigger than 16 MiB after every
++ * operation: the extended address register survives a watchdog or warm
++ * reset (the flash has no reset line), and the BootROM, which only knows
++ * 3-byte reads, would then read the upper bank and never boot.
++ */
++static void spi_nor_bank0(struct spi_nor *nor)
++{
++	if (nor->addr_nbytes != 3 || nor->curbank == 0)
++		return;
++	spi_nor_wait_till_ready(nor);
++	spi_nor_write_enable(nor);
++	if (spi_nor_write_ear(nor, 0x00))
++		nor->curbank = 0xff;
++}
++
+ static int spi_nor_erase(struct mtd_info *mtd, struct erase_info *instr)
+ {
+ 	struct spi_nor *nor = mtd_to_spi_nor(mtd);
+@@ -2116,6 +2132,7 @@
+ 	ret = spi_nor_write_disable(nor);
+ 
+ erase_err:
++	spi_nor_bank0(nor);
+ 	complete(&nor->spimem->request_completion);
+ 	spi_nor_unlock_and_unprep_pe(nor, instr->addr, instr->len);
+ 
+@@ -2493,6 +2510,7 @@
+ read_err:
+ 	if (is_ofst_odd)
+ 		kfree(readbuf);
++	spi_nor_bank0(nor);
+ 
+ 	complete(&nor->spimem->request_completion);
+ 	spi_nor_unlock_and_unprep_rd(nor, from_lock, len_lock);
+@@ -2673,6 +2691,7 @@
+ 	}
+ 
+ write_err:
++	spi_nor_bank0(nor);
+ 	complete(&nor->spimem->request_completion);
+ 	spi_nor_unlock_and_unprep_pe(nor, to, len);
+ 	return ret;

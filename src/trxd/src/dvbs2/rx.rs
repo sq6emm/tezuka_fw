@@ -19,6 +19,7 @@
 //! when locked and stepped over by their own length; only the configured
 //! MODCOD is decoded (a frame of another one counts as lost for the TS).
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 
 use num_complex::Complex32;
@@ -85,6 +86,9 @@ pub struct Stats {
     /// DVB-T2 blocks in DDR whose router buffer was reused before they were
     /// decoded (the decoder more than three frames behind): dropped.
     pub blocks_lapped: u64,
+    /// DVB-S2 frames from the ring the engine could not read in time (the
+    /// recorder had overwritten them): lost.
+    pub ring_lapped: u64,
 }
 
 /// Length (symbols) of a PLFRAME with this PLS; None for reserved MODCODs.
@@ -102,6 +106,50 @@ pub fn plframe_len(modcod: u8, short: bool, pilots: bool) -> Option<usize> {
     };
     let slots = if short { 16_200 } else { 64_800 } / bps / SLOT;
     Some(SLOT + slots * SLOT + if pilots { (slots - 1) / 16 * PILOT } else { 0 })
+}
+
+/// Ring mode ([`Receiver::new_ring_spec`]): the receiver keeps the ring's
+/// raw words and makes a symbol of one (i16 I/Q over 32768, times the
+/// AFC's mixer) only where it looks: headers, pilots, a sample of the data
+/// for the constellation. The data symbols go to the LDPC engine as a
+/// [`super::s2ring::Job`]: the engine reads them from the ring itself.
+struct RingRx {
+    raw: Vec<u32>,
+    /// Absolute ring word of `raw[0]`.
+    abs0: u64,
+    mix: Mix,
+    /// The mixer before the last retune (for symbols before it).
+    prev: Option<Mix>,
+    /// The engine reads the ring (otherwise the job carries the words and
+    /// the model makes the cells: tests, a PC).
+    engine: bool,
+    watch: Option<std::sync::Arc<super::fpga::RingWatch>>,
+}
+
+/// The AFC's mixer as a function of the absolute symbol: th0 + w (k - k0).
+#[derive(Clone, Copy, Debug)]
+struct Mix {
+    k0: u64,
+    th0: f64,
+    w: f64,
+}
+
+impl Mix {
+    fn at(&self, k: u64) -> f64 {
+        self.th0 + self.w * (k as i64 - self.k0 as i64) as f64
+    }
+}
+
+impl RingRx {
+    fn phase(&self, k: u64) -> f64 {
+        match self.prev {
+            Some(p) if k < self.mix.k0 => p.at(k),
+            _ => self.mix.at(k),
+        }
+    }
+    fn raw_sym(w: u32) -> Complex32 {
+        Complex32::new((w as u16 as i16) as f32 / 32768.0, ((w >> 16) as u16 as i16) as f32 / 32768.0)
+    }
 }
 
 /// A PLFRAME the receiver steps over: its PLS, length and header.
@@ -163,6 +211,11 @@ pub struct Receiver {
     // FEC: inline (tests, CLI) or on a thread of its own (trxd).
     fec: FecMode,
     llr: Vec<f32>,
+    /// Long frames: the data symbols as cells for the LDPC engine.
+    cells: Vec<[i8; 2]>,
+    /// Long frames with float LLRs made here instead (TRXD_S2_FLOAT_LLR=1:
+    /// the path before the engine's demapper, for comparisons).
+    pub float_llr: bool,
     pub stats: Stats,
     /// Constellation of the last frame: about 256 corrected, descrambled data
     /// symbols, scaled so the ideal QPSK points are (+-40, +-40).
@@ -179,6 +232,7 @@ pub struct Receiver {
     others: Vec<Other>,
     /// The frame at `locked_at`: ours (None) or `others[i]`.
     cur: Option<usize>,
+    ring: Option<RingRx>,
 }
 
 /// LDPC + BBFRAME -> TS: the expensive part, which can run on its own core.
@@ -192,13 +246,68 @@ pub struct Fec {
     have_prev: bool,
     /// BBFRAMEs with an unsupported MATYPE so far (logged once).
     matype_warned: bool,
+    /// The PL scrambling sequence (ring frames the model turns).
+    pl_scr: Vec<u8>,
 }
 
 enum FecMode {
     Inline(Fec),
     /// Frames of LLRs to the decoding thread; it counts failures in a row
     /// (read back here for re-acquisition).
-    Thread { tx: crossbeam_channel::Sender<Vec<f32>>, fails: std::sync::Arc<std::sync::atomic::AtomicU32> },
+    Thread { tx: crossbeam_channel::Sender<S2Block>, fails: std::sync::Arc<std::sync::atomic::AtomicU32> },
+}
+
+/// One DVB-S2 frame for the decoding thread: float LLRs (short frames), or a
+/// long frame's data symbols as cells with its noise scale `kq` and bits
+/// per symbol (the FPGA's LDPC engine makes the LLRs, [`super::s2cells`]).
+pub enum S2Block {
+    Llr(Vec<f32>),
+    Cells(Vec<[i8; 2]>, i32, u8),
+    /// A long frame the engine reads from the ring (s2ring).
+    Ring(Box<super::s2ring::Job>),
+}
+
+impl S2Block {
+    /// A frame missing.
+    fn lost() -> Self {
+        S2Block::Llr(Vec::new())
+    }
+}
+
+impl FecBlock for S2Block {
+    fn is_empty(&self) -> bool {
+        match self {
+            S2Block::Llr(v) => v.is_empty(),
+            S2Block::Cells(c, ..) => c.is_empty(),
+            S2Block::Ring(_) => false,
+        }
+    }
+    fn decode(&self, fec: &mut Fec, st: &mut Stats, ts: &mut Vec<[u8; TS_LEN]>) -> bool {
+        match self {
+            S2Block::Llr(v) => fec.frame(v, st, ts),
+            S2Block::Cells(c, kq, bps) => fec.frame_cells(c, &super::s2cells::params(*bps as usize, *kq), st, ts),
+            S2Block::Ring(job) => fec.frame_ring(job, st, ts),
+        }
+    }
+    fn dump(&self) -> Vec<u8> {
+        match self {
+            S2Block::Llr(v) => v.dump(),
+            S2Block::Cells(c, kq, bps) => {
+                let p = super::s2cells::params(*bps as usize, *kq);
+                let l = crate::dvbt2::stream::cell_llrs(c, &p);
+                l.iter().flat_map(|&v| (v as f32 / super::fpga_ldpc::LLR_SCALE).to_le_bytes()).collect()
+            }
+            // (the words are in the ring only, unless the job carries them)
+            S2Block::Ring(job) => match &job.words {
+                Some(w) => {
+                    let scr = pl_scrambling(w.len());
+                    let c = super::s2ring::cells(w, job.n_cells, job.pilots, &job.segs, job.gain, &scr);
+                    S2Block::Cells(c, job.kq, job.bps).dump()
+                }
+                None => Vec::new(),
+            },
+        }
+    }
 }
 
 /// Time in BCH and in deframing (ns), for the FEC thread's log.
@@ -207,7 +316,12 @@ pub static FEC_PROF_NS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::
 impl Fec {
     pub fn new(spec: FrameSpec) -> Self {
         let bch = Some(if spec.is_short() { Bch::short() } else { Bch::new() });
-        Fec { spec, dec: Ldpc::for_spec(&spec), bch, bbscr: bb_scrambling(spec.kbch / 8), bits: vec![0; spec.n], partial: Vec::new(), have_prev: false, matype_warned: false }
+        let mut dec = Ldpc::for_spec(&spec);
+        // normal frames: BBFRAME bytes and the BCH remainder from the fabric
+        if !spec.is_short() {
+            dec.want_bb();
+        }
+        Fec { spec, dec, bch, bbscr: bb_scrambling(spec.kbch / 8), bits: vec![0; spec.n], partial: Vec::new(), have_prev: false, matype_warned: false, pl_scr: Vec::new() }
     }
 
     /// Decode one frame of LLRs; TS packets out. False if it did not decode.
@@ -232,6 +346,35 @@ impl Fec {
         self.after_decode(ok, t0, stats, out)
     }
 
+    /// A DVB-S2 long frame from the receive ring (s2ring): the engine reads
+    /// and turns its symbols; without one (the job carries the words) the
+    /// model makes the cells here. A frame no longer in the ring is lost.
+    pub fn frame_ring(&mut self, job: &super::s2ring::Job, stats: &mut Stats, out: &mut Vec<[u8; TS_LEN]>) -> bool {
+        let t0 = std::time::Instant::now();
+        if let Some(w) = &job.words {
+            if self.pl_scr.len() < w.len() {
+                self.pl_scr = pl_scrambling(w.len());
+            }
+            let c = super::s2ring::cells(w, job.n_cells, job.pilots, &job.segs, job.gain, &self.pl_scr);
+            return self.frame_cells(&c, &super::s2cells::params(job.bps as usize, job.kq), stats, out);
+        }
+        let Some(watch) = &job.watch else {
+            stats.frames_bad += 1;
+            self.have_prev = false;
+            return false;
+        };
+        match self.dec.decode_ring(job, watch, &mut self.bits) {
+            Ok(ok) => self.after_decode(ok, t0, stats, out),
+            Err(()) => {
+                // lapped (the decoder far behind) or no engine: lost
+                stats.frames_bad += 1;
+                stats.ring_lapped += 1;
+                self.have_prev = false;
+                false
+            }
+        }
+    }
+
     /// A DVB-T2 QPSK block as cells (the FPGA decoder makes the LLRs).
     pub fn frame_cells(&mut self, cells: &[[i8; 2]], p: &crate::dvbt2::stream::CellParams, stats: &mut Stats, out: &mut Vec<[u8; TS_LEN]>) -> bool {
         let t0 = std::time::Instant::now();
@@ -241,6 +384,48 @@ impl Fec {
 
     fn after_decode(&mut self, ok: Option<usize>, t0: std::time::Instant, stats: &mut Stats, out: &mut Vec<[u8; TS_LEN]>) -> bool {
         let t_dec = std::time::Instant::now();
+        // The fabric's BBFRAME (descrambled bytes, the BCH remainder): no
+        // bits to unpack, divide or descramble here.
+        if let Some((mut bytes, rem)) = self.dec.take_bb() {
+            let n = self.spec.kbch + 192;
+            let good = match self.bch.as_ref().map(|b| b.correct_bytes(&mut bytes, rem, n, self.spec.kbch)) {
+                Some(Outcome::Clean) | None => true,
+                Some(Outcome::Fixed(k)) => {
+                    stats.bch_fixed += k as u64;
+                    true
+                }
+                Some(Outcome::Failed) => {
+                    if ok.is_some() {
+                        stats.bch_fail += 1;
+                    }
+                    false
+                }
+            };
+            stats.ldpc_s += t0.elapsed().as_secs_f64();
+            use std::sync::atomic::Ordering::Relaxed;
+            FEC_PROF_NS[0].fetch_add(t_dec.elapsed().as_nanos() as u64, Relaxed);
+            let r = if good {
+                let t_df = std::time::Instant::now();
+                let r = self.deframe_bytes(&bytes[..self.spec.kbch / 8], stats, out);
+                FEC_PROF_NS[1].fetch_add(t_df.elapsed().as_nanos() as u64, Relaxed);
+                r
+            } else {
+                stats.frames_bad += 1;
+                stats.ldpc_fail += 1;
+                self.have_prev = false;
+                false
+            };
+            self.dec.return_bb(bytes);
+            return r;
+        }
+        if self.dec.bb_lost() {
+            // (a time-out: neither bytes nor this frame's bits)
+            stats.ldpc_s += t0.elapsed().as_secs_f64();
+            stats.frames_bad += 1;
+            stats.ldpc_fail += 1;
+            self.have_prev = false;
+            return false;
+        }
         // BCH cleans up what LDPC left (or falsely converged on); it also
         // rescues a nearly converged frame.
         let ok = match &self.bch {
@@ -278,6 +463,21 @@ impl Fec {
     pub fn lost(&mut self) {
         self.have_prev = false;
     }
+}
+
+/// Normalized header correlation (0..1) of the symbols `s`, chunked
+/// coherent (10 symbols) so a frequency error of a few hundred Hz does not hurt.
+fn header_metric_of(s: &[Complex32], header: &[Complex32]) -> f32 {
+    let (mut num, mut den) = (0f32, 0f32);
+    for c in 0..SLOT / 10 {
+        let mut acc = Complex32::default();
+        for i in c * 10..c * 10 + 10 {
+            acc += s[i] * header[i].conj();
+            den += s[i].norm();
+        }
+        num += acc.norm();
+    }
+    num / den.max(1e-20)
 }
 
 /// Cubic (Catmull-Rom) interpolation of `x` at fractional index `t`.
@@ -358,6 +558,8 @@ impl Receiver {
             noise_frames: 0,
             fec: FecMode::Inline(Fec::new(spec)),
             llr: vec![0.0; spec.n],
+            cells: Vec::with_capacity(spec.n / 2),
+            float_llr: std::env::var_os("TRXD_S2_FLOAT_LLR").is_some(),
             stats: Stats::default(),
             constellation: Vec::new(),
             constellation_seq: 0,
@@ -378,6 +580,7 @@ impl Receiver {
                 v
             },
             cur: None,
+            ring: None,
         }
     }
 
@@ -388,6 +591,111 @@ impl Receiver {
         let mut r = Receiver::with_spec(spec, rs, rs, center_hz);
         r.symbol_input = true;
         r
+    }
+
+    /// Ring mode: the FPGA's symbols as the ring's raw words
+    /// ([`Self::process_ring`], from absolute word `at`), header flags in
+    /// them; long frames go to the engine as ring jobs (`engine`: it reads
+    /// the ring; otherwise the jobs carry the words for the model).
+    pub fn new_ring_spec(spec: FrameSpec, rs: f64, at: u64, engine: bool, watch: Option<std::sync::Arc<super::fpga::RingWatch>>) -> Self {
+        let mut r = Receiver::with_spec(spec, rs, rs, 0.0);
+        r.symbol_input = true;
+        r.flagged = true;
+        r.ring = Some(RingRx { raw: Vec::new(), abs0: at, mix: Mix { k0: at, th0: 0.0, w: 0.0 }, prev: None, engine, watch });
+        r
+    }
+
+    /// Ring words from absolute word `at` (see [`Self::new_ring_spec`]);
+    /// a gap (the reader lapped) loses lock and starts afresh there.
+    pub fn process_ring(&mut self, at: u64, words: &[u32], out: &mut Vec<[u8; TS_LEN]>) {
+        let t0 = std::time::Instant::now();
+        let ldpc0 = self.stats.ldpc_s;
+        let r = self.ring.as_mut().expect("ring mode");
+        if at != r.abs0 + r.raw.len() as u64 {
+            r.raw.clear();
+            r.abs0 = at;
+            r.prev = None;
+            r.mix = Mix { k0: at, th0: 0.0, w: r.mix.w };
+            self.stats.blocks_dropped += 1;
+            if self.locked_at.is_some() || self.candidate.is_some() {
+                self.locked_at = None;
+                self.candidate = None;
+                self.cur = None;
+                self.stats.locked = false;
+                self.fec_lost();
+            }
+        }
+        if let Some(r) = self.ring.as_mut() {
+            r.raw.extend_from_slice(words);
+        }
+        self.frames(out);
+        self.stats.other_s += t0.elapsed().as_secs_f64() - (self.stats.ldpc_s - ldpc0);
+    }
+
+    /// The TS loses the packet straddling a frame that will not come.
+    fn fec_lost(&mut self) {
+        match &mut self.fec {
+            FecMode::Inline(f) => f.lost(),
+            FecMode::Thread { tx, .. } => {
+                let _ = tx.try_send(S2Block::lost());
+            }
+        }
+    }
+
+    /// Symbols buffered.
+    fn nsyms(&self) -> usize {
+        match &self.ring {
+            Some(r) => r.raw.len(),
+            None => self.syms.len(),
+        }
+    }
+
+    /// Buffered symbol `k` (ring mode: made from its word now).
+    fn sym(&self, k: usize) -> Complex32 {
+        match &self.ring {
+            Some(r) => {
+                let ph = r.phase(r.abs0 + k as u64);
+                RingRx::raw_sym(r.raw[k]) * Complex32::new(ph.cos() as f32, ph.sin() as f32)
+            }
+            None => self.syms[k],
+        }
+    }
+
+    /// Buffered symbols `k..k + n` (ring mode: made now, the mixer's
+    /// phasor stepped along).
+    fn win(&self, k: usize, n: usize) -> Cow<'_, [Complex32]> {
+        let Some(r) = &self.ring else { return Cow::Borrowed(&self.syms[k..k + n]) };
+        let a = r.abs0 + k as u64;
+        let m = match r.prev {
+            Some(p) if a < r.mix.k0 => {
+                if a + n as u64 > r.mix.k0 {
+                    return Cow::Owned((k..k + n).map(|i| self.sym(i)).collect());
+                }
+                p
+            }
+            _ => r.mix,
+        };
+        let ph = m.at(a);
+        let mut z = Complex32::new(ph.cos() as f32, ph.sin() as f32);
+        let st = Complex32::new(m.w.cos() as f32, m.w.sin() as f32);
+        Cow::Owned(
+            r.raw[k..k + n]
+                .iter()
+                .map(|&w| {
+                    let y = RingRx::raw_sym(w) * z;
+                    z *= st;
+                    y
+                })
+                .collect(),
+        )
+    }
+
+    /// The FPGA's header candidate flag at symbol `k`.
+    fn flag(&self, k: usize) -> bool {
+        match &self.ring {
+            Some(r) => r.raw.get(k).is_some_and(|w| w & 0x1_0000 != 0),
+            None => self.flags.get(k) == Some(&true),
+        }
     }
 
     /// Input already matched-filtered and decimated (the FPGA DDC, see
@@ -513,17 +821,7 @@ impl Receiver {
     }
 
     fn header_metric_with(&self, k: usize, header: &[Complex32]) -> f32 {
-        let s = &self.syms[k..k + SLOT];
-        let (mut num, mut den) = (0f32, 0f32);
-        for c in 0..SLOT / 10 {
-            let mut acc = Complex32::default();
-            for i in c * 10..c * 10 + 10 {
-                acc += s[i] * header[i].conj();
-                den += s[i].norm();
-            }
-            num += acc.norm();
-        }
-        num / den.max(1e-20)
+        header_metric_of(&self.win(k, SLOT), header)
     }
 
     /// Another PLFRAME's header in `lo..=hi`: the best SOF position (two
@@ -532,19 +830,21 @@ impl Receiver {
     /// one reaches [`SYNC_MIN`].
     fn other_at(&self, lo: usize, hi: usize) -> Option<(usize, f32, usize)> {
         let sof = |k: usize| -> f32 {
+            let s = self.win(k, 26);
             let (mut num, mut den) = (0f32, 0f32);
             for c in 0..2 {
                 let mut acc = Complex32::default();
                 for i in c * 13..c * 13 + 13 {
-                    acc += self.syms[k + i] * self.header[i].conj();
-                    den += self.syms[k + i].norm();
+                    acc += s[i] * self.header[i].conj();
+                    den += s[i].norm();
                 }
                 num += acc.norm();
             }
             num / den.max(1e-20)
         };
         let k = (lo..=hi).max_by(|&a, &b| sof(a).total_cmp(&sof(b)))?;
-        let (i, m) = self.others.iter().enumerate().map(|(i, o)| (i, self.header_metric_with(k, &o.header))).max_by(|a, b| a.1.total_cmp(&b.1))?;
+        let w = self.win(k, SLOT);
+        let (i, m) = self.others.iter().enumerate().map(|(i, o)| (i, header_metric_of(&w, &o.header))).max_by(|a, b| a.1.total_cmp(&b.1))?;
         (m >= SYNC_MIN).then_some((k, m, i))
     }
 
@@ -560,7 +860,7 @@ impl Receiver {
         match &mut self.fec {
             FecMode::Inline(f) => f.lost(),
             FecMode::Thread { tx, .. } => {
-                let _ = tx.try_send(Vec::new());
+                let _ = tx.try_send(S2Block::lost());
             }
         }
     }
@@ -572,6 +872,19 @@ impl Receiver {
     /// than a core, the receiver fell behind the ring and never locked.
     /// Drop the first `n` symbols (and their flags).
     fn drain_syms(&mut self, n: usize) {
+        if let Some(r) = self.ring.as_mut() {
+            let n = n.min(r.raw.len());
+            r.raw.drain(..n);
+            r.abs0 += n as u64;
+            if r.prev.is_some() && r.abs0 >= r.mix.k0 {
+                r.prev = None;
+            }
+            // Keep the mixer's reference near (f64 phase over hours).
+            if r.prev.is_none() && r.abs0 > r.mix.k0 + (1 << 20) {
+                r.mix = Mix { k0: r.abs0, th0: wrap(r.mix.at(r.abs0)), w: r.mix.w };
+            }
+            return;
+        }
         let n = n.min(self.syms.len());
         self.syms.drain(..n);
         if self.flagged {
@@ -585,7 +898,7 @@ impl Receiver {
             let mut best = (start, 0f32);
             let last = super::hdrdet::SOF_LEN - 1;
             for k in start..end {
-                if self.flags.get(k + last) == Some(&true) {
+                if self.flag(k + last) {
                     let m = self.header_metric(k);
                     if m > best.1 && !self.other_beats(k, m) {
                         best = (k, m);
@@ -629,7 +942,11 @@ impl Receiver {
     /// Another PLS code fits the header at `k` better than ours (`m`): all
     /// share the SOF, which alone makes over a quarter of our metric.
     fn other_beats(&self, k: usize, m: f32) -> bool {
-        m >= SYNC_MIN && self.others.iter().any(|o| self.header_metric_with(k, &o.header) > m)
+        if m < SYNC_MIN {
+            return false;
+        }
+        let w = self.win(k, SLOT);
+        self.others.iter().any(|o| header_metric_of(&w, &o.header) > m)
     }
 
     fn frames(&mut self, out: &mut Vec<[u8; TS_LEN]>) {
@@ -640,7 +957,7 @@ impl Receiver {
                     // Search: the best header position within one frame of symbols.
                     let start = self.candidate.map_or(0, |c| c + l - TRACK_SLACK);
                     let need = start + if self.candidate.is_some() { 2 * TRACK_SLACK } else { l } + SLOT;
-                    if self.syms.len() < need {
+                    if self.nsyms() < need {
                         return;
                     }
                     let end = need - SLOT;
@@ -683,7 +1000,7 @@ impl Receiver {
                     // This frame's length: ours, or the one stepped over.
                     let l = self.cur.map_or(l, |i| self.others[i].len);
                     // A frame is ready once the next header can be checked.
-                    if self.syms.len() < p + l + TRACK_SLACK + SLOT {
+                    if self.nsyms() < p + l + TRACK_SLACK + SLOT {
                         return;
                     }
                     let lo = p + l - TRACK_SLACK;
@@ -718,12 +1035,7 @@ impl Receiver {
                         self.locked_at = None;
                         self.candidate = None;
                         self.stats.locked = false;
-                        match &mut self.fec {
-                            FecMode::Inline(f) => f.lost(),
-                            FecMode::Thread { tx, .. } => {
-                                let _ = tx.try_send(Vec::new());
-                            }
-                        }
+                        self.fec_lost();
                         self.drain_syms(next);
                         continue;
                     }
@@ -751,9 +1063,10 @@ impl Receiver {
         let a = std::f32::consts::FRAC_1_SQRT_2;
         let w = -std::f64::consts::TAU * f / self.rs;
         let mid = (len - 1) as f64 / 2.0;
+        let x = self.win(base + at, len);
         for i in 0..len {
             let ph = w * (i as f64 - mid);
-            let s = self.syms[base + at + i] * Complex32::new(ph.cos() as f32, ph.sin() as f32);
+            let s = x[i] * Complex32::new(ph.cos() as f32, ph.sin() as f32);
             let r = if at == 0 {
                 header[i]
             } else {
@@ -772,6 +1085,15 @@ impl Receiver {
     fn retune(&mut self, df: f64, from: usize) {
         self.afc_hz += df;
         let w = -std::f64::consts::TAU * df / self.rs;
+        if let Some(r) = self.ring.as_mut() {
+            // The mixer is a function of the symbol: from `from` on it turns
+            // at the new rate, continuing the phase.
+            let a = r.abs0 + from as u64;
+            let th = wrap(r.phase(a));
+            r.prev = Some(r.mix);
+            r.mix = Mix { k0: a, th0: th, w: r.mix.w + w };
+            return;
+        }
         for (i, s) in self.syms.iter_mut().enumerate().skip(from) {
             let ph = w * (i - from) as f64;
             *s *= Complex32::new(ph.cos() as f32, ph.sin() as f32);
@@ -791,7 +1113,9 @@ impl Receiver {
     fn frame(&mut self, p: usize, next: usize, kind: Option<usize>, out: &mut Vec<[u8; TS_LEN]>) {
         let rs = self.rs;
         // Header: frequency at increasing lags (+-rs/2, then finer).
-        let z: Vec<Complex32> = (0..SLOT).map(|i| self.syms[p + i] * self.header[i].conj()).collect();
+        let hw = self.win(p, SLOT);
+        let z: Vec<Complex32> = (0..SLOT).map(|i| hw[i] * self.header[i].conj()).collect();
+        drop(hw);
         // Acquisition: the header's lag correlations, summed over ACQ_FRAMES
         // with the NCO held, then resolved coarse to fine (lag 1: +-rs/2, lag
         // 40: +-rs/80) and applied once. One frame alone is too noisy (+-15 Hz
@@ -814,7 +1138,7 @@ impl Receiver {
         // Known blocks through the frame and the next header: phases unwrapped
         // against the frequency so far, then a least-squares line.
         let mut pts: Vec<(f64, f64, f32)> = Vec::new(); // (centre symbol, phase, weight)
-        let with_next = next + SLOT <= self.syms.len();
+        let with_next = next + SLOT <= self.nsyms();
         for &(at, len) in &self.known {
             let c = self.block(p, at, len, f);
             pts.push(((at + len / 2) as f64, c.arg() as f64, c.norm() * len as f32));
@@ -908,26 +1232,29 @@ impl Receiver {
         let (mut amp, mut n_known) = (0f32, 0usize);
         let mut noise = 0f32;
         let a = std::f32::consts::FRAC_1_SQRT_2;
-        for &(at, len) in &self.known {
+        // (the known symbols, made once)
+        let kw: Vec<Cow<'_, [Complex32]>> = self.known.iter().map(|&(at, len)| self.win(p + at, len)).collect();
+        for (b, &(at, len)) in self.known.iter().enumerate() {
             for i in 0..len {
                 let k = at + i;
                 let ph = phase_at(k as f64) as f32;
-                let s = self.syms[p + k] * Complex32::new(ph.cos(), -ph.sin());
+                let s = kw[b][i] * Complex32::new(ph.cos(), -ph.sin());
                 let r = if at == 0 { self.header[i] } else { super::rotate(Complex32::new(a, a), self.scramble[k - SLOT]) };
                 amp += (s * r.conj()).re;
                 n_known += 1;
             }
         }
         amp /= n_known as f32;
-        for &(at, len) in &self.known {
+        for (b, &(at, len)) in self.known.iter().enumerate() {
             for i in 0..len {
                 let k = at + i;
                 let ph = phase_at(k as f64) as f32;
-                let s = self.syms[p + k] * Complex32::new(ph.cos(), -ph.sin());
+                let s = kw[b][i] * Complex32::new(ph.cos(), -ph.sin());
                 let r = if at == 0 { self.header[i] } else { super::rotate(Complex32::new(a, a), self.scramble[k - SLOT]) };
                 noise += (s - r * amp).norm_sqr();
             }
         }
+        drop(kw);
         let sigma2 = (noise / n_known as f32).max(1e-9);
         self.stats.esn0_db = 10.0 * (amp * amp / sigma2).log10();
         if acquiring {
@@ -949,19 +1276,78 @@ impl Receiver {
             let a = std::f32::consts::FRAC_PI_4 * PSK8_PHASE[v] as f32;
             Complex32::new(a.cos(), a.sin())
         });
+        // Long frames: the data symbols go to the FPGA's LDPC engine as
+        // cells (it makes the LLRs; s2cells is its model); short frames:
+        // float LLRs here.
+        let cells = !self.spec.is_short() && !self.float_llr;
+        let g = super::s2cells::gain(amp);
+        // Ring mode: the engine turns the data symbols itself (s2ring);
+        // here only every 32nd, for the MER and the constellation.
+        let ring_job = cells && self.ring.is_some();
+        if cells && !ring_job {
+            self.cells.clear();
+        }
+        // The phase is linear between known blocks: a rotator stepped once a
+        // symbol, set afresh (cos, sin) at each block and after each pilot.
+        let mut rot = Complex32::new(1.0, 0.0);
+        let mut step = Complex32::new(1.0, 0.0);
+        let mut seg_end = 0usize;
         while n < nsym {
             if pilot < self.known.len() && k == self.known[pilot].0 {
                 k += PILOT;
                 pilot += 1;
+                seg_end = 0;
                 continue;
             }
-            let ph = phase_at(k as f64) as f32;
-            let s = self.syms[p + k] * Complex32::new(ph.cos(), -ph.sin());
+            if ring_job {
+                if n % 32 == 0 {
+                    let ph = phase_at(k as f64);
+                    let s = self.sym(p + k) * Complex32::new(ph.cos() as f32, -ph.sin() as f32);
+                    let d = super::rotate(s, (4 - self.scramble[k - SLOT]) & 3);
+                    let dec = if self.spec.bps == 2 {
+                        Complex32::new(amp * a * d.re.signum(), amp * a * d.im.signum())
+                    } else {
+                        let best = (0..8).min_by(|&x, &y| (d - psk8[x] * amp).norm_sqr().total_cmp(&(d - psk8[y] * amp).norm_sqr())).unwrap();
+                        psk8[best] * amp
+                    };
+                    dd_sig += dec.norm_sqr();
+                    dd_err += (d - dec).norm_sqr();
+                    let q = |v: f32| (v * unit).round().clamp(-127.0, 127.0) as i8;
+                    self.constellation.push([q(d.re), q(d.im)]);
+                }
+                n += 1;
+                k += 1;
+                continue;
+            }
+            if k >= seg_end {
+                let (p0, p1) = (phase_at(k as f64), phase_at(k as f64 + 1.0));
+                rot = Complex32::new(p0.cos() as f32, -p0.sin() as f32);
+                let dp = (p1 - p0) as f32;
+                step = Complex32::new(dp.cos(), -dp.sin());
+                seg_end = pts.iter().map(|pt| pt.0).find(|&b| b > k as f64).map_or(usize::MAX, |b| b.ceil() as usize);
+            }
+            let s = self.sym(p + k) * rot;
+            rot *= step;
             let d = super::rotate(s, (4 - self.scramble[k - SLOT]) & 3);
+            if cells {
+                self.cells.push(super::s2cells::cell(d, g));
+            }
             let dec = if self.spec.bps == 2 {
-                self.llr[2 * n] = scale * d.re;
-                self.llr[2 * n + 1] = scale * d.im;
+                if !cells {
+                    self.llr[2 * n] = scale * d.re;
+                    self.llr[2 * n + 1] = scale * d.im;
+                }
                 Complex32::new(amp * a * d.re.signum(), amp * a * d.im.signum())
+            } else if cells {
+                // The decision only for the MER (every 4th symbol: the
+                // nearest of 8 points is most of the work left here).
+                if n % 4 != 0 {
+                    n += 1;
+                    k += 1;
+                    continue;
+                }
+                let best = (0..8).min_by(|&x, &y| (d - psk8[x] * amp).norm_sqr().total_cmp(&(d - psk8[y] * amp).norm_sqr())).unwrap();
+                psk8[best] * amp
             } else {
                 // 8PSK, max-log: per bit the nearest point with it 1 minus
                 // the nearest with it 0, over the noise; bits y0 y1 y2 go to
@@ -1008,7 +1394,57 @@ impl Receiver {
         } else {
             self.noise_frames = 0;
         }
+        let mut kq = super::s2cells::kq(self.spec.bps, amp, sigma2);
+        // The ring job: per data group the angle the engine turns its first
+        // symbol by (the AFC's mixer less the carrier fit, both linear in
+        // the group) and the step a symbol.
+        let job = if ring_job {
+            let r = self.ring.as_ref().expect("ring mode");
+            let base = r.abs0 + p as u64;
+            let groups = if self.spec.pilots { nsym.div_ceil(super::s2ring::GROUP) } else { 1 };
+            let segs: Vec<(u32, u32)> = (0..groups)
+                .map(|gi| {
+                    let k_s = SLOT + gi * (super::s2ring::GROUP + PILOT);
+                    let ab = base + k_s as u64;
+                    let th = r.phase(ab) - phase_at(k_s as f64);
+                    let w = (r.phase(ab + 1) - r.phase(ab)) - (phase_at(k_s as f64 + 1.0) - phase_at(k_s as f64));
+                    (super::s2ring::angle(th), super::s2ring::step(w))
+                })
+                .collect();
+            let (gq, g_eff) = super::s2ring::gain(g);
+            kq = super::s2cells::kq_at(self.spec.bps, amp, sigma2, g_eff);
+            let fsym = super::s2ring::frame_symbols(nsym, self.spec.pilots);
+            Some(Box::new(super::s2ring::Job {
+                at: base + SLOT as u64,
+                n_cells: nsym,
+                pilots: self.spec.pilots,
+                segs,
+                gain: gq,
+                kq,
+                bps: self.spec.bps as u8,
+                words: (!r.engine).then(|| r.raw[p + SLOT..p + SLOT + fsym].to_vec()),
+                watch: r.watch.clone(),
+            }))
+        } else {
+            None
+        };
         let fails = match &mut self.fec {
+            FecMode::Inline(f) if cells => {
+                let ok = |f: &mut Fec, st: &mut Stats, out: &mut Vec<[u8; TS_LEN]>, cells: &[[i8; 2]]| match &job {
+                    Some(j) => f.frame_ring(j, st, out),
+                    None => f.frame_cells(cells, &super::s2cells::params(self.spec.bps, kq), st, out),
+                };
+                if hopeless {
+                    self.stats.frames_bad += 1;
+                    self.stats.frames_skipped += 1;
+                    f.lost();
+                    self.fails + 1
+                } else if ok(f, &mut self.stats, out, &self.cells) {
+                    0
+                } else {
+                    self.fails + 1
+                }
+            }
             FecMode::Inline(f) => {
                 // Debug: DVBS2_DUMP_LLR=<file> appends each frame's LLRs (f32 LE).
                 if let Some(path) = std::env::var_os("DVBS2_DUMP_LLR") {
@@ -1034,8 +1470,15 @@ impl Receiver {
                     self.stats.frames_bad += 1;
                     self.stats.frames_skipped += 1;
                     // An empty frame tells the decoder one is missing.
-                    let _ = tx.try_send(Vec::new());
-                } else if tx.try_send(self.llr.clone()).is_err() {
+                    let _ = tx.try_send(S2Block::lost());
+                } else if tx
+                    .try_send(match job {
+                        Some(j) => S2Block::Ring(j),
+                        None if cells => S2Block::Cells(self.cells.clone(), kq, self.spec.bps as u8),
+                        None => S2Block::Llr(self.llr.clone()),
+                    })
+                    .is_err()
+                {
                     self.stats.frames_bad += 1;
                     self.stats.frames_fec_busy += 1;
                 }
@@ -1072,6 +1515,12 @@ impl Fec {
                 v ^ self.bbscr[i]
             })
             .collect();
+        self.deframe_bytes(&bb, stats, out)
+    }
+
+    /// One BBFRAME (descrambled, Kbch / 8 bytes): TS packets out.
+    fn deframe_bytes(&mut self, bb: &[u8], stats: &mut Stats, out: &mut Vec<[u8; TS_LEN]>) -> bool {
+        let n = self.spec.kbch / 8;
         if crc8(&bb[..9]) != bb[9] {
             stats.frames_bad += 1;
             stats.crc_fail += 1;
@@ -1380,7 +1829,7 @@ impl RxThread {
         // gets none for a while now and then; 16 frames overflowed over the
         // air (a quarter of the frames lost as "busy" that would all have
         // decoded). Beyond it whole frames are skipped and timing stays intact.
-        let (ftx, frx) = crossbeam_channel::bounded::<Vec<f32>>(48);
+        let (ftx, frx) = crossbeam_channel::bounded::<S2Block>(48);
         let fails = Arc::new(AtomicU32::new(0));
         let shared = Arc::new(Mutex::new(RxShared::default()));
         let fec_stats = Arc::new(Mutex::new(Stats::default()));
@@ -1412,7 +1861,11 @@ impl RxThread {
                 // few ms into a queue of seconds, so the demodulator's bursts
                 // (a whole long frame at once) cannot let the DMA lap it.
                 let (btx, brx) = crossbeam_channel::bounded::<(Vec<Complex32>, Option<Vec<bool>>)>(800);
-                let (ftx_fs, frx_fs) = crossbeam_channel::bounded::<(f64, bool, bool)>(1);
+                // Ring mode (stage 2, s2ring): raw words from an absolute
+                // position (None: the reader was lapped, words lost).
+                let (wtx, wrx) = crossbeam_channel::bounded::<(Option<u64>, Vec<u32>)>(800);
+                type Ring = Option<(u64, std::sync::Arc<super::fpga::RingWatch>)>;
+                let (ftx_fs, frx_fs) = crossbeam_channel::bounded::<(f64, bool, bool, Ring)>(1);
                 let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let (st2, dr2) = (stop.clone(), dr.clone());
                 let rolloff = p.rolloff;
@@ -1427,12 +1880,37 @@ impl RxThread {
                                 return;
                             }
                         };
-                        let _ = ftx_fs.send((fe.fs_out(), fe.symbols(), fe.flagged()));
+                        // The engine reads long frames from the ring itself
+                        // when it can (and the ring tells absolute positions).
+                        let ring_mode = fe.symbols() && fe.flagged() && fe.wraps_hw() && !p.is_short() && super::fpga_ldpc::ring_available();
+                        let ring = if ring_mode {
+                            let mut first = Vec::new();
+                            let at = fe.read_raw(&mut first).unwrap_or(0) + first.len() as u64;
+                            fe.watch().map(|w| (at, std::sync::Arc::new(w)))
+                        } else {
+                            None
+                        };
+                        let ring_mode = ring.is_some();
+                        let _ = ftx_fs.send((fe.fs_out(), fe.symbols(), fe.flagged(), ring));
                         let (mut reported, mut late_reported) = (false, false);
                         let mut last = std::time::Instant::now();
                         while !st2.load(Ordering::Relaxed) {
                             std::thread::sleep(std::time::Duration::from_millis(5));
                             fe.set_center(f64::from_bits(fc.load(Ordering::Relaxed)));
+                            if ring_mode {
+                                let mut words = Vec::new();
+                                let at = fe.read_raw(&mut words);
+                                last = std::time::Instant::now();
+                                if !reported && fe.dropped() {
+                                    reported = true;
+                                    dr2.fetch_add(1, Ordering::Relaxed);
+                                    tracing::warn!("DATV: the FPGA recorder dropped samples");
+                                }
+                                if (at.is_none() || !words.is_empty()) && wtx.try_send((at, words)).is_err() {
+                                    dr2.fetch_add(1, Ordering::Relaxed);
+                                }
+                                continue;
+                            }
                             let mut buf = Vec::new();
                             let mut flags = fe.flagged().then(Vec::new);
                             match flags.as_mut() {
@@ -1473,11 +1951,16 @@ impl RxThread {
                         }
                     })
                     .expect("spawn datv-ring");
-                let Ok((fs_out, symbols, flagged)) = frx_fs.recv() else {
+                let Ok((fs_out, symbols, flagged, ring_rx)) = frx_fs.recv() else {
                     return;
                 };
-                tracing::info!(fs = fs_out, symbols, flagged, "DATV receive through the FPGA DDC");
-                let mut r = if symbols { Receiver::new_symbols_spec(p, sr, 0.0) } else { Receiver::new_prefiltered_spec(p, fs_out, sr, 0.0) };
+                tracing::info!(fs = fs_out, symbols, flagged, ring = ring_rx.is_some(), "DATV receive through the FPGA DDC");
+                let mut ring_at = ring_rx.as_ref().map(|r| r.0);
+                let mut r = match ring_rx {
+                    Some((at, watch)) => Receiver::new_ring_spec(p, sr, at, true, Some(watch)),
+                    None if symbols => Receiver::new_symbols_spec(p, sr, 0.0),
+                    None => Receiver::new_prefiltered_spec(p, fs_out, sr, 0.0),
+                };
                 r.fec = FecMode::Thread { tx: ftx, fails };
                 'run: loop {
                     // Until the RxThread is dropped (its sender goes); the
@@ -1488,6 +1971,24 @@ impl RxThread {
                             Err(crossbeam_channel::TryRecvError::Empty) => break,
                             Ok(_) => {}
                         }
+                    }
+                    if let Some(at) = ring_at.as_mut() {
+                        match wrx.recv_timeout(std::time::Duration::from_millis(20)) {
+                            Ok((pos, words)) => {
+                                // a lap: the next words start at the DMA (pos)
+                                if let Some(pos) = pos {
+                                    *at = pos;
+                                } else {
+                                    continue;
+                                }
+                                r.process_ring(*at, &words, &mut none);
+                                *at += words.len() as u64;
+                                publish(&r, &sh, &mut seen);
+                            }
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                        }
+                        continue;
                     }
                     match brx.recv_timeout(std::time::Duration::from_millis(20)) {
                         Ok((buf, flags)) => {
@@ -1999,6 +2500,73 @@ pub(crate) mod tests {
         assert_eq!(out.iter().filter(|p| p[1] & 0x80 != 0).count(), 1);
     }
 
+    /// Decoding margin of the LDPC engine's cells (s2cells) against the
+    /// float LLRs they replaced: the same noisy frames through both, near
+    /// each mode's threshold. Run by hand:
+    /// cargo test --release cells_margin -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn cells_margin() {
+        use super::super::fpga_tx::LongMode;
+        let frames = std::env::var("MARGIN_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(40usize);
+        for (mode, snrs) in [(LongMode::Qpsk12, [0.6f32, 1.0, 1.4]), (LongMode::Qpsk34, [3.6, 4.0, 4.4]), (LongMode::Psk8_34, [7.4, 7.8, 8.2])] {
+            let spec = FrameSpec::long(mode);
+            let mut next = counter_packets();
+            let clean = long_symbols(mode, frames, &mut next);
+            for esn0_db in snrs {
+                let sigma = (0.5 / 10f32.powf(esn0_db / 10.0)).sqrt();
+                let mut seed = 99u64 + (esn0_db * 10.0) as u64;
+                let mut g = || {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                    let u = ((seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-12);
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                    let v = (seed >> 11) as f64 / (1u64 << 53) as f64;
+                    ((-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()) as f32
+                };
+                let noisy: Vec<Complex32> = clean.iter().map(|&z| z + Complex32::new(sigma * g(), sigma * g())).collect();
+                let mut res = Vec::new();
+                for float in [true, false] {
+                    let mut rx = Receiver::new_symbols_spec(spec, 250e3, 0.0);
+                    rx.float_llr = float;
+                    let mut out = Vec::new();
+                    for c in noisy.chunks(8192) {
+                        rx.process(c, &mut out);
+                    }
+                    res.push((rx.stats.frames.saturating_sub(rx.stats.frames_bad), rx.stats.frames, out.len()));
+                }
+                println!("{mode:?} Es/N0 {esn0_db:.1} dB: float {}/{} frames ({} packets), cells {}/{} ({} packets)", res[0].0, res[0].1, res[0].2, res[1].0, res[1].1, res[1].2);
+            }
+        }
+    }
+
+    /// The demodulator's own time a frame (the decoder thread excluded:
+    /// its frames go to a channel), float LLRs against cells. By hand:
+    /// cargo test --release demod_time -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn demod_time() {
+        use super::super::fpga_tx::LongMode;
+        for mode in [LongMode::Qpsk12, LongMode::Psk8_34] {
+            let spec = FrameSpec::long(mode);
+            let mut next = counter_packets();
+            let syms: Vec<Complex32> = long_symbols(mode, 30, &mut next).iter().map(|&z| z * Complex32::new(0.9, 0.2)).collect();
+            for float in [true, false] {
+                let (tx, rx_c) = crossbeam_channel::unbounded::<S2Block>();
+                let mut rx = Receiver::new_symbols_spec(spec, 250e3, 0.0);
+                rx.float_llr = float;
+                rx.fec = FecMode::Thread { tx, fails: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)) };
+                let mut out = Vec::new();
+                let t0 = std::time::Instant::now();
+                for c in syms.chunks(8192) {
+                    rx.process(c, &mut out);
+                }
+                let dt = t0.elapsed().as_secs_f64();
+                let n = rx_c.len().max(1);
+                println!("{mode:?} {}: {:.2} ms a frame ({n} frames)", if float { "float" } else { "cells" }, 1e3 * dt / n as f64);
+            }
+        }
+    }
+
     pub(crate) fn counter_packets() -> impl FnMut() -> [u8; TS_LEN] {
         let mut n = 0u32;
         move || {
@@ -2015,6 +2583,311 @@ pub(crate) mod tests {
 
     /// Long frames through RRC, noise and a carrier offset into the receiver,
     /// decoded by the FPGA decoder's model: every packet back, in order.
+    /// Ring words as the FPGA leaves them: symbols at about -14 dBFS, a
+    /// carrier offset, noise, the header detector's flag in bit 16.
+    fn ring_words(mode: super::super::fpga_tx::LongMode, esn0_db: f32, frames: usize, off_hz: f64, rs: f64) -> Vec<u32> {
+        let mut next = counter_packets();
+        let syms = long_symbols(mode, frames, &mut next);
+        let sigma = (1.0 / 10f32.powf(esn0_db / 10.0) / 2.0).sqrt();
+        let mut seed = 23u64;
+        let mut g = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let u = ((seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-12);
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let v = (seed >> 11) as f64 / (1u64 << 53) as f64;
+            ((-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()) as f32
+        };
+        let mut det = super::super::hdrdet::HdrDet::default();
+        let q = |v: f32| (v * 6000.0).round().clamp(-32768.0, 32767.0) as i16;
+        // a little noise first, so the receiver searches
+        let lead: Vec<Complex32> = (0..5000).map(|_| Complex32::new(sigma * g(), sigma * g())).collect();
+        lead.iter()
+            .chain(syms.iter())
+            .enumerate()
+            .map(|(k, &z)| {
+                let ph = std::f64::consts::TAU * off_hz * k as f64 / rs;
+                let y = z * Complex32::new(ph.cos() as f32, ph.sin() as f32) + Complex32::new(sigma * g(), sigma * g());
+                let y = [q(y.re), q(y.im)];
+                let f = det.push(y);
+                let y = super::super::hdrdet::HdrDet::mark(y, f);
+                (y[0] as u16 as u32) | (y[1] as u16 as u32) << 16
+            })
+            .collect()
+    }
+
+    /// Ring mode (the engine reading the ring; here its model, s2ring):
+    /// every packet back, in order, with the carrier off and drifting
+    /// through the AFC's retunes.
+    fn ring_link(mode: super::super::fpga_tx::LongMode, esn0_db: f32, frames: usize) -> (Stats, usize, f64) {
+        let rs = 250e3;
+        let words = ring_words(mode, esn0_db, frames, 900.0, rs);
+        let mut rx = Receiver::new_ring_spec(FrameSpec::long(mode), rs, 1_000, false, None);
+        let mut out = Vec::new();
+        let mut at = 1_000u64;
+        let t0 = std::time::Instant::now();
+        for c in words.chunks(4096) {
+            rx.process_ring(at, c, &mut out);
+            at += c.len() as u64;
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        let data: Vec<_> = out.iter().filter(|p| p[1..3] != [0x1F, 0xFF]).collect();
+        if let Some(first) = data.first() {
+            let f0 = u32::from_be_bytes(first[1..5].try_into().unwrap());
+            for (i, pkt) in data.iter().enumerate() {
+                let k = f0 + i as u32;
+                assert_eq!(u32::from_be_bytes(pkt[1..5].try_into().unwrap()), k, "{mode:?}: packet {i} of {}; {:?}", data.len(), rx.stats);
+                assert!(pkt[5..].iter().enumerate().all(|(j, b)| *b == (k as usize * 7 + j) as u8), "{mode:?}: packet {i} payload");
+            }
+        }
+        (rx.stats, data.len(), dt)
+    }
+
+    #[test]
+    fn ring_frames_8psk_3_4() {
+        let (s, n, _) = ring_link(super::super::fpga_tx::LongMode::Psk8_34, 12.0, 20);
+        assert!(s.locked, "{s:?}");
+        assert!(n >= 17 * 32 && s.ldpc_fail == 0, "{n} packets, {s:?}");
+    }
+
+    #[test]
+    fn ring_frames_qpsk() {
+        for mode in [super::super::fpga_tx::LongMode::Qpsk12, super::super::fpga_tx::LongMode::Qpsk34] {
+            let (s, n, _) = ring_link(mode, 7.0, 14);
+            assert!(s.locked, "{mode:?} {s:?}");
+            assert!(n >= 10 * 20 && s.ldpc_fail == 0, "{mode:?}: {n} packets, {s:?}");
+        }
+    }
+
+    /// Ring mode and the symbol path (stage 1) on the same noisy words:
+    /// the same frames decode (no margin lost to the fixed-point turn).
+    #[test]
+    fn ring_matches_the_symbol_path() {
+        use super::super::fpga_tx::LongMode;
+        for (mode, esn0) in [(LongMode::Psk8_34, 8.2), (LongMode::Psk8_34, 7.7), (LongMode::Qpsk12, 1.4), (LongMode::Qpsk12, 1.0), (LongMode::Qpsk34, 4.0)] {
+            let rs = 250e3;
+            let words = ring_words(mode, esn0, 30, 400.0, rs);
+            let spec = FrameSpec::long(mode);
+            let mut a = Receiver::new_ring_spec(spec, rs, 0, false, None);
+            let mut b = Receiver::new_symbols_spec(spec, rs, 0.0);
+            let (mut oa, mut ob) = (Vec::new(), Vec::new());
+            let mut at = 0u64;
+            for c in words.chunks(4096) {
+                a.process_ring(at, c, &mut oa);
+                at += c.len() as u64;
+                let syms: Vec<Complex32> = c.iter().map(|&w| RingRx::raw_sym(w)).collect();
+                let flags: Vec<bool> = c.iter().map(|w| w & 0x1_0000 != 0).collect();
+                b.process_flagged(&syms, Some(&flags), &mut ob);
+            }
+            let good = |s: &Stats| s.frames - s.frames_bad;
+            println!("{mode:?} at {esn0} dB: ring {}/{} frames, symbols {}/{}", good(&a.stats), a.stats.frames, good(&b.stats), b.stats.frames);
+            assert!(good(&a.stats) + 1 >= good(&b.stats), "ring {:?}\nsymbols {:?}", a.stats, b.stats);
+        }
+    }
+
+    /// A gap in the ring (the reader lapped): lock is lost, then found again.
+    #[test]
+    fn ring_survives_a_gap() {
+        use super::super::fpga_tx::LongMode;
+        let rs = 250e3;
+        let words = ring_words(LongMode::Qpsk12, 8.0, 24, 200.0, rs);
+        let mut rx = Receiver::new_ring_spec(FrameSpec::long(LongMode::Qpsk12), rs, 0, false, None);
+        let mut out = Vec::new();
+        let cut = words.len() / 3;
+        rx.process_ring(0, &words[..cut], &mut out);
+        let before = out.len();
+        rx.process_ring((cut + 70_000) as u64, &words[cut + 70_000..], &mut out);
+        assert!(before > 0 && out.len() > before + 100, "{before} then {}; {:?}", out.len(), rx.stats);
+        assert!(rx.stats.locked && rx.stats.blocks_dropped == 1, "{:?}", rx.stats);
+    }
+
+    /// The receiver's own time per frame, ring mode against the symbol
+    /// path (cargo test --release ring_demod_time -- --ignored --nocapture).
+    #[test]
+    #[ignore]
+    fn ring_demod_time() {
+        use super::super::fpga_tx::LongMode;
+        for mode in [LongMode::Qpsk12, LongMode::Psk8_34] {
+            let rs = 250e3;
+            let words = ring_words(mode, 20.0, 30, 300.0, rs);
+            let spec = FrameSpec::long(mode);
+            let (tx, rx_c) = crossbeam_channel::unbounded::<S2Block>();
+            let mut a = Receiver::new_ring_spec(spec, rs, 0, true, None);
+            a.fec = FecMode::Thread { tx, fails: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)) };
+            let mut out = Vec::new();
+            let t0 = std::time::Instant::now();
+            let mut at = 0u64;
+            for c in words.chunks(8192) {
+                a.process_ring(at, c, &mut out);
+                at += c.len() as u64;
+            }
+            let ta = t0.elapsed().as_secs_f64() / rx_c.len().max(1) as f64;
+            let (tx, rx_c) = crossbeam_channel::unbounded::<S2Block>();
+            let mut b = Receiver::new_symbols_spec(spec, rs, 0.0);
+            b.fec = FecMode::Thread { tx, fails: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)) };
+            let t0 = std::time::Instant::now();
+            for c in words.chunks(8192) {
+                let syms: Vec<Complex32> = c.iter().map(|&w| RingRx::raw_sym(w)).collect();
+                let flags: Vec<bool> = c.iter().map(|w| w & 0x1_0000 != 0).collect();
+                b.process_flagged(&syms, Some(&flags), &mut out);
+            }
+            let tb = t0.elapsed().as_secs_f64() / rx_c.len().max(1) as f64;
+            println!("{mode:?}: ring {:.3} ms a frame, symbols (stage 1, conversion included) {:.3} ms", ta * 1e3, tb * 1e3);
+        }
+    }
+
+    /// The FPGA recorder in a model: a stream of ring words committed in
+    /// 128-byte bursts at the symbol rate, simulated time passing between
+    /// register reads (the DMA moves while the reader reads).
+    struct FakeRing {
+        mem: Vec<u32>,
+        src: Vec<u32>,
+        rate: f64,
+        t: f64,
+        reg_dt: f64,
+        committed: u64,
+    }
+
+    impl FakeRing {
+        fn new(src: Vec<u32>, rate: f64) -> Self {
+            FakeRing { mem: vec![0; super::super::fpga::RING_WORDS as usize], src, rate, t: 0.0, reg_dt: 4e-6, committed: 0 }
+        }
+        fn advance(&mut self, dt: f64) {
+            self.t += dt;
+            let want = (((self.t * self.rate) as u64) / 32 * 32).min(self.src.len() as u64 / 32 * 32);
+            while self.committed < want {
+                let k = self.committed as usize;
+                let n = self.mem.len();
+                self.mem[k % n] = self.src[k];
+                self.committed += 1;
+            }
+        }
+        fn addr(&self) -> u32 {
+            super::super::fpga::RING_START + ((self.committed % super::super::fpga::RING_WORDS) * 4) as u32
+        }
+        fn done(&self) -> bool {
+            self.committed >= self.src.len() as u64 / 32 * 32
+        }
+    }
+
+    impl super::super::fpga::RingHw for FakeRing {
+        fn position(&mut self) -> Option<(u64, u32)> {
+            self.advance(self.reg_dt);
+            Some((self.committed * 4, self.addr()))
+        }
+        fn copy(&mut self, from: u32, to: u32, out: &mut Vec<u32>) {
+            let (s, e) = (((from - super::super::fpga::RING_START) / 4) as usize, ((to - super::super::fpga::RING_START) / 4) as usize);
+            out.extend_from_slice(&self.mem[s..e]);
+            self.advance((e - s) as f64 * 4.0 / 185e6);
+        }
+    }
+
+    /// The whole ring path at a real rate: the recorder, the ring reader
+    /// thread's reads every 5 ms (some late), the receiver in ring mode, and
+    /// the decoder thread taking each job after its queue and decode time,
+    /// reading the frame from the ring as the engine would. Every frame
+    /// sent must decode and every TS packet come out once, in order.
+    fn ring_stream(mode: super::super::fpga_tx::LongMode, rs: f64, frames: usize) -> (usize, usize, u64, Stats) {
+        use super::super::fpga::{RingCursor, RING_START, RING_WORDS};
+        let words = ring_words(mode, 25.0, frames, 517.0, rs);
+        let spec = FrameSpec::long(mode);
+        let mut hw = FakeRing::new(words, rs);
+        let mut cur = RingCursor { rd: RING_START, total: 0 };
+        let (tx, rx_c) = crossbeam_channel::unbounded::<S2Block>();
+        let mut rx = Receiver::new_ring_spec(spec, rs, 0, true, None);
+        rx.fec = FecMode::Thread { tx, fails: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)) };
+        let mut fec = Fec::new(spec);
+        let mut fst = Stats::default();
+        let mut ts = Vec::new();
+        let mut none = Vec::new();
+        let mut at: Option<u64> = None;
+        // the decoder: (job, the time it was queued)
+        let mut queue: VecDeque<(S2Block, f64)> = VecDeque::new();
+        let mut busy_until = 0.0f64;
+        let (mut decoded, mut lost) = (0usize, 0usize);
+        let mut n_read = 0u32;
+        let mut seed = 3u32;
+        loop {
+            // the reader thread: 5 ms sleeps, now and then 30 ms late
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            hw.advance(if seed >> 28 == 0 { 0.030 } else { 0.005 });
+            let mut buf = Vec::new();
+            match cur.read(&mut hw, &mut buf) {
+                Some(pos) => {
+                    let a = at.get_or_insert(pos);
+                    *a = pos;
+                    rx.process_ring(pos, &buf, &mut none);
+                    *a += buf.len() as u64;
+                }
+                None => {}
+            }
+            n_read += 1;
+            while let Ok(b) = rx_c.try_recv() {
+                queue.push_back((b, hw.t));
+            }
+            // the decoder: one frame at a time, 12 ms each
+            while let Some((_, q_t)) = queue.front() {
+                let start = busy_until.max(*q_t);
+                if start + 0.012 > hw.t {
+                    break;
+                }
+                let (b, _) = queue.pop_front().unwrap();
+                busy_until = start + 0.012;
+                match b {
+                    S2Block::Ring(mut job) => {
+                        let nsym = super::super::s2ring::frame_symbols(job.n_cells, job.pilots) as u64;
+                        let ahead = hw.committed - job.at;
+                        if super::super::s2ring::in_ring(ahead, nsym) {
+                            job.words = Some((0..nsym).map(|k| hw.mem[((job.at + k) % RING_WORDS) as usize]).collect());
+                            if fec.frame_ring(&job, &mut fst, &mut ts) {
+                                decoded += 1;
+                            }
+                        } else {
+                            lost += 1;
+                            fec.lost();
+                        }
+                    }
+                    _ => fec.lost(),
+                }
+            }
+            if hw.done() && n_read > 10 && queue.is_empty() && rx_c.is_empty() {
+                // drain what is left in the ring
+                let mut buf = Vec::new();
+                if let Some(pos) = cur.read(&mut hw, &mut buf) {
+                    rx.process_ring(pos, &buf, &mut none);
+                }
+                if rx_c.is_empty() {
+                    break;
+                }
+            }
+        }
+        let data: Vec<_> = ts.iter().filter(|p| p[1..3] != [0x1F, 0xFF]).collect();
+        let mut in_order = 0usize;
+        if let Some(first) = data.first() {
+            let f0 = u32::from_be_bytes(first[1..5].try_into().unwrap());
+            for (i, pkt) in data.iter().enumerate() {
+                if u32::from_be_bytes(pkt[1..5].try_into().unwrap()) == f0 + i as u32 {
+                    in_order += 1;
+                }
+            }
+        }
+        println!("{mode:?} {rs}: {decoded} frames decoded of {frames} sent, {lost} lost to the ring, {} packets ({in_order} in order); receiver {:?}", data.len(), rx.stats);
+        let _ = lost;
+        (decoded, data.len(), rx.stats.blocks_dropped, rx.stats)
+    }
+
+    #[test]
+    fn ring_stream_at_real_rates() {
+        use super::super::fpga_tx::LongMode;
+        for (mode, rs, frames) in [(LongMode::Psk8_34, 500e3, 60), (LongMode::Qpsk12, 250e3, 30), (LongMode::Qpsk34, 33e3, 6)] {
+            let (decoded, packets, gaps, st) = ring_stream(mode, rs, frames);
+            // all but the frame or two before lock
+            assert!(decoded + 2 >= frames, "{mode:?} {rs}: {decoded} of {frames} frames; {st:?}");
+            assert_eq!(gaps, 0, "{mode:?} {rs}: the receiver saw gaps in the ring positions");
+            let per = (FrameSpec::long(mode).kbch / 8 - 10) as f64 / 188.0;
+            assert!(packets as f64 >= (frames - 2) as f64 * per - 2.0, "{mode:?} {rs}: {packets} packets");
+        }
+    }
+
     fn long_link(mode: super::super::fpga_tx::LongMode, esn0_db: f32, frames: usize) -> (Stats, usize) {
         let (sps, rs) = (4usize, 64_000.0);
         let fs = rs * sps as f64;

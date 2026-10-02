@@ -129,6 +129,9 @@ impl Settings {
     }
 
     /// Add a calibration point (replacing one within 1 dB of the same level).
+    /// The web UI no longer stores these (calib.rs replaced them); old
+    /// points still apply where no calibration table exists.
+    #[cfg(test)]
     pub fn add_cal(&mut self, band: &str, reading: f64, dbm: f64) {
         let v = self.smeter.entry(band.to_string()).or_default();
         v.retain(|p| (p.dbm - dbm).abs() >= 1.0);

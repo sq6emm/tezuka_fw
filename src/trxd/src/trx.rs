@@ -93,6 +93,43 @@ const DC_AVOID_SPAN_MAX: f64 = 100_000.0;
 /// Room between the edge of the view and the LO.
 const DC_GUARD_HZ: f64 = 5_000.0;
 
+/// One source's raw level of a band (power.rs), its own dBFS.
+#[derive(Debug, Clone)]
+struct RawLevel {
+    dbfs: f64,
+    /// The strongest narrow signal in the band alone.
+    peak_dbfs: f64,
+    noise_dbfs_hz: Option<f64>,
+    /// The spectrum's running number (a fresh one after a change: +2).
+    seq: u64,
+}
+
+/// The level meter's latest reading (power.rs, calib.rs).
+#[derive(Debug, Clone)]
+struct Meter {
+    /// Power in the measured band at the antenna socket, dBm.
+    dbm: f64,
+    /// Noise density there, dBm/Hz.
+    dbm_hz: Option<f64>,
+    /// The same at the measurement point, channel-scale dBFS.
+    dbfs: f64,
+    quality: crate::calib::Quality,
+    /// A stream sample at or near full scale since the last reading.
+    clip: bool,
+    /// The band holds less than twice the noise in it: mostly noise.
+    noise: bool,
+    /// "channel", "stream", "maia" or "none".
+    src: &'static str,
+    /// dB to add to the scope's dBFS for dBm (calibrated boards only).
+    scope_off: Option<f64>,
+}
+
+impl Default for Meter {
+    fn default() -> Self {
+        Meter { dbm: -160.0, dbm_hz: None, dbfs: -160.0, quality: crate::calib::Quality::None, clip: false, noise: true, src: "none", scope_off: None }
+    }
+}
+
 /// Where the transmit audio is coming from right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TxSource {
@@ -186,8 +223,27 @@ pub struct Trx {
     /// Squelch threshold (channel dBFS; None = open) and whether it is open.
     squelch_db: Option<f32>,
     squelch_open: bool,
-    /// Gain-compensated channel level, smoothed (S-meter / calibration).
+    /// Gain-compensated demodulator level, smoothed: only for the old
+    /// per-band S-meter points (settings.json), used where no calibration
+    /// table exists.
     reading_db: f64,
+    /// Level meter (power.rs): the 48 kS/s channel every mode shares, and
+    /// the stream for bands wider than it; their latest averaged spectra.
+    chan_meter: crate::power::PowerMeter,
+    stream_meter: crate::power::PowerMeter,
+    chan_spec: Option<crate::power::Spectrum>,
+    stream_spec: Option<crate::power::Spectrum>,
+    /// The stream meter runs until then (or while DATV is received).
+    stream_meter_until: Instant,
+    /// The latest Maia spectrometer row (wide bands).
+    maia_last: Option<Vec<f32>>,
+    /// Largest stream sample magnitude since the last reading.
+    stream_peak: f32,
+    /// (dial, LO, socket) the meters last averaged at: a change restarts them.
+    meter_at: (f64, f64, u8),
+    /// Per RX socket pair (index 0: RX1): the board's level calibration.
+    calib: [Option<crate::calib::Calib>; 2],
+    meter: Meter,
     /// Front-end gain actually in force (the AD936x AGC moves it), read by a
     /// background thread (an SPI round trip takes ~70 ms) as f64 bits.
     hw_gain_db: f64,
@@ -408,6 +464,16 @@ impl Trx {
             squelch_db: None,
             squelch_open: true,
             reading_db: -120.0,
+            chan_meter: crate::power::PowerMeter::new(CH_RATE, 0),
+            stream_meter: crate::power::PowerMeter::new(rate, 2 * crate::power::N),
+            chan_spec: None,
+            stream_spec: None,
+            stream_meter_until: Instant::now(),
+            maia_last: None,
+            stream_peak: 0.0,
+            meter_at: (0.0, 0.0, 0),
+            calib: crate::calib::Calib::load_both(&std::path::PathBuf::from(&cfg.web.state_dir)),
+            meter: Meter::default(),
             hw_gain_db: cfg.radio.rx_gain_db,
             hw_gain: None,
             temps: Default::default(),
@@ -1400,6 +1466,201 @@ impl Trx {
         info!(freq = self.tx_vfo(), mode = mode_name(self.mode), ?source, "TX");
     }
 
+    // ---- Level meter (power.rs, calib.rs, docs/DBM.md) ----
+
+    /// Feed the level meters with this block; a reading when one is due.
+    fn feed_meter(&mut self, iq: &[Complex32]) {
+        for z in iq {
+            let m = z.re.abs().max(z.im.abs());
+            if m > self.stream_peak || m.is_nan() {
+                self.stream_peak = if m.is_nan() { 1.0 } else { m };
+            }
+        }
+        let at = (self.rx_eff(), self.center, self.rx_port());
+        if at != self.meter_at {
+            self.meter_at = at;
+            self.chan_meter.reset();
+            self.stream_meter.reset();
+            self.chan_spec = None;
+            self.stream_spec = None;
+        }
+        let mut fresh = false;
+        // (DATV mode with a wide scope leaves the channel silent.)
+        if self.datv_mode && self.web_span > NARROW_SPAN_MAX {
+            self.chan_spec = None;
+        } else if let Some(sp) = self.chan_meter.feed(&self.chan) {
+            self.chan_spec = Some(sp);
+            fresh = true;
+        }
+        if self.datv_rx.is_some() || Instant::now() < self.stream_meter_until {
+            if let Some(sp) = self.stream_meter.feed(iq) {
+                self.stream_spec = Some(sp);
+                fresh = true;
+            }
+        } else {
+            self.stream_spec = None;
+        }
+        if fresh {
+            self.update_meter();
+        }
+    }
+
+    /// The band the meter measures, offsets from the dial (Hz): the
+    /// receive filter, or a DATV signal's whole channel.
+    fn meter_band(&self) -> (f64, f64) {
+        if let Some(r) = &self.datv_rx {
+            let half = match r.t2_bw {
+                Some(bw) => bw / 2.0,
+                None => r.sr * 1.35 / 2.0,
+            };
+            return (-half, half);
+        }
+        let (a, b) = (self.filter.0 as f64, self.filter.1 as f64);
+        (a.min(b), a.max(b))
+    }
+
+    /// Raw levels of `[lo, hi]` (offsets from the dial) at the channel, the
+    /// stream and the Maia spectrometer, each where it covers the band, in
+    /// that source's own dBFS.
+    fn raw_levels(&mut self, lo: f64, hi: f64) -> [Option<RawLevel>; 3] {
+        use crate::power::db;
+        let level = |sp: &crate::power::Spectrum, a: f64, b: f64| {
+            sp.covers(a, b).then(|| {
+                let span = (b - a).max(4_000.0);
+                RawLevel {
+                    dbfs: db(sp.band_power(a, b)),
+                    peak_dbfs: db(sp.peak_power(a, b)),
+                    noise_dbfs_hz: sp.noise_density(a, b, span).map(db),
+                    seq: sp.seq,
+                }
+            })
+        };
+        let chan = self.chan_spec.as_ref().and_then(|sp| level(sp, lo, hi));
+        let o = self.rx_eff() - self.center;
+        let stream = self.stream_spec.as_ref().and_then(|sp| level(sp, o + lo, o + hi));
+        // Wide bands: the spectrometer, its rows taken here unless the
+        // scope is reading them (then its last one).
+        let mut maia = None;
+        if chan.is_none() && stream.is_none() {
+            let scope_reads = self.web_span > STREAM_SPAN_MAX && self.web.as_ref().is_some_and(|w| w.clients() > 0);
+            if !scope_reads {
+                if let Some(r) = self.maia.as_ref().and_then(|m| m.try_iter().last()) {
+                    self.maia_last = Some(r);
+                }
+            }
+            if let Some(row) = &self.maia_last {
+                // The row is the AD936x's own spectrum, centred on its LO.
+                let inv = self.xvtr.as_ref().is_some_and(|t| t.inverted);
+                let (a, b) = if inv { (-(o + hi), -(o + lo)) } else { (o + lo, o + hi) };
+                maia = crate::power::maia_band(row, self.cfg.radio.adc_rate as f64, a, b).map(|(p, d)| RawLevel {
+                    dbfs: db(p),
+                    peak_dbfs: db(p),
+                    noise_dbfs_hz: d.map(db),
+                    seq: 0,
+                });
+            }
+        }
+        [chan, stream, maia]
+    }
+
+    /// The RX socket pair in use (1 or 2).
+    fn rx_port(&self) -> u8 {
+        self.radio.port().unwrap_or(1).clamp(1, 2)
+    }
+
+    /// The AD936x's own frequency for the dial (the IF through a transverter).
+    fn hw_freq(&self) -> f64 {
+        let dial = self.rx_eff();
+        self.xvtr.as_ref().map_or(dial, |t| t.to_if(dial))
+    }
+
+    /// A new reading from the latest spectra.
+    fn update_meter(&mut self) {
+        use crate::calib::Quality;
+        let (lo, hi) = self.meter_band();
+        let lv = self.raw_levels(lo, hi);
+        let table = self.calib[self.rx_port() as usize - 1].as_ref();
+        let (sdb, mdb) = table.map_or((0.0, 0.0), |c| (c.stream_db, c.maia_db));
+        let pick = [(0, 0.0, "channel"), (1, sdb, "stream"), (2, mdb, "maia")]
+            .into_iter()
+            .find_map(|(i, add, name)| lv[i].as_ref().map(|r| (r.dbfs + add, r.noise_dbfs_hz.map(|d| d + add), name)));
+        let Some((dbfs, dens, src)) = pick else { return };
+        let g = self.hw_gain_db;
+        let temp = self.temps.lock().ok().and_then(|t| t.ad936x);
+        let (off, quality) = match table {
+            Some(c) => c.offset(g, self.hw_freq(), temp, self.xvtr.as_ref().map(|t| t.name.as_str())),
+            None => {
+                let band = self.cal_band();
+                if self.settings.smeter.get(&band).is_some_and(|v| !v.is_empty()) {
+                    (self.settings.dbm(&band, self.reading_db) - dbfs, Quality::Legacy)
+                } else {
+                    (-g + crate::calib::K_DEFAULT_DB, Quality::None)
+                }
+            }
+        };
+        let bw = (hi - lo).max(1.0);
+        let noise = dens.is_some_and(|d| 10f64.powf(dbfs / 10.0) < 2.0 * 10f64.powf(d / 10.0) * bw);
+        // The scope shows the source its span reads (scope.rs: a full-scale
+        // tone at 0 dBFS, as here).
+        let scope_off = table.map(|_| {
+            if self.web_span <= NARROW_SPAN_MAX {
+                off
+            } else if self.web_span > STREAM_SPAN_MAX && self.maia.is_some() {
+                off + mdb
+            } else {
+                off + sdb
+            }
+        });
+        self.meter = Meter {
+            dbm: dbfs + off,
+            dbm_hz: dens.map(|d| d + off),
+            dbfs,
+            quality,
+            clip: self.stream_peak >= crate::power::CLIP,
+            noise,
+            src,
+            scope_off,
+        };
+        self.stream_peak = 0.0;
+    }
+
+    /// The meter's raw measurement of `[lo_hz, hi_hz]` (absolute, on the
+    /// air; else the meter's band), for the calibration tool. Keeps the
+    /// stream meter running for 10 s.
+    fn meter_raw(&mut self, lo_hz: Option<f64>, hi_hz: Option<f64>) -> serde_json::Value {
+        self.stream_meter_until = Instant::now() + Duration::from_secs(10);
+        let dial = self.rx_eff();
+        let (lo, hi) = match (lo_hz, hi_hz) {
+            (Some(a), Some(b)) if b > a && b - a <= 4e6 => (a - dial, b - dial),
+            _ => self.meter_band(),
+        };
+        let lv = self.raw_levels(lo, hi);
+        let j = |r: &Option<RawLevel>| {
+            r.as_ref().map(|r| serde_json::json!({"dbfs": r.dbfs, "peak_dbfs": r.peak_dbfs, "noise_dbfs_hz": r.noise_dbfs_hz, "seq": r.seq}))
+        };
+        serde_json::json!({"type": "meter_raw", "port": self.rx_port(), "dial_hz": dial, "center_hz": self.center,
+            "hw_freq_hz": self.hw_freq(), "lo_hz": dial + lo, "hi_hz": dial + hi,
+            "hw_gain_db": self.hw_gain_db, "gain_mode": format!("{:?}", self.rx_gain_mode),
+            "temp_c": self.temps.lock().ok().and_then(|t| t.ad936x), "clip": self.meter.clip,
+            "chan": j(&lv[0]), "stream": j(&lv[1]), "maia": j(&lv[2]),
+            "dbm": self.meter.dbm, "cal": self.meter.quality, "xvtr": self.xvtr.as_ref().map(|t| t.name.clone()),
+            "datv": self.datv_mode, "tx": self.tx_on.is_some()})
+    }
+
+    /// Both sockets' tables and per-band status, for SET and the tool.
+    fn calib_json(&self) -> serde_json::Value {
+        let ports: Vec<serde_json::Value> = (1..=2u8)
+            .map(|p| {
+                let c = &self.calib[p as usize - 1];
+                serde_json::json!({"port": p, "table": c, "status": c.as_ref().map(|c| c.status()),
+                    "note": c.as_ref().map(|c| c.note.clone())})
+            })
+            .collect();
+        serde_json::json!({"type": "calib", "port": self.rx_port(), "ports": ports,
+            "bands": crate::calib::BANDS.iter().map(|b| b.0).collect::<Vec<_>>(),
+            "legacy_bands": self.settings.smeter.keys().collect::<Vec<_>>()})
+    }
+
     /// MUTE AT TX and transmitting (or just stopped): the receiver is muted.
     fn rx_quiet(&self) -> bool {
         self.settings.mute_at_tx
@@ -1583,7 +1844,7 @@ impl Trx {
     fn publish_state(&mut self) {
         let can_tx = self.cfg.trx.allow_tx;
         let range = (self.cfg.radio.freq_min_hz, self.cfg.radio.freq_max_hz);
-        let strength = self.settings.dbm(&self.cal_band(), self.reading_db).round() as i32;
+        let strength = self.meter.dbm.round() as i32;
         let rig = RigState {
             vfo_a_hz: self.vfo_a,
             vfo_b_hz: self.vfo_b,
@@ -1733,6 +1994,7 @@ impl Trx {
         } else {
             let reading = self.s_dbfs as f64 - self.hw_gain_db;
             self.reading_db += (reading - self.reading_db) * 0.03;
+            self.feed_meter(iq);
         }
         if let Some(n) = self.notch.as_mut().filter(|_| !self.datv_mode) {
             n.process(&mut self.audio);
@@ -1799,7 +2061,12 @@ impl Trx {
                     .map(|r| scope::render(&r, vfo, CH_RATE, view, span))
             } else if let (true, Some(m)) = (span > STREAM_SPAN_MAX, &self.maia) {
                 let adc = self.cfg.radio.adc_rate as f64;
-                m.try_iter().last().map(|mut r| {
+                let got = m.try_iter().last();
+                // (The level meter measures wide bands on it too.)
+                if let Some(r) = &got {
+                    self.maia_last = Some(r.clone());
+                }
+                got.map(|mut r| {
                     if inverted {
                         r.reverse();
                     }
@@ -2213,7 +2480,6 @@ impl Trx {
             "xvtr": self.xvtr.as_ref().map(|t| t.name.clone()),
             "xvtrs": self.settings.transverters,
             "cal_band": self.cal_band(),
-            "cal_points": self.settings.smeter.get(&self.cal_band()).map_or(0, |v| v.len()),
         });
         if let (Some(v), serde_json::Value::Object(m)) = (v.as_object_mut(), more) {
             v.extend(m);
@@ -2287,7 +2553,8 @@ impl Trx {
             let cw = self.cwlive.readout().map(|r| {
                 serde_json::json!({"tone_hz": r.tone_hz.round(), "wpm": r.wpm.round(), "snr_db": r.snr_db.round(), "locked": r.locked})
             });
-            let dbm = self.settings.dbm(&self.cal_band(), self.reading_db);
+            let mt = &self.meter;
+            let dbm = mt.dbm;
             let datv = self.datv.as_ref().map(|d| serde_json::json!({"backlog": (d.mux.backlog_s() * 10.0).round() / 10.0, "dropped": d.mux.dropped_frames}));
             let s = &self.datv_rx_stats;
             let datv_rx = (self.datv_rx.is_some() || self.datv_auto).then(|| serde_json::json!({"auto": self.datv_auto.then(|| self.datv_auto_note.clone()), "rx": self.datv_rx.is_some(), "locked": s.locked, "esn0": (s.esn0_db * 10.0).round() / 10.0,
@@ -2298,6 +2565,8 @@ impl Trx {
                 "si": self.datv_rx.as_ref().map(|r| r.si().json())}));
             w.send_json(&serde_json::json!({"type": "meter", "s_dbfs": self.s_dbfs, "tx": tx, "rx_gain_db": self.hw_gain_db, "cw": cw, "datv": datv, "datv_rx": datv_rx, "txm": txm,
                 "dbm": (dbm * 10.0).round() / 10.0, "s": crate::settings::s_units(self.rx_eff(), dbm),
+                "dbm_hz": mt.dbm_hz.map(|d| (d * 10.0).round() / 10.0), "cal": mt.quality, "clip": mt.clip, "noise": mt.noise,
+                "msrc": mt.src, "dbfs": (mt.dbfs * 10.0).round() / 10.0, "scope_dbm_off": mt.scope_off.map(|d| (d * 10.0).round() / 10.0),
                 "reading": (self.reading_db * 10.0).round() / 10.0, "sq": self.squelch_open}));
         }
         if self.web_state_at.elapsed() >= Duration::from_millis(100) {
@@ -2620,18 +2889,49 @@ impl Trx {
                     }
                 }
             }
-            "smeter_cal" => {
-                if let Some(dbm) = num("dbm") {
-                    let band = self.cal_band();
-                    self.settings.add_cal(&band, self.reading_db, dbm);
-                    self.settings.save(&self.settings_dir);
-                    info!(band, reading = self.reading_db, dbm, "S-meter calibration point");
+            "meter_raw" => {
+                let r = self.meter_raw(num("lo_hz"), num("hi_hz"));
+                if let Some(w) = &self.web {
+                    w.send_json_to(client, &r);
                 }
             }
-            "smeter_clear" => {
-                let band = self.cal_band();
-                self.settings.smeter.remove(&band);
-                self.settings.save(&self.settings_dir);
+            "calib_get" => {
+                let r = self.calib_json();
+                if let Some(w) = &self.web {
+                    w.send_json_to(client, &r);
+                }
+            }
+            "calib_set" | "calib_clear" => {
+                let port = num("port").map_or(0, |p| p as u8);
+                let res = if !(1..=2).contains(&port) {
+                    Err("port must be 1 or 2".to_string())
+                } else if cmd == "calib_clear" {
+                    crate::calib::Calib::remove(&self.settings_dir, port).map(|_| None)
+                } else {
+                    serde_json::from_value::<crate::calib::Calib>(m["table"].clone())
+                        .map_err(|e| e.to_string())
+                        .and_then(|mut c| {
+                            c.validate()?;
+                            c.normalise();
+                            c.save(&self.settings_dir, port)?;
+                            Ok(Some(c))
+                        })
+                };
+                let reply = match res {
+                    Ok(c) => {
+                        info!(port, points = c.as_ref().map_or(0, |c| c.k.len()), "{cmd}");
+                        self.calib[port as usize - 1] = c;
+                        serde_json::json!({"type": "calib_ack", "cmd": cmd, "port": port, "ok": true})
+                    }
+                    Err(e) => {
+                        warn!(port, "{cmd}: {e}");
+                        serde_json::json!({"type": "calib_ack", "cmd": cmd, "port": port, "ok": false, "error": e})
+                    }
+                };
+                if let Some(w) = &self.web {
+                    w.send_json_to(client, &reply);
+                    w.send_json_to(client, &self.calib_json());
+                }
             }
             "cw_engine" => self.cwlive.set_engine(m["engine"].as_str().unwrap_or("timing")),
             "decoder" => {
@@ -2867,6 +3167,90 @@ mod tests {
         t.set_vfo(Vfo::A, 146_010_000.0);
         assert!(t.tx_on.is_none());
         assert_eq!(after_rf_on(&log).first().map(String::as_str), Some("rf off"));
+    }
+
+    /// Feed `secs` of stream with a tone of amplitude `amp` at `off_hz` from
+    /// the dial, scaled by `gain_db` (the front end), through the engine.
+    fn feed_tone(t: &mut Trx, amp: f64, off_hz: f64, gain_db: f64, secs: f64) {
+        let rate = t.rate;
+        let f = t.rx_eff() + off_hz - t.center;
+        let a = amp * 10f64.powf(gain_db / 20.0);
+        let n = (secs * rate) as usize;
+        let mut i = 0usize;
+        while i < n {
+            let iq: Vec<Complex32> = (i..i + t.block)
+                .map(|k| {
+                    let p = 2.0 * std::f64::consts::PI * f * k as f64 / rate;
+                    Complex32::new((a * p.cos()) as f32, (a * p.sin()) as f32)
+                })
+                .collect();
+            t.receive(&RxBlock { t0: 0.0, iq });
+            i += t.block;
+        }
+    }
+
+    #[test]
+    fn the_level_meter_reads_the_same_in_every_mode_filter_and_gain() {
+        let (mut t, _log) = trx(144_300_000.0);
+        // -60 dBFS at the converter with 0 dB of front-end gain.
+        let amp = 1e-3;
+        let mut seen = Vec::new();
+        for (mode, gain) in [(Mode::Usb, 40.0), (Mode::Cw, 40.0), (Mode::Am, 40.0), (Mode::Nfm, 40.0), (Mode::Usb, 10.0), (Mode::Cw, 65.0)] {
+            t.set_mode(mode);
+            t.rx_gain_db = gain;
+            t.hw_gain_db = gain;
+            feed_tone(&mut t, amp, 700.0, gain, 1.5);
+            assert_eq!(t.meter.src, "channel");
+            // Uncalibrated: dBm = dBFS - G + K_DEFAULT, so dBFS - G is what
+            // must not move.
+            seen.push((mode, gain, t.meter.dbfs - gain, t.meter.dbm));
+        }
+        let first = seen[0].2;
+        for (mode, gain, v, _) in &seen {
+            assert!((v - first).abs() < 0.1, "{mode:?} at {gain} dB: {v} vs {first}");
+        }
+        // The shared channel filter passes the tone at (nearly) unity gain.
+        assert!((first - -60.0).abs() < 0.5, "{first}");
+        let dbm: Vec<f64> = seen.iter().map(|x| x.3).collect();
+        assert!(dbm.iter().all(|d| (d - dbm[0]).abs() < 0.1), "{dbm:?}");
+    }
+
+    #[test]
+    fn a_calibration_table_turns_the_reading_into_dbm() {
+        use crate::calib::{Calib, KPoint, Quality};
+        let (mut t, _log) = trx(144_300_000.0);
+        // K such that this tone is -80 dBm: dBm = dBFS - G + K.
+        let k = -80.0 - (-60.0);
+        let c = Calib { version: 1, k: vec![KPoint { f: 144.3e6, k, src: "test".into(), date: String::new(), t: None }], ..Default::default() };
+        t.calib[0] = Some(c);
+        for gain in [20.0, 50.0] {
+            t.rx_gain_db = gain;
+            t.hw_gain_db = gain;
+            feed_tone(&mut t, 1e-3, 700.0, gain, 1.5);
+            assert!((t.meter.dbm - -80.0).abs() < 0.5, "{gain}: {}", t.meter.dbm);
+            assert_eq!(t.meter.quality, Quality::Calibrated);
+            assert!(!t.meter.noise);
+        }
+        // Another socket pair has no table.
+        assert!(t.calib[1].is_none());
+        let j = t.calib_json();
+        assert_eq!(j["ports"][0]["status"][2]["band"], "2m");
+        assert_eq!(j["ports"][0]["status"][2]["status"], "calibrated");
+        let raw = t.meter_raw(Some(144.3e6 + 200.0), Some(144.3e6 + 1200.0));
+        assert!((raw["chan"]["dbfs"].as_f64().unwrap() - (-60.0 + 50.0)).abs() < 0.5, "{raw}");
+    }
+
+    #[test]
+    fn old_smeter_points_apply_only_without_a_table() {
+        use crate::calib::{Calib, KPoint, Quality};
+        let (mut t, _log) = trx(144_300_000.0);
+        let band = t.cal_band();
+        t.settings.add_cal(&band, -100.0, -93.0);
+        feed_tone(&mut t, 1e-3, 700.0, 40.0, 1.5);
+        assert_eq!(t.meter.quality, Quality::Legacy);
+        t.calib[0] = Some(Calib { version: 1, k: vec![KPoint { f: 144.3e6, k: 0.0, src: String::new(), date: String::new(), t: None }], ..Default::default() });
+        feed_tone(&mut t, 1e-3, 700.0, 40.0, 1.5);
+        assert_eq!(t.meter.quality, Quality::Calibrated);
     }
 
     #[test]

@@ -53,8 +53,10 @@ stop() {
 	sleep 1
 	killall -9 trxd 2>/dev/null
 	rf_off
-	# No PL DMA left writing RAM into a reboot (or the next bitstream).
-	[ -x /usr/sbin/fpga-mode ] && /usr/sbin/fpga-mode stop-dma >/dev/null 2>&1
+	# No PL DMA left writing RAM into a reboot (rcK stops trxd this way).
+	# Not on a restart: a trxd started on a bitstream just quiesced this
+	# way hung the board (2026-10-02, cause not found yet).
+	[ "$1" = restart ] || { [ -x /usr/sbin/fpga-mode ] && /usr/sbin/fpga-mode stop-dma >/dev/null 2>&1; }
 	rm -f "$PIDFILE"
 	echo "OK"
 }
@@ -62,7 +64,7 @@ stop() {
 case "$1" in
 	start) start ;;
 	stop) stop ;;
-	restart|reload) stop; sleep 1; start ;;
+	restart|reload) stop restart; sleep 1; start ;;
 	rf-off) rf_off "$2" ;;
 	*) echo "Usage: $0 {start|stop|restart|rf-off}"; exit 1 ;;
 esac

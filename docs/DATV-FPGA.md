@@ -324,3 +324,141 @@ RAM (4 posterior banks 16200 x 8, 4 state banks 8100 x 30). The first
 build missed 100 MHz by 0.1 ns on four decoder paths (ROM -> address ->
 RAM, pass 1 -> result FIFO, pass 2 -> unsat, pass 2 -> rotated write):
 each has a register now.
+
+## DVB-S2 soft bits in the FPGA (stage 1 of 3, 2026-10-02)
+
+The A9 no longer makes, quantizes or lays out the 64 800 LLRs of a long
+frame. It hands the LDPC engine (`ldpc_dma.py`, "LDP6") the frame's data
+symbols as cells instead: derotated (phase still tracked on the A9),
+descrambled, times `s2cells::gain` (the constellation on radius 64), as
+8-bit I/Q, two a word, plus one per-frame noise scale `kq` (0xFF24). The
+engine makes the LLRs and writes them where the decoder wants them:
+
+- QPSK (1/2, 3/4): the DVB-T2 QPSK cells path, unrotated (0xFF20 = 1):
+  bit 2 j from I, 2 j + 1 from Q.
+- 8PSK 3/4 (0xFF20 bit 4, features 0xFF30 bit 3): three LLRs a cell,
+  max-log over the eight points (correlations in Q14, 1/sqrt 2 as 11585;
+  labels via PSK8_PHASE), and the 3-column bit interleaver undone (bit m of
+  cell j is variable m 21600 + j; column 2 crosses K, the parity part as
+  p = c q + r, no parity interleaving in DVB-S2). One extra cycle a cell
+  (C_PREP) for the max trees.
+
+Bit for bit with trxd `dvbs2/s2cells.rs` (`test_ldpc_dma.py
+test_cells_psk8`, full-scale and -128 cells included). An older bitstream
+(no feature bit 3) gets its 8PSK LLRs from the model on the A9, QPSK
+through the old cells path; `TRXD_S2_FLOAT_LLR=1` brings back the float
+LLRs of before. Decoding margin unchanged (`rx.rs cells_margin`: the same
+noisy frames at 0.4 dB steps around each threshold decode alike, within a
+frame of 39). Per frame the A9 now packs 10 800 (8PSK) or 16 200 (QPSK)
+cell words and copies them to DDR, instead of 64 800 float-to-6-bit
+conversions and the parity permutation (4.6 ms a frame on the A9 before).
+The demodulator also steps a rotator between known blocks instead of a
+sine and cosine a symbol, and computes the 8PSK decision (only for the
+MER shown) on every fourth symbol.
+
+## DVB-S2 frames straight from the ring (stage 2 of 3, 2026-10-02)
+
+The CPU no longer touches the data symbols of a long frame. The LDPC
+engine's DMA reads them from the receive ring where the recorder left them,
+and a new block in front of the demapper (maia-hdl `s2front.py`, model
+`src/trxd/src/dvbs2/s2ring.rs`, bit-exact) turns, descrambles and scales
+them into the stage-1 cells.
+
+Per frame the receiver (`rx.rs`, ring mode) still:
+- finds and tracks the headers (the FPGA's flags, then its header
+  correlation at those few positions; other PLS codes stepped over);
+- fits the carrier from the known blocks (header, pilots, next header),
+  as before;
+- measures the amplitude and noise on the known symbols, and the MER and
+  the constellation on every 32nd data symbol;
+- hands the engine a job: where the frame's first data symbol is (an
+  absolute ring position, from the recorder's wrap counter), and per data
+  group (1440 symbols between pilot blocks) the angle of its first symbol
+  and the step per symbol (the AFC's mixer less the carrier fit: both are
+  linear inside a group), the gain and kq.
+
+The ring reader takes a block's absolute position and the address it
+copies up to from one consistent read of the recorder (wrap counter,
+committed address, wrap counter). The first stage-2 image read the
+committed address apart from the wrap counter: the DMA moved between the
+two, every block came out a few words off, the receiver saw a gap each
+time, lost lock and about half the frames, and the TS broke (over the air
+2026-10-02: 430 of 1012 frames at 8PSK 500k). `ring_stream_at_real_rates`
+(recorder model with time passing between register reads, reads every 5 ms
+with late ones, decoder queue and latency) reproduced it (28 of 60 frames)
+and passes since (59 of 60, every packet in order).
+
+Symbols are made from the ring's raw words only where the receiver looks
+(headers, pilots, the sampled data), with the AFC's mixer as a function of
+the absolute symbol position (a retune changes it from the next header on).
+
+Fixed point (s2front.py): the angle A + t B (32 bits a turn) rounded to 16
+bits, plus (4 - R_j) quarter turns of descrambling (R the PL scrambling
+sequence, generated in the block), a +-90 degree pre-rotation and a 12-step
+CORDIC (no multipliers), then x G >> 20 saturated to i8 (two DSPs; G has
+the CORDIC gain in it). The 32-entry segment table is LUT RAM.
+
+Registers (ldpc_axi, besides stage 1): 0xFF20 bit 5 ring mode; 0xFF34 ring
+start, 0xFF38 ring end; 0xFF3C gain (16:0), lead (28:24, words before the
+frame's first symbol in its 128-byte aligned first beat), bit 31 pilots;
+0xFF40 / 0xFF44 segment angle / step, 0xFF48 write them at entry (4:0).
+0xFF30 bit 4 says the core has it. The DMA's read address wraps at the ring
+end; 0xFF18 counts the words with the lead (16 bits now).
+
+A frame is decoded only if it is still wholly in the ring, with 32768 words
+(65 ms at 500 kS/s) of margin, before and after the engine read it; one the
+recorder overwrote first (the decoder far behind) is counted in the
+receiver stats as `ring_lapped` and lost. Without the wrap counter, the
+feature bit, or with `TRXD_S2_NO_RING=1` (an A/B on the board) the stage-1
+path runs.
+
+PC model, 250 kS/s, the receiver's own time per frame (the ARM's share is
+the same ratio): QPSK 1/2 0.28 ms (stage 1: 1.05 ms), 8PSK 3/4 0.22 ms
+(0.87 ms); `cargo test --release ring_demod_time -- --ignored --nocapture`.
+Decoding margin unchanged against the symbol path on the same noisy words
+(`ring_matches_the_symbol_path`: equal frames at 8PSK 8.2 dB, QPSK 1/2 1.0
+and 1.4 dB; one frame of 29 apart at 8PSK 7.7 dB and QPSK 3/4 4 dB, either
+way within the noise of 29 frames).
+
+Libre DATV bitstream: LUT 78.7 % (+2.1 points), registers 36.5 %, BRAM
+92.5 % (unchanged), DSP 202 of 220 (+2); WNS +0.013 ns after post-route
+phys_opt (-0.069 ns routed): met, but there is no slack left. Stage 3 (BCH,
+descrambling in the fabric) will need room freed first.
+
+## BCH and descrambling in the FPGA (stage 3 of 3, 2026-10-02)
+
+The A9 no longer unpacks the decisions, divides them by the BCH generator
+or descrambles the BBFRAME. With 0xFF20 bit 6 (features 0xFF30 bit 5) the
+LDPC engine's store stage (`ldpc_dma.py`, model `src/trxd/src/dvbs2/bbout.rs`,
+bit-exact) does it while the decisions go out, four a cycle:
+
+- the BCH division: the first Nbch decisions (the info part, natural order
+  in the decoder's RAM; 32400 / 48600) through a 192-bit LFSR, r = r x + b
+  mod g(x), g the product of Table 6a's g1..g12 (the same code for DVB-S2
+  and DVB-T2 normal frames at 1/2 and 3/4); the remainder in 0xFF4C (bits
+  31:0) .. 0xFF60 (191:160), status bit 3 when it is zero;
+- the BB descrambler (1 + x^14 + x^15) over the first Kbch = Nbch - 192;
+- the packing MSB first a byte at a time (variable 32 k + 8 c + r at bit
+  8 c + 7 - r of word k): the buffer is the BBFRAME's bytes in order.
+
+The receiver (`rx.rs` `Fec`, normal frames) takes the Kbch / 8 bytes as the
+BBFRAME; only a non-zero remainder (rare after LDPC) costs anything: the
+syndromes from the 192-bit remainder, Berlekamp-Massey and the Chien search
+on the A9 (`bch.rs correct_bytes`), the wrong bits flipped in the bytes.
+A decode that runs in this mode and gives nothing (a time-out) is a lost
+frame (its bits were not written). The T2 receiver goes the same way (same
+code, same Kbch). Without the feature bit, on the model, or with
+`TRXD_S2_SW_BCH=1` (an A/B on the board) the bits path as before.
+
+One more register stage in the store pipeline (the four decisions of a RAM
+word, then the LFSR, the scrambler and the packing): no BRAM, no DSP.
+
+Tests: maia-hdl `test_ldpc_dma.py test_bb` (the three vectors of
+ldpc_long.json decoded, words, remainder and zero flag against the model);
+`vectors/bbout.json` ties the Python model to the Rust one
+(`BBOUT_VECTORS=... cargo test --release bbout_vectors -- --ignored`);
+`bbout.rs bytes_and_remainder_correct_as_bits_do` (a codeword's BBFRAME,
+1..12 errors corrected in the bytes, 13 refused). The A9's share before:
+`bits_out_ms` 0.4-0.64 and `bch_ms` 0.37-0.6 a block (board log); PC
+`cargo test --release bb_arm_time -- --ignored --nocapture`: 0.036 ms
+against nothing measurable.

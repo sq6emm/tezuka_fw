@@ -26,6 +26,14 @@
 //! that times out keeps the decoder until it is idle again, and an engine
 //! that stays busy is left alone ([`STUCK`]) with the frames decoded by the
 //! model in software, slowly, until it comes back.
+//!
+//! BBFRAME out (features bit 5, 0xFF20 bit 6; ldpc_dma.py `bb`): the
+//! decisions come back packed MSB first a byte at a time, the first Kbch
+//! descrambled, so the buffer starts with the BBFRAME's bytes; the BCH
+//! remainder of the first Nbch is in 0xFF4C..0xFF60 (status bit 3: zero, a
+//! valid codeword). The receiver ([`Ldpc::want_bb`]) then neither unpacks
+//! bits nor divides by g(x) nor descrambles: [`Ldpc::take_bb`].
+//! TRXD_S2_SW_BCH=1: not used (the bits as before, for an A/B on a board).
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
@@ -72,6 +80,8 @@ pub struct Window {
     qam16: bool,
     /// 0xFF30 (0 on older cores): bit 0 finished counter, bit 1 AXI error.
     feat: u32,
+    /// BBFRAME out and the BCH remainder in the fabric (features bit 5).
+    bb: bool,
 }
 
 // SAFETY: owned by the decoding thread alone.
@@ -93,7 +103,7 @@ impl Window {
         if p == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error().to_string());
         }
-        let mut w = Window { _mem: mem, ptr: p.cast(), lanes: 0, dma: None, qam16: false, feat: 0 };
+        let mut w = Window { _mem: mem, ptr: p.cast(), lanes: 0, dma: None, qam16: false, feat: 0, bb: false };
         // A bitstream without the decoder has nothing at this address: the
         // read raises a bus error. Look from a child process first.
         static LANES: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -103,7 +113,8 @@ impl Window {
         }
         w.lanes = lanes.min(4);
         w.qam16 = lanes == 6;
-        w.feat = w.rd(0xFF30) & 7;
+        w.feat = w.rd(0xFF30) & 63;
+        w.bb = w.feat & 32 != 0 && std::env::var_os("TRXD_S2_SW_BCH").is_none();
         if lanes >= 5 && std::path::Path::new(DT_DMA).exists() && std::env::var_os("TRXD_NO_LDPC_DMA").is_none() {
             // SAFETY: MAP_SHARED of the reserved (no-map) buffer memory;
             // accessed below as aligned words inside it, unmapped on drop.
@@ -208,8 +219,27 @@ fn pack(q: &mut [u32], perm: &[u32], k: usize, v: impl Fn(usize) -> u32) {
 /// `ddr_in`: the words are in DDR there already (the cell router's frame
 /// buffer; `q` only gives their count).
 #[allow(clippy::too_many_arguments)]
-fn run_fpga(win: &Window, rate: LongRate, q: &mut [u32], max_iter: u32, need: usize, bits: &mut [u8], t_q: std::time::Instant, cells: Option<&crate::dvbt2::stream::CellParams>, ddr_in: Option<u32>) -> Result<Option<usize>, Stuck> {
+fn run_fpga(win: &Window, rate: LongRate, q: &mut [u32], max_iter: u32, need: usize, bits: &mut [u8], bb: &mut BbOut, t_q: std::time::Instant, cells: Option<&crate::dvbt2::stream::CellParams>, ddr_in: Option<u32>) -> Result<Option<usize>, Stuck> {
+    run_fpga_ring(win, rate, q, max_iter, need, bits, bb, t_q, cells, ddr_in, None)
+}
+
+/// What the engine needs to read a DVB-S2 frame from the receive ring
+/// (s2ring): its first word (128-aligned) and how many to read with the
+/// lead, the ring, the gain and lead word, the segment table.
+struct RingRegs<'a> {
+    in_addr: u32,
+    in_words: u32,
+    gain_lead: u32,
+    segs: &'a [(u32, u32)],
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_fpga_ring(win: &Window, rate: LongRate, q: &mut [u32], max_iter: u32, need: usize, bits: &mut [u8], bb: &mut BbOut, t_q: std::time::Instant, cells: Option<&crate::dvbt2::stream::CellParams>, ddr_in: Option<u32>, ring: Option<&RingRegs>) -> Result<Option<usize>, Stuck> {
     use std::sync::atomic::Ordering::Relaxed;
+    bb.valid = false;
+    bb.tried = false;
+    // BBFRAME out: only for a caller that takes it, through the DDR engine.
+    let bb_on = bb.want && win.bb && win.dma.is_some();
     let _one = DECODER.lock().unwrap_or_else(|e| e.into_inner());
     // Never touch the registers or the buffers of a decode still running.
     let stuck = STUCK.load(Relaxed);
@@ -238,22 +268,35 @@ fn run_fpga(win: &Window, rate: LongRate, q: &mut [u32], max_iter: u32, need: us
         win.wr(0xFF14, (DMA_PHYS as usize + DMA_OUT) as u32);
         win.wr(0xFF18, q.len() as u32);
         win.wr(0xFF1C, out_words as u32);
+        if let Some(r) = ring {
+            win.wr(0xFF10, r.in_addr);
+            win.wr(0xFF18, r.in_words);
+            win.wr(0xFF34, super::fpga::RING_START);
+            win.wr(0xFF38, super::fpga::RING_END);
+            win.wr(0xFF3C, r.gain_lead);
+            for (i, &(a, b)) in r.segs.iter().enumerate() {
+                win.wr(0xFF40, a);
+                win.wr(0xFF44, b);
+                win.wr(0xFF48, i as u32);
+            }
+        }
         match cells {
             Some(p) => {
-                win.wr(0xFF20, 1 | (p.rot as u32) << 1 | (p.qam16.is_some() as u32) << 3);
+                win.wr(0xFF20, 1 | (p.rot as u32) << 1 | (p.qam16.is_some() as u32) << 3 | (p.psk8 as u32) << 4 | (ring.is_some() as u32) << 5 | (bb_on as u32) << 6);
                 win.wr(0xFF24, p.kq as u32);
                 win.wr(0xFF28, (p.c14 as u32 & 0xFFFF) | (p.s14 as u32) << 16);
                 if p.qam16.is_some() {
                     win.wr(0xFF2C, p.a14 as u32);
                 }
             }
-            None => win.wr(0xFF20, 0),
+            None => win.wr(0xFF20, (bb_on as u32) << 6),
         }
         ctl |= 4;
     } else {
         win.write_words(0, q);
     }
     let t_in = std::time::Instant::now();
+    bb.tried = bb_on;
     win.wr(0xFF00, ctl);
     // 2.5 ms an iteration: sleep in small steps until done.
     let t0 = std::time::Instant::now();
@@ -284,11 +327,26 @@ fn run_fpga(win: &Window, rate: LongRate, q: &mut [u32], max_iter: u32, need: us
     if let Some(d) = win.dma {
         // packed: bit j of word k is variable 32 k + j (the info part is in
         // natural order in the RAM)
-        let mut w = vec![0u32; out_words];
-        // SAFETY: the mapped buffers: out_words (<= 2048) words at DMA_OUT.
-        unsafe { std::ptr::copy_nonoverlapping(d.add(DMA_OUT / 4), w.as_mut_ptr(), out_words) };
-        for (i, b) in bits[..need].iter_mut().enumerate() {
-            *b = ((w[i / 32] >> (i % 32)) & 1) as u8;
+        if bb_on {
+            // the BBFRAME's bytes (and the parity after them), as they are
+            let nbytes = need / 8;
+            bb.bytes.resize(nbytes, 0);
+            // SAFETY: the mapped buffers: nbytes <= out_words * 4 bytes at DMA_OUT.
+            unsafe { std::ptr::copy_nonoverlapping(d.add(DMA_OUT / 4).cast::<u8>(), bb.bytes.as_mut_ptr(), nbytes) };
+            bb.rem = if st & 8 != 0 {
+                [0; 3]
+            } else {
+                let r: Vec<u64> = (0..6).map(|n| win.rd(0xFF4C + 4 * n) as u64).collect();
+                [r[0] | r[1] << 32, r[2] | r[3] << 32, r[4] | r[5] << 32]
+            };
+            bb.valid = true;
+        } else {
+            let mut w = vec![0u32; out_words];
+            // SAFETY: the mapped buffers: out_words (<= 2048) words at DMA_OUT.
+            unsafe { std::ptr::copy_nonoverlapping(d.add(DMA_OUT / 4), w.as_mut_ptr(), out_words) };
+            for (i, b) in bits[..need].iter_mut().enumerate() {
+                *b = ((w[i / 32] >> (i % 32)) & 1) as u8;
+            }
         }
     } else {
         let words = need.div_ceil(4);
@@ -358,10 +416,41 @@ pub fn cells_available() -> bool {
     *CELLS.get_or_init(|| Window::open().is_ok_and(|w| w.dma.is_some()) && std::env::var_os("TRXD_NO_LDPC_CELLS").is_none())
 }
 
+/// DVB-S2 8PSK cells (0xFF30 bit 3: the max-log demapper and the 3-column
+/// deinterleaver in the engine)?
+pub fn psk8_cells_available() -> bool {
+    static CELLS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELLS.get_or_init(|| cells_available() && Window::open().is_ok_and(|w| w.feat & 8 != 0))
+}
+
+/// DVB-S2 long frames straight from the receive ring (0xFF30 bit 4:
+/// s2front.py, the CPU no longer touches the data symbols)?
+pub fn ring_available() -> bool {
+    static RING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RING.get_or_init(|| psk8_cells_available() && Window::open().is_ok_and(|w| w.feat & 16 != 0) && std::env::var_os("TRXD_S2_NO_RING").is_none())
+}
+
 /// And 16QAM cells (four LLRs a cell and the bit deinterleaver there too)?
 pub fn cells16_available() -> bool {
     static CELLS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CELLS.get_or_init(|| cells_available() && Window::open().is_ok_and(|w| w.qam16))
+}
+
+/// A decode's BBFRAME from the fabric ([`Ldpc::take_bb`]).
+#[derive(Default)]
+pub struct BbOut {
+    /// The decisions as bytes, MSB first: the BBFRAME (descrambled), then
+    /// the BCH and LDPC parity.
+    pub bytes: Vec<u8>,
+    /// The BCH remainder of the first Nbch decisions (zero: valid).
+    pub rem: super::bch::Reg,
+    /// Filled by the last decode and not taken yet.
+    valid: bool,
+    /// The last decode ran in this mode (its bits were not written, even
+    /// when it produced nothing: a time-out).
+    tried: bool,
+    /// The caller takes BBFRAMEs (and not bits) from FPGA decodes.
+    want: bool,
 }
 
 pub enum Ldpc {
@@ -371,7 +460,7 @@ pub enum Ldpc {
     /// `perm` (four-lane decoder): for each parity byte of the RAM in
     /// order, its parity bit.
     /// `model`: the software decoder, made when the engine is stuck.
-    Fpga { win: Window, rate: LongRate, q: Vec<u32>, max_iter: u32, need: usize, perm: Vec<u32>, model: Option<Box<FpgaDecoder>> },
+    Fpga { win: Window, rate: LongRate, q: Vec<u32>, max_iter: u32, need: usize, perm: Vec<u32>, model: Option<Box<FpgaDecoder>>, bb: BbOut },
 }
 
 impl Ldpc {
@@ -384,12 +473,49 @@ impl Ldpc {
             Ok(win) => {
                 tracing::info!(?rate, lanes = win.lanes, dma = win.dma.is_some(), "LDPC: the FPGA decoder");
                 let perm = if win.lanes == 4 { parity_layout(rate) } else { Vec::new() };
-                Ldpc::Fpga { win, rate, q: vec![0; N / 4], max_iter: MAX_ITER, need: (spec.kbch + 192).min(N), perm, model: None }
+                Ldpc::Fpga { win, rate, q: vec![0; N / 4], max_iter: MAX_ITER, need: (spec.kbch + 192).min(N), perm, model: None, bb: BbOut::default() }
             }
             Err(e) => {
                 tracing::info!(?rate, "LDPC: FPGA decoder unavailable ({e}); its model in software");
                 Ldpc::Model(FpgaDecoder::new(rate))
             }
+        }
+    }
+
+    /// The caller takes the BBFRAME bytes and BCH remainder of FPGA
+    /// decodes ([`Self::take_bb`]) where the engine makes them; decodes it
+    /// does not (no engine, an older core, the model) still fill the bits.
+    pub fn want_bb(&mut self) {
+        if let Ldpc::Fpga { bb, .. } = self {
+            bb.want = true;
+        }
+    }
+
+    /// The last decode's BBFRAME from the fabric (its bits were not
+    /// unpacked then); give the buffer back with [`Self::return_bb`].
+    pub fn take_bb(&mut self) -> Option<(Vec<u8>, super::bch::Reg)> {
+        match self {
+            Ldpc::Fpga { bb, .. } if bb.valid => {
+                bb.valid = false;
+                bb.tried = false;
+                Some((std::mem::take(&mut bb.bytes), bb.rem))
+            }
+            _ => None,
+        }
+    }
+
+    /// The last decode ran with the BBFRAME out but gave nothing (its bits
+    /// are not this frame's either): lost.
+    pub fn bb_lost(&mut self) -> bool {
+        match self {
+            Ldpc::Fpga { bb, .. } => std::mem::take(&mut bb.tried) && !bb.valid,
+            _ => false,
+        }
+    }
+
+    pub fn return_bb(&mut self, v: Vec<u8>) {
+        if let Ldpc::Fpga { bb, .. } = self {
+            bb.bytes = v;
         }
     }
 
@@ -409,15 +535,15 @@ impl Ldpc {
     /// deinterleavers): the FPGA's DDR engine makes the LLRs; anywhere else
     /// they are made here, the same ([`crate::dvbt2::stream::cell_llrs`]).
     pub fn decode_cells(&mut self, cells: &[[i8; 2]], p: &crate::dvbt2::stream::CellParams, bits: &mut [u8]) -> Option<usize> {
-        if let Ldpc::Fpga { win, rate, q, max_iter, need, .. } = self {
-            let per_cell = if p.qam16.is_some() { 4 } else { 2 };
-            if win.dma.is_some() && cells.len() * per_cell == N && (p.qam16.is_none() || win.qam16) {
+        if let Ldpc::Fpga { win, rate, q, max_iter, need, bb, .. } = self {
+            let per_cell = if p.psk8 { 3 } else if p.qam16.is_some() { 4 } else { 2 };
+            if win.dma.is_some() && cells.len() * per_cell == N && (p.qam16.is_none() || win.qam16) && (!p.psk8 || win.feat & 8 != 0) {
                 let t_q = std::time::Instant::now();
                 for (w, c) in q.iter_mut().zip(cells.chunks_exact(2)) {
                     *w = (c[0][0] as u8 as u32) | (c[0][1] as u8 as u32) << 8 | (c[1][0] as u8 as u32) << 16 | (c[1][1] as u8 as u32) << 24;
                 }
                 let words = cells.len() / 2;
-                if let Ok(r) = run_fpga(win, *rate, &mut q[..words], *max_iter, *need, bits, t_q, Some(p), None) {
+                if let Ok(r) = run_fpga(win, *rate, &mut q[..words], *max_iter, *need, bits, bb, t_q, Some(p), None) {
                     return r;
                 }
             }
@@ -426,15 +552,48 @@ impl Ldpc {
         self.decode_q(&llr, bits)
     }
 
+    /// A DVB-S2 long frame the engine reads from the receive ring itself
+    /// (s2ring). Ok(None) when it did not decode; Err(()) when the frame is
+    /// no longer (or not wholly) in the ring, or there is no engine for it.
+    pub fn decode_ring(&mut self, job: &super::s2ring::Job, watch: &super::fpga::RingWatch, bits: &mut [u8]) -> Result<Option<usize>, ()> {
+        use super::fpga::{RING_WORDS, ring_addr};
+        let Ldpc::Fpga { win, rate, q, max_iter, need, bb, .. } = self else { return Err(()) };
+        if win.dma.is_none() || win.feat & 16 == 0 {
+            return Err(());
+        }
+        let nsym = super::s2ring::frame_symbols(job.n_cells, job.pilots) as u64;
+        let lead = job.at % 32;
+        // The frame's start must stay in the ring until the engine has read
+        // it all (a few ms): margin for that at any rate here.
+        match watch.ahead_of(job.at) {
+            Some(a) if super::s2ring::in_ring(a, nsym) => {}
+            _ => return Err(()),
+        }
+        let p = super::s2cells::params(job.bps as usize, job.kq);
+        let r = RingRegs {
+            in_addr: ring_addr(job.at - lead),
+            in_words: (lead + nsym) as u32,
+            gain_lead: job.gain | (lead as u32) << 24 | (job.pilots as u32) << 31,
+            segs: &job.segs,
+        };
+        let t_q = std::time::Instant::now();
+        let res = run_fpga_ring(win, *rate, &mut q[..1], *max_iter, *need, bits, bb, t_q, Some(&p), Some(r.in_addr), Some(&r)).map_err(|_| ())?;
+        // read while the DMA still had the start? (lapped during the decode)
+        match watch.ahead_of(job.at) {
+            Some(a) if a < RING_WORDS => Ok(res),
+            _ => Err(()),
+        }
+    }
+
     /// A DVB-T2 QPSK block whose cells the FPGA's cell router put in DDR at
     /// `addr` (only with the FPGA decoder's DDR engine: None otherwise).
     pub fn decode_ddr(&mut self, addr: u32, p: &crate::dvbt2::stream::CellParams, bits: &mut [u8]) -> Option<usize> {
-        if let Ldpc::Fpga { win, rate, q, max_iter, need, .. } = self {
+        if let Ldpc::Fpga { win, rate, q, max_iter, need, bb, .. } = self {
             if win.dma.is_some() && (p.qam16.is_none() || win.qam16) {
                 let t_q = std::time::Instant::now();
                 let words = if p.qam16.is_some() { N / 8 } else { N / 4 };
                 // (stuck: the cells are only in DDR, the block is lost)
-                return run_fpga(win, *rate, &mut q[..words], *max_iter, *need, bits, t_q, Some(p), Some(addr)).ok().flatten();
+                return run_fpga(win, *rate, &mut q[..words], *max_iter, *need, bits, bb, t_q, Some(p), Some(addr)).ok().flatten();
             }
         }
         None
@@ -447,10 +606,10 @@ impl Ldpc {
                 self.decode(&f, bits)
             }
             Ldpc::Model(d) => d.decode(llr, bits),
-            Ldpc::Fpga { win, rate, q, max_iter, need, perm, model } => {
+            Ldpc::Fpga { win, rate, q, max_iter, need, perm, model, bb } => {
                 let t_q = std::time::Instant::now();
                 pack(q, perm, rate.k(), |i| llr[i] as u8 as u32);
-                match run_fpga(win, *rate, q, *max_iter, *need, bits, t_q, None, None) {
+                match run_fpga(win, *rate, q, *max_iter, *need, bits, bb, t_q, None, None) {
                     Ok(r) => r,
                     Err(Stuck) => soft(model, *rate, *max_iter, llr, bits),
                 }
@@ -467,13 +626,13 @@ impl Ldpc {
                 let q: Vec<i8> = llr.iter().map(|&l| quantize_llr(l, LLR_SCALE)).collect();
                 d.decode(&q, bits)
             }
-            Ldpc::Fpga { win, rate, q, max_iter, need, perm, model } => {
+            Ldpc::Fpga { win, rate, q, max_iter, need, perm, model, bb } => {
                 let t_q = std::time::Instant::now();
                 // Four 6-bit LLRs a word, then one bulk copy into the
                 // window (word writes one at a time cost 10 ms a frame).
                 let b = |l: f32| quantize_llr(l, LLR_SCALE) as u8 as u32;
                 pack(q, perm, rate.k(), |i| b(llr[i]));
-                match run_fpga(win, *rate, q, *max_iter, *need, bits, t_q, None, None) {
+                match run_fpga(win, *rate, q, *max_iter, *need, bits, bb, t_q, None, None) {
                     Ok(r) => r,
                     Err(Stuck) => {
                         let q: Vec<i8> = llr.iter().map(|&l| quantize_llr(l, LLR_SCALE)).collect();
@@ -553,7 +712,7 @@ mod board_tests {
                     [(words[j].0 + sigma * g()).round().clamp(-127.0, 127.0) as i8, (q + sigma * g()).round().clamp(-127.0, 127.0) as i8]
                 })
                 .collect();
-            let p = CellParams { rot: true, kq: (2048.0 * 1024.0 / (sigma * sigma)).min(65536.0) as i32, c14: (c * 16384.0).round() as i32, s14: (-s * 16384.0).round() as i32, qam16: None, a14: 0 };
+            let p = CellParams { rot: true, kq: (2048.0 * 1024.0 / (sigma * sigma)).min(65536.0) as i32, c14: (c * 16384.0).round() as i32, s14: (-s * 16384.0).round() as i32, qam16: None, a14: 0, psk8: false };
             let mut b1 = vec![0u8; N];
             let mut b2 = vec![0u8; N];
             let t = std::time::Instant::now();
@@ -594,7 +753,7 @@ mod board_tests {
             let spec = FrameSpec::long(mode);
             let mut dec = Ldpc::for_spec(&spec);
             let cells: Vec<[i8; 2]> = (0..N / 4).map(|_| [(rnd() >> 8) as i8, (rnd() >> 8) as i8]).collect();
-            let p = CellParams { rot: true, kq: 1811, c14: 15685, s14: -4739, qam16: Some(rate), a14: (2.0 * 40.0 / 10f64.sqrt() * 16384.0).round() as i32 };
+            let p = CellParams { rot: true, kq: 1811, c14: 15685, s14: -4739, qam16: Some(rate), a14: (2.0 * 40.0 / 10f64.sqrt() * 16384.0).round() as i32, psk8: false };
             let mut b1 = vec![0u8; N];
             let mut b2 = vec![0u8; N];
             let t = std::time::Instant::now();

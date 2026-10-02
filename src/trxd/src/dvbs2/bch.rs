@@ -19,7 +19,7 @@ const POLYS16: [u32; T] =
 const POLYS14: [u32; T] = [0x402B, 0x4941, 0x4647, 0x5591, 0x6B55, 0x6389, 0x6CE5, 0x4F21, 0x460F, 0x5A49, 0x5811, 0x65EF];
 
 /// 192-bit register, bit i = coefficient of x^i.
-type Reg = [u64; 3];
+pub type Reg = [u64; 3];
 
 pub struct Bch {
     /// Field GF(2^m), q = 2^m - 1; parity bits m t; the generator's shift
@@ -132,7 +132,7 @@ impl Bch {
 
     /// Remainder of the codeword (one bit a byte, 0/1) mod g(x), bit i =
     /// coefficient of x^i.
-    fn remainder(&self, bits: &[u8]) -> Reg {
+    pub(crate) fn remainder(&self, bits: &[u8]) -> Reg {
         let mut r = self.remainder_up(bits);
         for _ in 0..self.shift {
             self.step(&mut r, 0);
@@ -240,6 +240,39 @@ impl Bch {
         if r == [0; 3] {
             return Outcome::Clean;
         }
+        match self.locate(r, n) {
+            Some(found) => {
+                for &i in &found {
+                    bits[i] ^= 1;
+                }
+                Outcome::Fixed(found.len())
+            }
+            None => Outcome::Failed,
+        }
+    }
+
+    /// The same from the codeword's remainder alone (the FPGA computes it,
+    /// ldpc_dma.py `bb`): `bytes` are the BBFRAME's Kbch / 8 bytes (MSB
+    /// first, descrambled or not: a flip is a flip), n = Kbch + 192. Errors
+    /// in the BCH parity need no correcting.
+    pub fn correct_bytes(&self, bytes: &mut [u8], rem: Reg, n: usize, kbch: usize) -> Outcome {
+        if rem == [0; 3] {
+            return Outcome::Clean;
+        }
+        match self.locate(rem, n) {
+            Some(found) => {
+                for &i in found.iter().filter(|&&i| i < kbch) {
+                    bytes[i / 8] ^= 0x80 >> (i % 8);
+                }
+                Outcome::Fixed(found.len())
+            }
+            None => Outcome::Failed,
+        }
+    }
+
+    /// The wrong bits (indices into the n-bit codeword) for a non-zero
+    /// remainder `r`; None when there are more than t.
+    fn locate(&self, r: Reg, n: usize) -> Option<Vec<usize>> {
         // S_j = r(alpha^j), j = 1 .. 2t (g(alpha^j) = 0).
         let mut s = [0u16; 2 * T + 1];
         for (j, sj) in s.iter_mut().enumerate().skip(1) {
@@ -283,7 +316,7 @@ impl Bch {
             }
         }
         if l > T || !self.splits(&lam[..=l]) {
-            return Outcome::Failed;
+            return None;
         }
         // Chien search: bit at degree p is wrong when lam(alpha^-p) = 0.
         // Each term in the log domain: log(lam_i) - i p (mod Q), one table
@@ -309,12 +342,9 @@ impl Bch {
             }
         }
         if found.len() != l {
-            return Outcome::Failed;
+            return None;
         }
-        for p in &found {
-            bits[n - 1 - p] ^= 1;
-        }
-        Outcome::Fixed(l)
+        Some(found.iter().map(|p| n - 1 - p).collect())
     }
 }
 
