@@ -19,6 +19,9 @@ BOARD_FPGA_SITE_METHOD = local
 BOARD_FPGA_INSTALL_IMAGES = YES
 BOARD_FPGA_INSTALL_TARGET = YES
 BOARD_FPGA_PROJECT = $(call qstrip,$(BR2_PACKAGE_BOARD_FPGA_PROJECT))
+# The flavour's modes ("" = all the board has) and name (docs/FLAVOURS.md).
+BOARD_FPGA_MODES = $(call qstrip,$(BR2_PACKAGE_BOARD_FPGA_MODES))
+BOARD_FPGA_FLAVOUR = $(call qstrip,$(BR2_PACKAGE_BOARD_FPGA_FLAVOUR))
 
 define BOARD_FPGA_INSTALL_IMAGES_CMDS
 	mode=$$(cat $(@D)/boot-mode 2>/dev/null || echo all); \
@@ -28,7 +31,8 @@ define BOARD_FPGA_INSTALL_IMAGES_CMDS
 endef
 
 define BOARD_FPGA_INSTALL_TARGET_CMDS
-	rm -f $(TARGET_DIR)/lib/firmware/fpga-*.bin $(TARGET_DIR)/etc/fpga-boot-mode
+	rm -f $(TARGET_DIR)/lib/firmware/fpga-*.bin $(TARGET_DIR)/etc/fpga-boot-mode $(TARGET_DIR)/etc/fw-flavour
+	$(if $(BOARD_FPGA_FLAVOUR),echo $(BOARD_FPGA_FLAVOUR) > $(TARGET_DIR)/etc/fw-flavour)
 	mode=$$(cat $(@D)/boot-mode 2>/dev/null || echo all); \
 	if [ "$$mode" != all ]; then \
 		mkdir -p $(TARGET_DIR)/lib/firmware; \
@@ -37,6 +41,7 @@ define BOARD_FPGA_INSTALL_TARGET_CMDS
 			[ -e "$$x" ] || continue; \
 			m=$${x##*/$(BOARD_FPGA_PROJECT)-}; m=$${m%.xsa}; \
 			[ "$$m" = "$$mode" ] && continue; \
+			case " $(BOARD_FPGA_MODES) " in "  ") ;; *" $$m "*) ;; *) continue ;; esac; \
 			$(UNZIP) -p $$x system_top.bit > $(@D)/mode.bit; \
 			python3 $(BR2_EXTERNAL_PLUTOSDR_PATH)/board/tezuka/common/bit2bin.py \
 				$(@D)/mode.bit $(TARGET_DIR)/lib/firmware/fpga-$$m.bin || exit 1; \

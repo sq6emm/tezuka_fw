@@ -146,6 +146,8 @@ table.xv input[type=text] { width: 100%; min-width: 60px; padding: 3px 5px; text
   background: var(--lcd); border: 1px solid var(--lcd-edge); border-radius: var(--r); padding: 4px 6px; }
 /* DATV mode: the voice controls go, the DATV ones come. */
 body:not(.datv-mode) .datv-only { display: none !important; }
+/* BASIC firmware (docs/FLAVOURS.md): no DATV bitstream, no DATV button */
+body.no-datv [data-mode=DATV] { display: none !important; }
 body.datv-mode .voice-only { display: none !important; }
 body:not(.cw-mode) .cw-only, body:not(.ssb-mode) .ssb-only, body:not(.data-mode) .data-only, body.cw-mode .no-cw { display: none !important; }
 .txm { display: grid; grid-template-columns: auto 1fr auto; gap: 6px; align-items: center; font-size: 12px; color: var(--dim); }
@@ -752,6 +754,7 @@ function renderCalib(m) {
 // ============================================================ state rendering
 function renderState() {
   const st = S.st;
+  document.body.classList.toggle("no-datv", !!(st.features && st.features.datv === false));
   DATV.state(st);
   $("callsign").textContent = st.call || "";
   renderFreq();

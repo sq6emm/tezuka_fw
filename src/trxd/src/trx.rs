@@ -2480,6 +2480,9 @@ impl Trx {
             "xvtr": self.xvtr.as_ref().map(|t| t.name.clone()),
             "xvtrs": self.settings.transverters,
             "cal_band": self.cal_band(),
+            // What this firmware can do (docs/FLAVOURS.md): the page hides
+            // what is not there.
+            "features": {"datv": crate::fpgamode::datv_available(), "flavour": crate::fpgamode::flavour()},
         });
         if let (Some(v), serde_json::Value::Object(m)) = (v.as_object_mut(), more) {
             v.extend(m);
@@ -2631,6 +2634,15 @@ impl Trx {
             "cw_engine" if m["engine"].as_str() == Some("rs") => Some(crate::fpgamode::Part::Rsnn),
             _ => None,
         };
+        // No bitstream with DATV in this firmware (BASIC): refused, not run
+        // on hardware that is not there.
+        if part == Some(crate::fpgamode::Part::Datv) && !crate::fpgamode::datv_available() {
+            warn!(cmd, "DATV refused: this firmware has no DATV bitstream (BASIC flavour)");
+            if let Some(w) = &self.web {
+                w.send_json_to(client, &serde_json::json!({"type": "datv_error", "msg": "this firmware (BASIC) has no DATV: install the BASIC+ image"}));
+            }
+            return;
+        }
         if let Some(want) = part.and_then(crate::fpgamode::switch_for) {
             if self.tx_on.is_none() {
                 // every page shows it (the switch restarts trxd: all of them

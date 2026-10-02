@@ -91,5 +91,9 @@ if [ -f "$MODEL" ]; then
 fi
 "$COMMON_DIR/uboot-ab-env.sh" "$BIN_DIR/uboot-env.txt" > "$QSPIDIR/uboot-ab.env"
 [ "$(wc -l < "$QSPIDIR/uboot-ab.env")" -eq 12 ] || { echo "ERROR: uboot-ab.env incomplete" >&2; exit 1; }
-(cd "$COMMON_DIR" && git describe --abbrev=4 --always --tags --dirty 2>/dev/null || echo unknown) > "$QSPIDIR/VERSION"
-(cd "$QSPIDIR" && sha256sum firmware.itb $( [ -f model.bin ] && echo model.bin ) uboot-ab.env VERSION > SHA256SUMS)
+# The flavour (docs/FLAVOURS.md) in VERSION and on its own for fw-update.
+FLAVOUR=$(cat "${TARGET_DIR}/etc/fw-flavour" 2>/dev/null || true)
+echo "$(cd "$COMMON_DIR" && git describe --abbrev=4 --always --tags --dirty 2>/dev/null || echo unknown)${FLAVOUR:+ $FLAVOUR}" > "$QSPIDIR/VERSION"
+rm -f "$QSPIDIR/FLAVOUR"
+[ -z "$FLAVOUR" ] || echo "$FLAVOUR" > "$QSPIDIR/FLAVOUR"
+(cd "$QSPIDIR" && sha256sum firmware.itb $( [ -f model.bin ] && echo model.bin ) uboot-ab.env VERSION $( [ -f FLAVOUR ] && echo FLAVOUR ) > SHA256SUMS)

@@ -23,6 +23,13 @@ uplinks_now() {
 }
 
 uplink_ok() {
+	# A board without Ethernet of its own (ADALM-Pluto: its overlay has
+	# /etc/fw-usb-only): any interface with an address, usb0 included (a
+	# USB-Ethernet adapter on the OTG port replaces usb0).
+	if [ -f /etc/fw-usb-only ]; then
+		ip -4 -o addr show 2>/dev/null | awk '$2 != "lo"' | grep -q .
+		return
+	fi
 	now=$(uplinks_now)
 	if [ -f "$UPLINKS" ]; then
 		if [ -s "$UPLINKS" ]; then

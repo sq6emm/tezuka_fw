@@ -1,4 +1,7 @@
 [
-  {"board": "plutoskyr2", "defconfig": "plutoskyr2_defconfig"},
-  {"board": "libre",      "defconfig": "libre_defconfig"}
+  {"board": "libre-plus",       "hw": "libre",      "flavour": "plus",  "defconfig": "libre_defconfig",      "output": "libre"},
+  {"board": "libre-basic",      "hw": "libre",      "flavour": "basic", "defconfig": "libre_defconfig"},
+  {"board": "plutoskyr2-plus",  "hw": "plutoskyr2", "flavour": "plus",  "defconfig": "plutoskyr2_defconfig", "output": "plutoskyr2"},
+  {"board": "plutoskyr2-basic", "hw": "plutoskyr2", "flavour": "basic", "defconfig": "plutoskyr2_defconfig"},
+  {"board": "pluto-basic",      "hw": "pluto",      "flavour": "basic", "defconfig": "pluto_defconfig"}
 ]

@@ -19,6 +19,15 @@ boards into:
 
 Frequency range is that of the AD936x: about 47 MHz to 6 GHz. HF needs a transverter.
 
+## Firmware flavours
+
+Five images from one tree (docs/FLAVOURS.md):
+
+| | LibreSDR | PlutoSky R2 | ADALM-Pluto |
+|---|---|---|---|
+| **BASIC**: narrowband SQTRX (SSB/CW/data, Q65/PI4, CW decoders, TCI/rigctld, dBm meter, beacons) | `libre-basic` | `plutoskyr2-basic` | `pluto-basic` |
+| **BASIC+**: BASIC plus DATV (DVB-S2/T2 transmit and receive in the FPGA) | `libre-plus` | `plutoskyr2-plus` | not available (xc7z010 too small) |
+
 ## What changed vs tezuka_fw
 
 * FPGA: only the AD936x interface, DMA, an x8 FIR decimator/interpolator, and

@@ -4,18 +4,28 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILDROOT_DIR="${SCRIPT_DIR}/buildroot"
 
-# Board name -> defconfig mapping, loaded from boards.json (single
-# source of truth shared with .github/workflows/main.yml).
+# Image name (<board>-<flavour>, docs/FLAVOURS.md) -> defconfig, flavour and
+# output directory, loaded from boards.json (single source of truth shared
+# with .github/workflows/main.yml). A flavour is configs/flavour/<f>.config,
+# appended to the board's defconfig. The plus images keep the old output
+# directory (output/<board>); a bare board name means its first image there
+# (libre = libre-plus, pluto = pluto-basic).
 if ! command -v jq >/dev/null 2>&1; then
     echo "ERROR: jq required to read boards.json" >&2
     exit 1
 fi
 declare -A BOARDS=()
 declare -A ARTIFACT=()   # board -> release-artifact group name (defaults to board)
-while IFS=$'\t' read -r _board _defconfig _artifact; do
+declare -A FLAVOUR=()    # image -> flavour (configs/flavour/<f>.config)
+declare -A OUTNAME=()    # image -> output/<dir>
+declare -A ALIAS=()      # bare board name -> its default image
+while IFS=$'\t' read -r _board _defconfig _artifact _flavour _out _hw; do
     BOARDS[$_board]=$_defconfig
     ARTIFACT[$_board]=$_artifact
-done < <(jq -r '.[] | [.board, .defconfig, (.artifact // .board)] | @tsv' "${SCRIPT_DIR}/boards.json")
+    FLAVOUR[$_board]=$_flavour
+    OUTNAME[$_board]=$_out
+    [ -n "${ALIAS[$_hw]+x}" ] || ALIAS[$_hw]=$_board
+done < <(jq -r '.[] | [.board, .defconfig, (.artifact // .board), (.flavour // ""), (.output // .board), (.hw // .board)] | @tsv' "${SCRIPT_DIR}/boards.json")
 
 # Artifact groups with more than one member board (e.g. fishball_mini_7010's
 # flash-only build merges into fishball's own zip) get merged into one zip;
@@ -41,8 +51,9 @@ usage() {
     echo ""
     echo "Boards:"
     for board in $(printf '%s\n' "${!BOARDS[@]}" | sort); do
-        printf "  %-20s %s\n" "${board}" "${BOARDS[$board]}"
+        printf "  %-20s %s + configs/flavour/%s.config\n" "${board}" "${BOARDS[$board]}" "${FLAVOUR[$board]}"
     done
+    echo "  (a bare board name: libre = libre-plus, plutoskyr2 = plutoskyr2-plus, pluto = pluto-basic)"
     if [ "${#MERGE_GROUPS[@]}" -gt 0 ]; then
         echo ""
         echo "Groups (build all members, merge flash images into one zip):"
@@ -99,6 +110,8 @@ for arg in "$@"; do
         REQUESTED_GROUPS+=("$arg")
     elif [ -n "${BOARDS[$arg]+x}" ]; then
         TARGETS+=("$arg")
+    elif [ -n "${ALIAS[$arg]+x}" ]; then
+        TARGETS+=("${ALIAS[$arg]}")
     else
         echo "ERROR: Unknown board '${arg}'"
         echo ""
@@ -109,7 +122,8 @@ done
 build_board() {
     local board="$1"
     local defconfig="${BOARDS[$board]}"
-    local output_dir="${SCRIPT_DIR}/output/${board}"
+    local flavour="${FLAVOUR[$board]}"
+    local output_dir="${SCRIPT_DIR}/output/${OUTNAME[$board]}"
 
     echo "=== Building ${board} (${defconfig}) ==="
     echo "    Output: ${output_dir}"
@@ -124,6 +138,10 @@ build_board() {
     fi
 
     make -C "${BUILDROOT_DIR}" O="${output_dir}" "${defconfig}"
+    if [ -n "${flavour}" ]; then
+        cat "${SCRIPT_DIR}/configs/flavour/${flavour}.config" >> "${output_dir}/.config"
+        make -C "${BUILDROOT_DIR}" O="${output_dir}" olddefconfig
+    fi
     # shellcheck disable=SC2086
     make -C "${BUILDROOT_DIR}" O="${output_dir}" ${JOBS}
 
@@ -131,6 +149,8 @@ build_board() {
     if [ -f "${zip}" ]; then
         mkdir -p "${SCRIPT_DIR}/build"
         cp "${zip}" "${SCRIPT_DIR}/build/${board}.zip"
+        # the plus images also under the old name (build/libre.zip)
+        [ "${OUTNAME[$board]}" = "${board}" ] || cp "${zip}" "${SCRIPT_DIR}/build/${OUTNAME[$board]}.zip"
         echo "=== ${board} complete: build/${board}.zip ==="
     else
         echo "WARNING: ${zip} not found"

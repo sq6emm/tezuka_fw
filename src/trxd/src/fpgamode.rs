@@ -60,6 +60,26 @@ pub fn switch_for(part: Part) -> Option<&'static str> {
     order.iter().copied().find(|m| boot.as_deref() == Some(*m) || Path::new(FIRMWARE).join(format!("fpga-{m}.bin")).exists())
 }
 
+/// Can `part` run on this firmware at all: in the loaded bitstream, or in
+/// one installed to switch to? The BASIC flavour (docs/FLAVOURS.md) has
+/// only the trx bitstream: no DATV.
+pub fn available(part: Part) -> bool {
+    has(&loaded(), part) || switch_for(part).is_some()
+}
+
+/// [`available`] for DATV, read once (the installed bitstreams do not
+/// change while trxd runs).
+pub fn datv_available() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| available(Part::Datv))
+}
+
+/// The firmware flavour ("basic", "plus"; "" for a build without one).
+pub fn flavour() -> &'static str {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| std::fs::read_to_string("/etc/fw-flavour").map(|s| s.trim().to_string()).unwrap_or_default())
+}
+
 /// Ask for `mode` and exit (the S80trxd loop loads it and starts trxd
 /// again, which takes `resume` back with [`take_resume`]).
 pub fn request(mode: &str, resume: &serde_json::Value) -> ! {

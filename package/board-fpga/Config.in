@@ -21,3 +21,20 @@ config BR2_PACKAGE_BOARD_FPGA_PROJECT
 	  the .xsa filename: board/tezuka/<board>/bitstream/<project>.xsa.
 	  Most boards use the default "tezuka" project; boards built from a
 	  different maia-hdl project (e.g. "ka9q") should set this to match.
+
+config BR2_PACKAGE_BOARD_FPGA_MODES
+	string "FPGA modes to install"
+	default ""
+	depends on BR2_PACKAGE_BOARD_FPGA
+	help
+	  Space-separated FPGA modes (docs/FPGA-MODES.md) the image carries:
+	  "trx" for the BASIC flavour, empty for every <project>-<mode>.xsa
+	  the board has (BASIC+). The boot mode is always included.
+
+config BR2_PACKAGE_BOARD_FPGA_FLAVOUR
+	string "Firmware flavour"
+	default ""
+	depends on BR2_PACKAGE_BOARD_FPGA
+	help
+	  basic or plus (docs/FLAVOURS.md); written to /etc/fw-flavour and
+	  into the image's VERSION.

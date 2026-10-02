@@ -298,6 +298,13 @@ pub fn spawn(cfg: RefConfig, apply: Apply) {
 }
 
 fn run(cfg: RefConfig, apply: Apply) -> Result<(), String> {
+    // The ADALM-Pluto's bitstream has no refmeter (no reference clock into
+    // the fabric): its address would answer with a bus error, which kills
+    // the process. Nothing else names the core, so go by the board.
+    let model = std::fs::read_to_string("/proc/device-tree/model").unwrap_or_default();
+    if model.contains("PlutoSDR") {
+        return Err("no refmeter in the ADALM-Pluto bitstream".into());
+    }
     let meter = Regs::map(REFMETER_BASE)?;
     if meter.rd(0x00) != REFMETER_ID {
         return Err("no refmeter in this bitstream".into());

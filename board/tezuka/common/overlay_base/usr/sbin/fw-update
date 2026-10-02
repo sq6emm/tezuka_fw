@@ -216,6 +216,14 @@ install_qspi() {
 		log "fw-update: tezuka flash layout: converting (slot A replaces the old image; this write has no rollback)"
 	fi
 	VER=$(cat "$F/VERSION" 2>/dev/null || echo unknown)
+	# A flavour change (BASIC <-> BASIC+, docs/FLAVOURS.md) on the same
+	# board is a normal update: the model check above already refused an
+	# image for another board. Say so; settings in /mnt/jffs2 are kept.
+	NEW_FLAVOUR=$(cat "$F/FLAVOUR" 2>/dev/null || true)
+	OLD_FLAVOUR=$(cat "${FW_FLAVOUR_FILE:-/etc/fw-flavour}" 2>/dev/null || true)
+	if [ -n "$NEW_FLAVOUR" ] && [ "$NEW_FLAVOUR" != "${OLD_FLAVOUR:-$NEW_FLAVOUR}" ]; then
+		log "fw-update: flavour changes: $OLD_FLAVOUR -> $NEW_FLAVOUR (settings are kept)"
+	fi
 	log "fw-update: installing $VER into QSPI slot $TARGET ($SLOT_DEV, running: ${CUR:-tezuka})"
 
 	# Slot first: on a tezuka board it replaces the old image's start, and

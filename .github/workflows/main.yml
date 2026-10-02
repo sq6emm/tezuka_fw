@@ -197,6 +197,8 @@ jobs:
           # object files, debuggers need 'cd $OUTPUT_DIR' first.
           echo 'BR2_CCACHE=y' >> "${OUTPUT_DIR}/.config"
           echo 'BR2_CCACHE_USE_BASEDIR=y' >> "${OUTPUT_DIR}/.config"
+          # The flavour (docs/FLAVOURS.md): basic / plus fragment.
+          [ -n "${{ matrix.flavour }}" ] && cat "configs/flavour/${{ matrix.flavour }}.config" >> "${OUTPUT_DIR}/.config"
           make -C buildroot O="${OUTPUT_DIR}" olddefconfig
 
       - name: Build U-Boot

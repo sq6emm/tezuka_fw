@@ -1,0 +1,2 @@
+# ADALM-Pluto: no Ethernet on the board; S99fwconfirm takes any interface
+# with an address (usb0, or a USB-Ethernet adapter) as the uplink.
