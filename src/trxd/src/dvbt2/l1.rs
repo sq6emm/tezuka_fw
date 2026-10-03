@@ -341,6 +341,9 @@ pub enum PreOutcome {
     Mismatch(Vec<&'static str>),
     /// Not decoded (BCH or CRC failed).
     Failed,
+    /// The hard decisions did not check and the LDPC was not run
+    /// ([`PreDecoder::decode_hard`]).
+    Unchecked,
 }
 
 /// The L1-pre fields the receiver's fixed layout depends on, (name, first
@@ -394,8 +397,9 @@ struct L1Decoder {
 }
 
 impl L1Decoder {
-    /// `llr`: the block's bits as sent (positive = 0).
-    fn decode(&mut self, llr: &[f32]) -> PreOutcome {
+    /// `llr`: the block's bits as sent (positive = 0); `ldpc`: the LDPC
+    /// decoder when the hard decisions do not check (else Unchecked).
+    fn decode(&mut self, llr: &[f32], ldpc: bool) -> PreOutcome {
         let nbch = self.kbch + NBCH_PARITY;
         let big = 64.0;
         let mut it = llr.iter();
@@ -413,6 +417,9 @@ impl L1Decoder {
             *b = (l < 0.0) as u8;
         }
         if !self.check() {
+            if !ldpc {
+                return PreOutcome::Unchecked;
+            }
             let llr = std::mem::take(&mut self.llr);
             let conv = self.ldpc.decode(&llr, &mut self.bits);
             self.llr = llr;
@@ -462,7 +469,15 @@ impl PreDecoder {
     /// `llr`: the 1840 cells' LLRs in order (positive = 0).
     pub fn decode(&mut self, llr: &[f32]) -> PreOutcome {
         assert_eq!(llr.len(), super::L1_PRE_CELLS);
-        self.0.decode(llr)
+        self.0.decode(llr, true)
+    }
+
+    /// [`Self::decode`] on the hard decisions only (BCH, CRC): no LDPC,
+    /// Unchecked when they do not check. (The float LDPC of a 16K block
+    /// costs the A9 tens of ms; at a low MER every frame needs it.)
+    pub fn decode_hard(&mut self, llr: &[f32]) -> PreOutcome {
+        assert_eq!(llr.len(), super::L1_PRE_CELLS);
+        self.0.decode(llr, false)
     }
 }
 
@@ -487,7 +502,13 @@ impl PostDecoder {
 
     pub fn decode(&mut self, llr: &[f32]) -> PreOutcome {
         assert_eq!(llr.len(), post_sizes().0);
-        self.0.decode(llr)
+        self.0.decode(llr, true)
+    }
+
+    /// [`PreDecoder::decode_hard`] for L1-post.
+    pub fn decode_hard(&mut self, llr: &[f32]) -> PreOutcome {
+        assert_eq!(llr.len(), post_sizes().0);
+        self.0.decode(llr, false)
     }
 }
 

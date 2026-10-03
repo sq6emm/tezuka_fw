@@ -383,6 +383,101 @@ cell and a CSI-weighted (per-component for rotated QPSK/16QAM) demapper in
 the LDPC engine's LLR stage all need HDL (t2eq, t2router, ldpc_dma), with
 the software model (`fe.rs`, `stream.rs`) changed to match.
 
+## Searching and tracking in the FPGA: P1, GI and MER reports (2026-10-03)
+
+Profile of the locked receiver before (Libre, per frame): P1 work 245 ms,
+word loop 71 ms, equalized symbols 10 ms; demodulator 61 % of a core.
+Searching cost 99.8 % of a core (raw samples, every one through the
+ring and the A9's P1 correlator), so a gap meant more gaps (re-acquisition
+overloaded the A9) and in full duplex the frame end came too late for the
+router (751 ms finish, software fallback).
+
+The front end (maia-hdl `t2ofdm.py`) now does that work itself and puts
+short records in the carrier stream:
+
+- **P1 detector** (`t2p1.py`): trxd's structure correlation, streaming
+  from one 2048-sample delay line (taps 482, 964, 1024, 1506, 2048): C
+  over A's last 542 samples against C, B over its last 482 against B, the
+  1/1024 shift from the NCO table, E the energy of 2048 samples; every
+  sum adds a term and later takes the same one away, so they stay exact
+  (48 bits). Score (|C| + |B|) >> 10 - k (E >> 10) >> 8 (k = 64), the
+  best window of each frame-length block reported (record 253: start,
+  |C| + |B|, E). About 16 cycles a sample, four multipliers.
+- **Guard-interval correlation** (same unit): the sum of x[t] conj(x[t -
+  2048]) over the scheduled symbols' last guard-interval samples, raw
+  (before the NCO), >> 16 at the frame's end (record 252: re, im, the
+  frame's start).
+- **Pilot MER** (`t2eq.py`): (8 I - s ref8)^2 + (8 Q)^2 of every scattered
+  pilot after the equalizer (ref8 = 8 x 20 x boost: 213 for PP1/PP2),
+  summed over the frame's symbols, reported after the last (record 251:
+  sum >> 4, count, the frame's start). The A9's MER is the same definition
+  as before: -10 log10(sum 16 / (n 25600)); the 7-bit cells cap it near 35
+  dB.
+- **Less in the ring**: no raw samples while searching
+  (`acq_raw_off`), none around the guard intervals (`gi_raw_off`; only
+  the 2176-sample window around each scheduled P1 is left), and with the
+  router running only one equalized data symbol a frame for the browser's
+  constellation (`eq_ring_j`; the router still takes every one).
+
+A record is a carrier-stream header with symbol number 251 to 253 and six
+words of 16 bits; its words go out together, possibly inside a symbol's
+carriers. Control: T2 register 14 (0x78) `t2_ext`: p1_en 0, p1_k 8:1,
+acq_raw_off 9, gi_raw_off 10, mer_en 11, eq_ring_j 19:12, ref8 29:20;
+register 15 (0x7C) `t2_features` (read only): bits 2:0 = P1/GI, MER,
+eq_ring; bit 8 P1 overflow. An older bitstream reads 0 there.
+
+trxd (`dvbs2/fpga.rs` start_t2): with all three feature bits and the
+equalizer it writes t2_ext and reads it back; `TRXD_T2_HW=0` keeps the
+raw-sample path (A/B). `stream.rs` then:
+- acquires from a P1 record whose (|C| + |B|) / E is 0.15 or more: the
+  schedule starts two frames on; the first scheduled P1 window gives the
+  coarse frequency (`find_p1_in`, as before), the first GI record the fine
+  one outright; that first frame is not decoded (it came in partly at the
+  search frequency);
+- ends a frame on its MER record (its P2 symbols all in): `finish()` (L1,
+  the router's buffer), the MER from the record, the frequency from the
+  frame's GI record (before or after the MER record), then the next P1
+  window as before.
+
+Models: `t2p1.Model` (Python) and `fe::model::P1Model` (Rust) bit-exact
+(`p1_model_matches_the_python_one`: the same input, the same 28 words);
+`T2P1` against its model with the front end's pacing, bursts and a
+consumer that stalls (`test_t2p1.py`); t2eq's MER against `mer_terms`
+(`test_t2eq.py`); the front end's records and raw gating against the model
+(`test_t2ofdm.py TestT2OfdmReports`); the ring filter alone
+(`test_t2ringfilter.py`). Receiver: `t2_through_the_front_end_with_reports`
+(the front-end model with reports, 3 of 3 frames after acquisition, no
+LDPC failure, MER 27.1 dB against 27.4 with raw samples, 10 885 raw words
+for 3.57 M samples; `t2_through_the_front_end` unchanged) and
+`t2_reports_reacquire` (ignored, about 25 s: 50 000 samples cut out
+mid-stream, the lock lost after six missed P1s, found again from the P1
+records, 575 packets before the cut and 960 after).
+
+On the boards (2026-10-03) one-way T2 took 4-6 % of a core; in full
+duplex Libre 1 (MER 7.8 dB) took 52-76 %. The cause was not the frame moves
+(P1 off by 3-4 samples about once a second, cheap) but L1: at that MER
+L1-post's hard decisions rarely check, and every frame ran the float 16K
+LDPC on the A9 (once or twice, each longer than a frame there). Now L1 is
+verified with the LDPC at most once every 32 frames (`L1_LDPC_EVERY`, about
+8 s); between, a frame whose hard decisions do not check is taken as
+`l1_unchecked` (log field `l1_ok_unchecked_failed`); a mismatch on the hard
+decisions still refuses it. `t2_reports_low_mer_cost` (ignored; T2NOISE,
+T2PPM): MER 7.9 dB, 3 ppm, the frame moved 3 times in 8 frames; steady
+state on the PC 1.06 ms a frame (1.07 at 20.8 dB, 1.36 at 5.4 dB; before:
+about 3.5 and 9 ms; the test has no router, so the A9 also handles all the
+data symbols there).
+
+Bitstream `t2` (Libre, Vivado 2023.1): WNS +0.176 ns, WHS +0.040 ns; LUTs
+70 % (64.8 % without the reports), BRAM 117.5 tiles (113: the P1 delay
+line), DSPs 208 of 220 (196).
+
+Expected on the board (to be measured): no P1 correlation on the A9 at
+all while searching or locked (it was 245 ms a frame locked and the whole
+core searching), raw-word handling down from every guard interval to one
+2176-sample window a frame, equalized-symbol handling from 1 in 4 to 1
+symbol a frame. What is left per frame: the P2 symbols (channel estimate,
+equalizer table, L1), one P1 window, the records.
+
 ## Not done
 
 - 64QAM/256QAM, other FFT sizes, PAPR reduction.

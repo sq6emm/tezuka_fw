@@ -462,3 +462,70 @@ ldpc_long.json decoded, words, remainder and zero flag against the model);
 `bits_out_ms` 0.4-0.64 and `bch_ms` 0.37-0.6 a block (board log); PC
 `cargo test --release bb_arm_time -- --ignored --nocapture`: 0.036 ms
 against nothing measurable.
+
+## What the A9 still does for DVB-S2 (measured 2026-10-03)
+
+The ring-mode receiver's own time per long frame on the PC
+(`ring_demod_time`, 250 kS/s, timers around each step): `frame()` 78-93 us
+(70 %: the known blocks' phases, the carrier fit, amplitude and noise, the
+MER and constellation from every 32nd data symbol, the engine's job),
+`other_at` 24 us (20 %: the other PLS codes' headers around the expected
+one), the header scan 3 us, appending the ring words 4-5 us, the buffer
+drain 0.2 us. On the board that is the 12 % of a core at 500 kS/s.
+
+## Known blocks in the FPGA, PLS decoder, cheaper sampling (2026-10-03)
+
+The tracking receiver (ring mode, after acquisition) no longer makes the
+known symbols one by one:
+
+- **Known-symbol accumulator** (maia-hdl `s2trk.py`, s2 mode bitstream):
+  on the words the recorder writes into the ring (so its index is the
+  ring's absolute position), it follows the frames from a loaded header
+  position (whole frames on; a frame of another length or a slip: trxd
+  loads again), mixes each header and pilot symbol with its own AFC phase
+  accumulator (the step trxd sends, taken at each frame start; the
+  1024-entry Q15 table), turns it by the reference's quarter turns (every
+  header and pilot reference is e^(j pi/4) j^q; trxd applies the e^(j
+  pi/4)) and sums them; per block a FIFO entry: first symbol, sum re/im,
+  power, its phase at the first symbol and its step. trxd corrects each
+  entry to its own mixer at the block's centre (`s2trk::Entry::corr`) and
+  takes it when the two steps differ by under 0.05 rad over the block
+  (the AFC retunes a little every frame; the unit takes a step a frame
+  later). Three pipeline stages, a word a cycle at most. Registers in the
+  window T2 has in the other bitstreams (0x40-0x7F): control (enable,
+  load, pilots, pilot blocks), base, length, step, header table, the entry
+  (6 words), status (level, overflow, synced), pop, counter, features 0x7C
+  bit 16 (T2's features are bits 7:0, so a t2 or datv bitstream reads 0
+  there).
+- **Without the unit** (another bitstream, a frame it did not follow,
+  `TRXD_S2_TRK=0`) the receiver makes the same entry from the ring's words
+  (`s2trk::block`, bit for bit the unit's: `block_matches_the_python_one`;
+  the unit against its model: `test_s2trk.py`).
+- From the entries: the carrier fit's phases, the amplitude (mean of
+  Re(c e^(-j phase)) over the blocks) and the noise (mean power less the
+  amplitude squared), the frequency left inside a block ignored (a few Hz
+  when tracking; acquisition keeps the symbol-by-symbol path).
+- **PLS decoder** (`s2trk::pls_decode`): the 64 PLS symbols' soft bits
+  through a 32-point Hadamard transform (the (32, 6) Reed-Muller code, the
+  repeated or inverted bit), phase from the SOF: `other_at` decodes the PLS
+  at the best SOF position and scores that one header instead of
+  correlating all 115 (`pls_decode_finds_every_header`).
+- The MER and the constellation from every 128th data symbol (169 to 253
+  a long frame), a rotator per data group stepped 128 symbols at a time,
+  instead of every 32nd with a sine and cosine each.
+
+`TRXD_S2_OLDFRAME=1` brings back the previous path (A/B). The receiver's
+log line has `blocks_fpga_made` (blocks from the unit / made on the A9).
+
+PC (`ring_demod_time`, 250 kS/s, no unit: the model makes the blocks;
+the first frames' acquisition included): QPSK 1/2 0.130 -> 0.034 ms a
+frame, 8PSK 3/4 0.112 -> 0.029 ms; `other_at` 24 -> 2.3 us. With the unit
+the block sums go too (about 8 us of the rest; its FIFO costs the reader
+thread 7 register accesses a block). `ring_with_the_fpga_accumulator`:
+the unit's model fed the words as they come, the receiver's commands a
+chunk late: every frame decoded (QPSK 1/2 and 8PSK 3/4, 8 dB, 900 Hz off),
+all blocks from the unit after the first two tracked frames.
+
+Bitstream `s2` with the unit (Libre, Vivado 2023.1): WNS +0.144 ns, WHS
++0.015 ns; LUTs 53.9 % (52.1 % before), BRAM 111.5 tiles (108.5: the
+FIFO and the table), DSPs 121 (115); 830 KiB xz in the image (805).

@@ -142,6 +142,15 @@ build_board() {
         cat "${SCRIPT_DIR}/configs/flavour/${flavour}.config" >> "${output_dir}/.config"
         make -C "${BUILDROOT_DIR}" O="${output_dir}" olddefconfig
     fi
+    # trxd is built from the tree (package/trxd/trxd.mk, local site):
+    # Buildroot rebuilds such a package only when told, and once shipped
+    # the daemon built hours before a change to src/trxd. Its stamps go
+    # when the sources are newer than its last build.
+    local trxd_build="${output_dir}/build/trxd-0.1.0"
+    if [ -f "${trxd_build}/.stamp_built" ] && [ -n "$(find "${SCRIPT_DIR}/src/trxd/src" "${SCRIPT_DIR}/src/trxd/web" "${SCRIPT_DIR}/src/trxd/Cargo.toml" "${SCRIPT_DIR}/src/trxd/Cargo.lock" -newer "${trxd_build}/.stamp_built" -print -quit 2>/dev/null)" ]; then
+        echo "    src/trxd changed since its last build: rebuilding trxd"
+        rm -f "${trxd_build}"/.stamp_built "${trxd_build}"/.stamp_installed "${trxd_build}"/.stamp_target_installed "${trxd_build}"/.stamp_staging_installed
+    fi
     # shellcheck disable=SC2086
     make -C "${BUILDROOT_DIR}" O="${output_dir}" ${JOBS}
 

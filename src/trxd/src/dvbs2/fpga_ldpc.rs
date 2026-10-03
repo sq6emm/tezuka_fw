@@ -65,6 +65,9 @@ const DECODE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 const LATE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 /// Time in the FPGA decoder's stages (ns): LLRs in, waiting, decisions out.
 pub static PROF_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Decodes run, iterations they took, and how many ran to the limit
+/// without converging (for the FEC thread's log: what `fpga_ms` is made of).
+pub static PROF_ITER: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Channel LLR -> the decoder's 6-bit input (as the model was tuned).
 pub const LLR_SCALE: f32 = 2.0;
@@ -359,6 +362,11 @@ fn run_fpga_ring(win: &Window, rate: LongRate, q: &mut [u32], max_iter: u32, nee
     }
     PROF_NS[0].fetch_add((t_in - t_q).as_nanos() as u64, Relaxed);
     PROF_NS[1].fetch_add((t_out - t0).as_nanos() as u64, Relaxed);
+    PROF_ITER[0].fetch_add(1, Relaxed);
+    PROF_ITER[1].fetch_add(((st >> 8) & 0x3F) as u64, Relaxed);
+    if (st >> 1) & 1 == 0 {
+        PROF_ITER[2].fetch_add(1, Relaxed);
+    }
     PROF_NS[2].fetch_add(t_out.elapsed().as_nanos() as u64, Relaxed);
     Ok(((st >> 1) & 1 == 1).then_some(((st >> 8) & 0x3F) as usize))
 }

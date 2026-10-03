@@ -2528,7 +2528,9 @@ impl Trx {
                     fec_busy = s.frames_fec_busy,
                     iq_dropped = s.blocks_dropped,
                     demod_pct = (100.0 * s.other_s / s.wall_s.max(1e-9)).round(),
-                    fec_pct = (100.0 * s.ldpc_s / s.wall_s.max(1e-9)).round(),
+                    fec_pct = (100.0 * s.fec_cpu_s / s.wall_s.max(1e-9)).round(),
+                    fec_wait_pct = (100.0 * s.ldpc_s / s.wall_s.max(1e-9)).round(),
+                    blocks_fpga_made = ?(s.trk_hw, s.trk_model),
                     "DATV receive"
                 );
             }
@@ -2564,7 +2566,7 @@ impl Trx {
                 "mer": (s.data_esn0_db * 10.0).round() / 10.0,
                 "freq": s.freq_hz.round(), "frames": s.frames, "bad": s.frames_bad, "packets": s.packets,
                 "dropped": s.blocks_dropped, "skipped": s.frames_skipped, "busy": s.frames_fec_busy,
-                "demod_pct": (100.0 * s.other_s / s.wall_s.max(1e-9)).round(), "fec_pct": (100.0 * s.ldpc_s / s.wall_s.max(1e-9)).round(),
+                "demod_pct": (100.0 * s.other_s / s.wall_s.max(1e-9)).round(), "fec_pct": (100.0 * s.fec_cpu_s / s.wall_s.max(1e-9)).round(),
                 "si": self.datv_rx.as_ref().map(|r| r.si().json())}));
             w.send_json(&serde_json::json!({"type": "meter", "s_dbfs": self.s_dbfs, "tx": tx, "rx_gain_db": self.hw_gain_db, "cw": cw, "datv": datv, "datv_rx": datv_rx, "txm": txm,
                 "dbm": (dbm * 10.0).round() / 10.0, "s": crate::settings::s_units(self.rx_eff(), dbm),
@@ -2630,13 +2632,13 @@ impl Trx {
         // A feature on a part of the FPGA the loaded bitstream lacks: load
         // one that has it (trxd restarts and takes this command up again).
         let part = match cmd {
-            "datv_mode" | "datv_rx" | "datv" if on => Some(crate::fpgamode::Part::Datv),
+            "datv_mode" | "datv_rx" | "datv" if on => Some(crate::fpgamode::datv_part(m["rate"].as_str())),
             "cw_engine" if m["engine"].as_str() == Some("rs") => Some(crate::fpgamode::Part::Rsnn),
             _ => None,
         };
         // No bitstream with DATV in this firmware (BASIC): refused, not run
         // on hardware that is not there.
-        if part == Some(crate::fpgamode::Part::Datv) && !crate::fpgamode::datv_available() {
+        if matches!(part, Some(crate::fpgamode::Part::S2 | crate::fpgamode::Part::T2)) && !crate::fpgamode::datv_available() {
             warn!(cmd, "DATV refused: this firmware has no DATV bitstream (BASIC flavour)");
             if let Some(w) = &self.web {
                 w.send_json_to(client, &serde_json::json!({"type": "datv_error", "msg": "this firmware (BASIC) has no DATV: install the BASIC+ image"}));

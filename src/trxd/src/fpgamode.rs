@@ -6,8 +6,9 @@
 //! again) and starts trxd, which takes up the saved state.
 //!
 //! Modes: "all" (everything; also what a board without mode bitstreams
-//! has), "trx" (radio, wide scope, CW-RS network front end), "datv" (radio,
-//! wide scope, DVB-S2/T2 receive and transmit, LDPC).
+//! has), "trx" (radio, wide scope, CW-RS network front end), "s2" (radio,
+//! wide scope, DVB-S2 receive and transmit, LDPC), "t2" (the same for
+//! DVB-T2), and "datv" (both: the single DATV bitstream before the split).
 
 use std::path::Path;
 
@@ -20,8 +21,12 @@ const RESUME: &str = "/run/trxd-resume.json";
 /// A part of the FPGA a feature runs on.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Part {
-    /// DVB-S2/T2 receive and transmit (Maia DDC ring, encoder, IFFT, LDPC).
-    Datv,
+    /// DVB-S2 receive and transmit (Maia DDC ring, symbol timing, header
+    /// detector, encoder, LDPC).
+    S2,
+    /// DVB-T2 receive and transmit (resampler, OFDM front end, equalizer,
+    /// cell router, IFFT, LDPC).
+    T2,
     /// The CW-RS network's front end (rsnn_front).
     Rsnn,
 }
@@ -39,7 +44,9 @@ pub fn loaded() -> String {
 fn has(mode: &str, part: Part) -> bool {
     match mode {
         "trx" => part == Part::Rsnn,
-        "datv" => part == Part::Datv,
+        "datv" => part == Part::S2 || part == Part::T2,
+        "s2" => part == Part::S2,
+        "t2" => part == Part::T2,
         // "all" and anything unknown: never switch away
         _ => true,
     }
@@ -52,7 +59,8 @@ pub fn switch_for(part: Part) -> Option<&'static str> {
         return None;
     }
     let order: &[&'static str] = match part {
-        Part::Datv => &["datv", "all"],
+        Part::S2 => &["s2", "datv", "all"],
+        Part::T2 => &["t2", "datv", "all"],
         Part::Rsnn => &["trx", "all"],
     };
     // the boot mode's comes out of the running slot's FIT (fpga-mode)
@@ -71,7 +79,13 @@ pub fn available(part: Part) -> bool {
 /// change while trxd runs).
 pub fn datv_available() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| available(Part::Datv))
+    *V.get_or_init(|| available(Part::S2) || available(Part::T2))
+}
+
+/// The DATV part a web command's mode needs: DVB-T2 for the "T2-..." rates,
+/// else DVB-S2 (also a command that names none).
+pub fn datv_part(rate: Option<&str>) -> Part {
+    if rate.is_some_and(|r| r.starts_with("T2-")) { Part::T2 } else { Part::S2 }
 }
 
 /// The firmware flavour ("basic", "plus"; "" for a build without one).
@@ -239,6 +253,18 @@ mod tests {
         f.extend(st);
         f.extend(strings);
         f
+    }
+
+    #[test]
+    fn modes_hold_their_parts() {
+        assert!(has("s2", Part::S2) && !has("s2", Part::T2) && !has("s2", Part::Rsnn));
+        assert!(has("t2", Part::T2) && !has("t2", Part::S2));
+        assert!(has("datv", Part::S2) && has("datv", Part::T2) && !has("datv", Part::Rsnn));
+        assert!(has("trx", Part::Rsnn) && !has("trx", Part::S2) && !has("trx", Part::T2));
+        assert!(has("all", Part::T2) && has("all", Part::Rsnn));
+        assert_eq!(datv_part(Some("T2-1.7-QPSK-1/2")), Part::T2);
+        assert_eq!(datv_part(Some("L-8PSK-3/4")), Part::S2);
+        assert_eq!(datv_part(None), Part::S2);
     }
 
     #[test]

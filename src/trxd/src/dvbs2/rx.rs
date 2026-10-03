@@ -51,6 +51,9 @@ pub struct Stats {
     /// Seconds spent in the LDPC decoder and in the rest of the receiver.
     pub ldpc_s: f64,
     pub other_s: f64,
+    /// CPU seconds of the decoder thread (`ldpc_s` is wall time: with the
+    /// FPGA decoder mostly its wait).
+    pub fec_cpu_s: f64,
     /// Of `frames_bad`: LDPC did not converge / the BBHEADER CRC failed.
     pub ldpc_fail: u64,
     pub crc_fail: u64,
@@ -89,6 +92,10 @@ pub struct Stats {
     /// DVB-S2 frames from the ring the engine could not read in time (the
     /// recorder had overwritten them): lost.
     pub ring_lapped: u64,
+    /// Ring mode, tracking: known blocks from the FPGA's accumulator /
+    /// made from the ring's words (s2trk).
+    pub trk_hw: u64,
+    pub trk_model: u64,
 }
 
 /// Length (symbols) of a PLFRAME with this PLS; None for reserved MODCODs.
@@ -124,6 +131,16 @@ struct RingRx {
     /// the model makes the cells: tests, a PC).
     engine: bool,
     watch: Option<std::sync::Arc<super::fpga::RingWatch>>,
+    /// The FPGA's known-block entries (s2trk) by absolute first symbol.
+    hw: std::collections::BTreeMap<u64, super::s2trk::Entry>,
+    tabs: super::s2trk::Tables,
+    /// Our header's quarter turns (the unit's table).
+    hdr_q: Vec<u8>,
+    /// The unit is there ([`Receiver::set_trk`]); commands for it.
+    trk: bool,
+    ctl: Vec<super::s2trk::Ctl>,
+    trk_loaded: Option<u64>,
+    dth_sent: Option<u32>,
 }
 
 /// The AFC's mixer as a function of the absolute symbol: th0 + w (k - k0).
@@ -147,6 +164,13 @@ impl RingRx {
             _ => self.mix.at(k),
         }
     }
+    /// The mixer's step a symbol at `k`.
+    fn w_at(&self, k: u64) -> f64 {
+        match self.prev {
+            Some(p) if k < self.mix.k0 => p.w,
+            _ => self.mix.w,
+        }
+    }
     fn raw_sym(w: u32) -> Complex32 {
         Complex32::new((w as u16 as i16) as f32 / 32768.0, ((w >> 16) as u16 as i16) as f32 / 32768.0)
     }
@@ -157,6 +181,8 @@ struct Other {
     modcod: u8,
     len: usize,
     header: Vec<Complex32>,
+    /// Its PLS index (modcod << 2 | short << 1 | pilots).
+    pls: u8,
 }
 
 pub struct Receiver {
@@ -232,6 +258,10 @@ pub struct Receiver {
     others: Vec<Other>,
     /// The frame at `locked_at`: ours (None) or `others[i]`.
     cur: Option<usize>,
+    /// Ring mode, tracking: the carrier fit, amplitude and noise from
+    /// per-block sums (s2trk; TRXD_S2_OLDFRAME=1: from every known symbol
+    /// as before).
+    sums: bool,
     ring: Option<RingRx>,
 }
 
@@ -574,12 +604,13 @@ impl Receiver {
                             continue;
                         }
                         let len = plframe_len(modcod, short, pilots).unwrap();
-                        v.push(Other { modcod, len, header: super::plheader_typed(modcod, pilots, short) });
+                        v.push(Other { modcod, len, header: super::plheader_typed(modcod, pilots, short), pls: modcod << 2 | (short as u8) << 1 | pilots as u8 });
                     }
                 }
                 v
             },
             cur: None,
+            sums: std::env::var_os("TRXD_S2_OLDFRAME").is_none(),
             ring: None,
         }
     }
@@ -601,8 +632,53 @@ impl Receiver {
         let mut r = Receiver::with_spec(spec, rs, rs, 0.0);
         r.symbol_input = true;
         r.flagged = true;
-        r.ring = Some(RingRx { raw: Vec::new(), abs0: at, mix: Mix { k0: at, th0: 0.0, w: 0.0 }, prev: None, engine, watch });
+        let hdr_q = super::s2trk::quarters(&r.header);
+        r.ring = Some(RingRx {
+            raw: Vec::new(),
+            abs0: at,
+            mix: Mix { k0: at, th0: 0.0, w: 0.0 },
+            prev: None,
+            engine,
+            watch,
+            hw: Default::default(),
+            tabs: Default::default(),
+            hdr_q,
+            trk: false,
+            ctl: Vec::new(),
+            trk_loaded: None,
+            dth_sent: None,
+        });
         r
+    }
+
+    /// Ring mode: the FPGA has the known-symbol accumulator (s2trk); its
+    /// commands then come out of [`Self::trk_ctl`].
+    pub fn set_trk(&mut self, on: bool) {
+        if let Some(r) = self.ring.as_mut() {
+            r.trk = on;
+            if on {
+                r.ctl.push(super::s2trk::Ctl::Header(r.hdr_q.clone()));
+            }
+        }
+    }
+
+    /// Commands for the FPGA's accumulator since the last call.
+    pub fn trk_ctl(&mut self) -> Vec<super::s2trk::Ctl> {
+        self.ring.as_mut().map_or_else(Vec::new, |r| std::mem::take(&mut r.ctl))
+    }
+
+    /// The accumulator's entries (as read from its FIFO).
+    pub fn push_trk(&mut self, ents: &[[u32; super::s2trk::ENTRY_WORDS]]) {
+        let Some(r) = self.ring.as_mut() else { return };
+        let now = r.abs0 + r.raw.len() as u64;
+        for w in ents {
+            let e = super::s2trk::Entry::from_words(w);
+            let k = crate::dvbt2::fe::extend(e.k0, 32, now);
+            r.hw.insert(k, e);
+        }
+        // (what fell out of the buffer)
+        let keep = r.hw.split_off(&r.abs0);
+        r.hw = keep;
     }
 
     /// Ring words from absolute word `at` (see [`Self::new_ring_spec`]);
@@ -824,6 +900,60 @@ impl Receiver {
         header_metric_of(&self.win(k, SLOT), header)
     }
 
+    /// After a frame of ours at `p` (tracking): the FPGA's accumulator gets
+    /// the mixer's step when it changed (it takes it at its next frame
+    /// start) and, when it did not have this frame's header, the next
+    /// frame to follow from.
+    fn trk_commands(&mut self, p: usize, next: usize, kind: Option<usize>) {
+        let (len, pilots, npil) = (self.frame_len as u32, self.spec.pilots, (self.known.len() - 1) as u8);
+        let Some(r) = self.ring.as_mut().filter(|r| r.trk) else { return };
+        let d = super::s2trk::step(r.mix.w);
+        if r.dth_sent != Some(d) {
+            r.ctl.push(super::s2trk::Ctl::Dth(d));
+            r.dth_sent = Some(d);
+        }
+        let at = r.abs0 + p as u64;
+        if kind.is_none() && !r.hw.contains_key(&at) && r.trk_loaded.is_none_or(|l| at >= l + 2 * len as u64) {
+            r.ctl.push(super::s2trk::Ctl::Load { base: r.abs0 + next as u64, len, pilots, npil });
+            r.trk_loaded = Some(at);
+        }
+    }
+
+    /// Ring mode: the known block at buffer index `k` (`len` symbols; a
+    /// header with quarter turns `hdr`, ours when None and `pilot_at` None;
+    /// pilots from frame position `pilot_at` on): its correlation with the
+    /// references per symbol, mixed as the receiver mixes, and its power.
+    /// The FPGA's entry when it has one made with our mixer step, else the
+    /// same sums from the words (s2trk::block).
+    fn known_block(&mut self, k: usize, len: usize, hdr: Option<&[u8]>, pilot_at: Option<usize>) -> (Complex32, f64) {
+        let r = self.ring.as_ref().expect("ring mode");
+        let abs = r.abs0 + k as u64;
+        let ph0 = r.phase(abs);
+        let w = r.w_at(abs);
+        let dth = super::s2trk::step(w);
+        let mid = ph0 + w * (len - 1) as f64 / 2.0;
+        let ours = hdr.is_none();
+        // (its own mixer's step may lag ours by a retune: its mean phase is
+        // corrected by corr(); the rest turns the block's ends by
+        // dw len / 2 at most, taken when under 0.05 rad)
+        let close = |e: &&super::s2trk::Entry| {
+            let dw = e.dth.wrapping_sub(dth) as i32 as f64 * std::f64::consts::TAU / 4_294_967_296.0;
+            dw.abs() * len as f64 / 2.0 < 0.05
+        };
+        if let Some(e) = r.hw.get(&abs).filter(|e| ours && close(e)) {
+            let c = (e.corr(len, mid), e.power());
+            self.stats.trk_hw += 1;
+            return c;
+        }
+        let words = &r.raw[k..k + len];
+        let e = match pilot_at {
+            Some(at) => super::s2trk::block(&r.tabs, words, abs, self.scramble[at - SLOT..at - SLOT + len].iter().copied(), super::s2trk::turns(ph0), dth),
+            None => super::s2trk::block(&r.tabs, words, abs, hdr.unwrap_or(&r.hdr_q).iter().copied(), super::s2trk::turns(ph0), dth),
+        };
+        self.stats.trk_model += 1;
+        (e.corr(len, mid), e.power())
+    }
+
     /// Another PLFRAME's header in `lo..=hi`: the best SOF position (two
     /// coherent chunks of 13, as the FPGA's [`super::hdrdet`]), then every
     /// other PLS code there. (position, metric, index into `others`) when
@@ -844,8 +974,25 @@ impl Receiver {
         };
         let k = (lo..=hi).max_by(|&a, &b| sof(a).total_cmp(&sof(b)))?;
         let w = self.win(k, SLOT);
-        let (i, m) = self.others.iter().enumerate().map(|(i, o)| (i, header_metric_of(&w, &o.header))).max_by(|a, b| a.1.total_cmp(&b.1))?;
+        let (i, m) = if self.sums {
+            // the PLS there (one decode, not 115 correlations)
+            let i = self.pls_other(&w)?;
+            (i, header_metric_of(&w, &self.others[i].header))
+        } else {
+            self.others.iter().enumerate().map(|(i, o)| (i, header_metric_of(&w, &o.header))).max_by(|a, b| a.1.total_cmp(&b.1))?
+        };
         (m >= SYNC_MIN).then_some((k, m, i))
+    }
+
+    /// The other frame type whose PLS the header `w` carries (None: ours,
+    /// or none of the others). Its phase from the SOF, then
+    /// [`super::s2trk::pls_decode`].
+    fn pls_other(&self, w: &[Complex32]) -> Option<usize> {
+        let c: Complex32 = (0..26).map(|i| w[i] * self.header[i].conj()).sum();
+        let rot = c.conj() / c.norm().max(1e-20);
+        let h: Vec<Complex32> = w.iter().map(|z| z * rot).collect();
+        let (idx, _) = super::s2trk::pls_decode(&h);
+        self.others.iter().position(|o| o.pls == idx)
     }
 
     /// A frame of another type was stepped over.
@@ -946,6 +1093,9 @@ impl Receiver {
             return false;
         }
         let w = self.win(k, SLOT);
+        if self.sums {
+            return self.pls_other(&w).is_some_and(|i| header_metric_of(&w, &self.others[i].header) > m);
+        }
         self.others.iter().any(|o| header_metric_of(&w, &o.header) > m)
     }
 
@@ -1139,14 +1289,32 @@ impl Receiver {
         // against the frequency so far, then a least-squares line.
         let mut pts: Vec<(f64, f64, f32)> = Vec::new(); // (centre symbol, phase, weight)
         let with_next = next + SLOT <= self.nsyms();
-        for &(at, len) in &self.known {
-            let c = self.block(p, at, len, f);
-            pts.push(((at + len / 2) as f64, c.arg() as f64, c.norm() * len as f32));
-        }
-        if with_next {
-            let h = kind.map_or(&self.header, |i| &self.others[i].header);
-            let c = self.block_with(next, 0, SLOT, f, h);
-            pts.push(((next - p + SLOT / 2) as f64, c.arg() as f64, c.norm() * SLOT as f32));
+        // Ring mode, tracking: per-block sums (the FPGA's, or made from the
+        // words), the frequency left inside a block ignored (a few Hz when
+        // tracking); (correlation per symbol, power) of each known block.
+        let sums = self.sums && !acquiring && self.ring.is_some();
+        let mut kb: Vec<(Complex32, f64)> = Vec::new();
+        if sums {
+            for (b, &(at, len)) in self.known.clone().iter().enumerate() {
+                let c = self.known_block(p + at, len, None, (b > 0).then_some(at));
+                pts.push(((at + len / 2) as f64, c.0.arg() as f64, c.0.norm() * len as f32));
+                kb.push(c);
+            }
+            if with_next {
+                let q = kind.map(|i| super::s2trk::quarters(&self.others[i].header));
+                let c = self.known_block(next, SLOT, q.as_deref(), None).0;
+                pts.push(((next - p + SLOT / 2) as f64, c.arg() as f64, c.norm() * SLOT as f32));
+            }
+        } else {
+            for &(at, len) in &self.known {
+                let c = self.block(p, at, len, f);
+                pts.push(((at + len / 2) as f64, c.arg() as f64, c.norm() * len as f32));
+            }
+            if with_next {
+                let h = kind.map_or(&self.header, |i| &self.others[i].header);
+                let c = self.block_with(next, 0, SLOT, f, h);
+                pts.push(((next - p + SLOT / 2) as f64, c.arg() as f64, c.norm() * SLOT as f32));
+            }
         }
         // Unwrap against a predicted frequency, fit a line (weighted least
         // squares), score by the weighted residual. Phases sampled at the
@@ -1232,9 +1400,22 @@ impl Receiver {
         let (mut amp, mut n_known) = (0f32, 0usize);
         let mut noise = 0f32;
         let a = std::f32::consts::FRAC_1_SQRT_2;
+        if sums {
+            // from the block sums: amp = mean Re(c e^(-j phase)); noise =
+            // mean |s|^2 - amp^2 (the phase constant inside a block)
+            let mut pw = 0f64;
+            for (&(at, len), &(c, p_b)) in self.known.iter().zip(&kb) {
+                let ph = phase_at((at + len / 2) as f64) as f32;
+                amp += (c * Complex32::new(ph.cos(), -ph.sin())).re * len as f32;
+                pw += p_b;
+                n_known += len;
+            }
+            amp /= n_known as f32;
+            noise = (pw as f32 - n_known as f32 * amp * amp).max(0.0);
+        }
         // (the known symbols, made once)
-        let kw: Vec<Cow<'_, [Complex32]>> = self.known.iter().map(|&(at, len)| self.win(p + at, len)).collect();
-        for (b, &(at, len)) in self.known.iter().enumerate() {
+        let kw: Vec<Cow<'_, [Complex32]>> = if sums { Vec::new() } else { self.known.iter().map(|&(at, len)| self.win(p + at, len)).collect() };
+        for (b, &(at, len)) in self.known.iter().enumerate().filter(|_| !sums) {
             for i in 0..len {
                 let k = at + i;
                 let ph = phase_at(k as f64) as f32;
@@ -1244,8 +1425,10 @@ impl Receiver {
                 n_known += 1;
             }
         }
-        amp /= n_known as f32;
-        for (b, &(at, len)) in self.known.iter().enumerate() {
+        if !sums {
+            amp /= n_known as f32;
+        }
+        for (b, &(at, len)) in self.known.iter().enumerate().filter(|_| !sums) {
             for i in 0..len {
                 let k = at + i;
                 let ph = phase_at(k as f64) as f32;
@@ -1292,6 +1475,46 @@ impl Receiver {
         let mut rot = Complex32::new(1.0, 0.0);
         let mut step = Complex32::new(1.0, 0.0);
         let mut seg_end = 0usize;
+        if ring_job && sums {
+            // Every 128th data symbol (the MER, the constellation: 169 to
+            // 253 points a long frame): per data group one rotator for the
+            // mixer less the carrier fit (both linear in a group), stepped
+            // SAMPLE symbols at a time.
+            const SAMPLE: usize = 128;
+            let r = self.ring.as_ref().expect("ring mode");
+            let base = r.abs0 + p as u64;
+            let glen = if self.spec.pilots { super::s2ring::GROUP } else { nsym };
+            for gi in 0..nsym.div_ceil(glen) {
+                let n0 = gi * glen;
+                let k_s = SLOT + gi * (glen + if self.spec.pilots { PILOT } else { 0 });
+                let ab = base + k_s as u64;
+                let th = r.phase(ab) - phase_at(k_s as f64);
+                let w = (r.phase(ab + 1) - r.phase(ab)) - (phase_at(k_s as f64 + 1.0) - phase_at(k_s as f64));
+                let mut n = n0.div_ceil(SAMPLE) * SAMPLE;
+                let a0 = th + w * (n - n0) as f64;
+                let mut rot = Complex32::new(a0.cos() as f32, a0.sin() as f32);
+                let sw = SAMPLE as f64 * w;
+                let st = Complex32::new(sw.cos() as f32, sw.sin() as f32);
+                while n < (n0 + glen).min(nsym) {
+                    let k = k_s + (n - n0);
+                    let s = RingRx::raw_sym(r.raw[p + k]) * rot;
+                    rot *= st;
+                    let d = super::rotate(s, (4 - self.scramble[k - SLOT]) & 3);
+                    let dec = if self.spec.bps == 2 {
+                        Complex32::new(amp * a * d.re.signum(), amp * a * d.im.signum())
+                    } else {
+                        let best = (0..8).min_by(|&x, &y| (d - psk8[x] * amp).norm_sqr().total_cmp(&(d - psk8[y] * amp).norm_sqr())).unwrap();
+                        psk8[best] * amp
+                    };
+                    dd_sig += dec.norm_sqr();
+                    dd_err += (d - dec).norm_sqr();
+                    let q = |v: f32| (v * unit).round().clamp(-127.0, 127.0) as i8;
+                    self.constellation.push([q(d.re), q(d.im)]);
+                    n += SAMPLE;
+                }
+            }
+            n = nsym;
+        }
         while n < nsym {
             if pilot < self.known.len() && k == self.known[pilot].0 {
                 k += PILOT;
@@ -1377,6 +1600,9 @@ impl Receiver {
             }
             n += 1;
             k += 1;
+        }
+        if sums {
+            self.trk_commands(p, next, kind);
         }
         self.stats.data_esn0_db = 10.0 * (dd_sig / dd_err.max(1e-9)).log10();
         self.constellation_seq += 1;
@@ -1745,6 +1971,16 @@ fn spawn_fec<B: FecBlock>(
             let mut st = Stats::default();
             let mut dumped = 0usize;
             let (mut nblk, mut dmx_ns, mut t_prof) = (0u64, 0u64, std::time::Instant::now());
+            // this thread's CPU time (the shares above are wall time, the
+            // engine's decode included, which this thread sleeps through)
+            let cpu_s = || {
+                let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                // SAFETY: a valid timespec out-pointer.
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) };
+                t.tv_sec as f64 + t.tv_nsec as f64 * 1e-9
+            };
+            let cpu_base = cpu_s();
+            let mut cpu0 = cpu_base;
             for llr in frx.iter() {
                 if llr.is_empty() {
                     fec.lost();
@@ -1790,17 +2026,27 @@ fn spawn_fec<B: FecBlock>(
                     tracing::info!(
                         llr_in_ms = format!("{:.2}", ms(&PROF_NS[0])),
                         fpga_ms = format!("{:.2}", ms(&PROF_NS[1])),
+                        // iterations a decode, and decodes that did not converge (at the limit)
+                        iters = {
+                            use super::fpga_ldpc::PROF_ITER;
+                            let n = PROF_ITER[0].swap(0, Ordering::Relaxed).max(1);
+                            format!("{:.1}", PROF_ITER[1].swap(0, Ordering::Relaxed) as f64 / n as f64)
+                        },
+                        unconverged = super::fpga_ldpc::PROF_ITER[2].swap(0, Ordering::Relaxed),
                         bits_out_ms = format!("{:.2}", ms(&PROF_NS[2])),
                         bch_ms = format!("{:.2}", ms(&FEC_PROF_NS[0])),
                         deframe_ms = format!("{:.2}", ms(&FEC_PROF_NS[1])),
                         demux_ms = format!("{:.2}", dmx_ns as f64 / per / 1e6),
                         blocks = nblk,
+                        cpu_pct = format!("{:.1}", 100.0 * (cpu_s() - cpu0) / t_prof.elapsed().as_secs_f64()),
                         "DATV FEC per block"
                     );
+                    cpu0 = cpu_s();
                     dmx_ns = 0;
                     nblk = 0;
                     t_prof = std::time::Instant::now();
                 }
+                st.fec_cpu_s = cpu_s() - cpu_base;
                 *fs2.lock().unwrap() = st;
                 let mut s = sh.lock().unwrap();
                 s.si = dmx.si.clone();
@@ -1863,8 +2109,12 @@ impl RxThread {
                 let (btx, brx) = crossbeam_channel::bounded::<(Vec<Complex32>, Option<Vec<bool>>)>(800);
                 // Ring mode (stage 2, s2ring): raw words from an absolute
                 // position (None: the reader was lapped, words lost).
-                let (wtx, wrx) = crossbeam_channel::bounded::<(Option<u64>, Vec<u32>)>(800);
-                type Ring = Option<(u64, std::sync::Arc<super::fpga::RingWatch>)>;
+                // (with the known-symbol accumulator's entries read with them)
+                type Ents = Vec<[u32; super::s2trk::ENTRY_WORDS]>;
+                let (wtx, wrx) = crossbeam_channel::bounded::<(Option<u64>, Vec<u32>, Ents)>(800);
+                // the receiver's commands for the accumulator
+                let (ctx_trk, crx_trk) = crossbeam_channel::bounded::<super::s2trk::Ctl>(64);
+                type Ring = Option<(u64, std::sync::Arc<super::fpga::RingWatch>, bool)>;
                 let (ftx_fs, frx_fs) = crossbeam_channel::bounded::<(f64, bool, bool, Ring)>(1);
                 let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let (st2, dr2) = (stop.clone(), dr.clone());
@@ -1886,7 +2136,7 @@ impl RxThread {
                         let ring = if ring_mode {
                             let mut first = Vec::new();
                             let at = fe.read_raw(&mut first).unwrap_or(0) + first.len() as u64;
-                            fe.watch().map(|w| (at, std::sync::Arc::new(w)))
+                            fe.watch().map(|w| (at, std::sync::Arc::new(w), fe.s2trk()))
                         } else {
                             None
                         };
@@ -1898,6 +2148,13 @@ impl RxThread {
                             std::thread::sleep(std::time::Duration::from_millis(5));
                             fe.set_center(f64::from_bits(fc.load(Ordering::Relaxed)));
                             if ring_mode {
+                                for c in crx_trk.try_iter() {
+                                    fe.trk_ctl(&c);
+                                }
+                                // the entries first: those of blocks whose
+                                // words come now or came before
+                                let mut ents = Vec::new();
+                                fe.read_trk(&mut ents);
                                 let mut words = Vec::new();
                                 let at = fe.read_raw(&mut words);
                                 last = std::time::Instant::now();
@@ -1906,7 +2163,7 @@ impl RxThread {
                                     dr2.fetch_add(1, Ordering::Relaxed);
                                     tracing::warn!("DATV: the FPGA recorder dropped samples");
                                 }
-                                if (at.is_none() || !words.is_empty()) && wtx.try_send((at, words)).is_err() {
+                                if (at.is_none() || !words.is_empty() || !ents.is_empty()) && wtx.try_send((at, words, ents)).is_err() {
                                     dr2.fetch_add(1, Ordering::Relaxed);
                                 }
                                 continue;
@@ -1957,7 +2214,11 @@ impl RxThread {
                 tracing::info!(fs = fs_out, symbols, flagged, ring = ring_rx.is_some(), "DATV receive through the FPGA DDC");
                 let mut ring_at = ring_rx.as_ref().map(|r| r.0);
                 let mut r = match ring_rx {
-                    Some((at, watch)) => Receiver::new_ring_spec(p, sr, at, true, Some(watch)),
+                    Some((at, watch, trk)) => {
+                        let mut r = Receiver::new_ring_spec(p, sr, at, true, Some(watch));
+                        r.set_trk(trk);
+                        r
+                    }
                     None if symbols => Receiver::new_symbols_spec(p, sr, 0.0),
                     None => Receiver::new_prefiltered_spec(p, fs_out, sr, 0.0),
                 };
@@ -1974,7 +2235,8 @@ impl RxThread {
                     }
                     if let Some(at) = ring_at.as_mut() {
                         match wrx.recv_timeout(std::time::Duration::from_millis(20)) {
-                            Ok((pos, words)) => {
+                            Ok((pos, words, ents)) => {
+                                r.push_trk(&ents);
                                 // a lap: the next words start at the DMA (pos)
                                 if let Some(pos) = pos {
                                     *at = pos;
@@ -1983,6 +2245,9 @@ impl RxThread {
                                 }
                                 r.process_ring(*at, &words, &mut none);
                                 *at += words.len() as u64;
+                                for c in r.trk_ctl() {
+                                    let _ = ctx_trk.try_send(c);
+                                }
                                 publish(&r, &sh, &mut seen);
                             }
                             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -2033,7 +2298,7 @@ impl RxThread {
                 // Samples (no FFT front end) or front-end words; commands back.
                 let (btx, brx) = crossbeam_channel::bounded::<Result<Vec<Complex32>, Vec<u32>>>(800);
                 let (ctx, crx) = crossbeam_channel::unbounded::<crate::dvbt2::fe::Ctl>();
-                let (ftx_fs, frx_fs) = crossbeam_channel::bounded::<(f64, bool)>(1);
+                let (ftx_fs, frx_fs) = crossbeam_channel::bounded::<(f64, bool, bool)>(1);
                 let params = mode.p;
                 let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let (st2, dr2) = (stop.clone(), dr.clone());
@@ -2049,7 +2314,7 @@ impl RxThread {
                                 return;
                             }
                         };
-                        let _ = ftx_fs.send((fe.fs_out(), fe.t2_fe()));
+                        let _ = ftx_fs.send((fe.fs_out(), fe.t2_fe(), fe.t2_hw()));
                         let mut reported = false;
                         // (`touch /tmp/t2-words-all` too: from the start, the search included)
                         let mut rec_on = std::path::Path::new("/tmp/t2-words-all").exists();
@@ -2129,7 +2394,7 @@ impl RxThread {
                         }
                     })
                     .expect("spawn datv-ring");
-                let Ok((fs, t2_fe)) = frx_fs.recv() else {
+                let Ok((fs, t2_fe, t2_hw)) = frx_fs.recv() else {
                     return;
                 };
                 tracing::info!(fs, t2_fe, mode = %label_log(&mode), "DVB-T2 receive through the FPGA resampler");
@@ -2140,7 +2405,10 @@ impl RxThread {
                 d.cells_out = super::fpga_ldpc::cells_available();
                 d.cells16_out = super::fpga_ldpc::cells16_available();
                 let router = d.enable_router();
-                tracing::info!(cells = d.cells_out, qam16 = d.cells16_out, router, "DVB-T2 LLRs in the FPGA");
+                // the FPGA's P1 / GI / MER reports (searching and tracking
+                // without raw samples, the frame's end with its MER)
+                d.hw = t2_fe && t2_hw;
+                tracing::info!(cells = d.cells_out, qam16 = d.cells16_out, router, reports = d.hw, "DVB-T2 LLRs in the FPGA");
                 let (mut blocks, mut seen) = (Vec::new(), 0u64);
                 let (mut busy_s, mut t_log) = (0f64, std::time::Instant::now());
                 let mut prof_f0 = 0u64;
@@ -2174,7 +2442,7 @@ impl RxThread {
                             let dt = t0.elapsed().as_secs_f64();
                             busy_s += dt;
                             if t_log.elapsed() > std::time::Duration::from_secs(30) {
-                                tracing::info!(demod_cpu = format!("{:.1} %", 100.0 * busy_s / t_log.elapsed().as_secs_f64()), mer_db = d.stats.mer_db, freq_hz = d.stats.freq_hz, frames = d.stats.frames, gaps = d.stats.gaps, p1_missed = d.stats.p1_missed, resched = d.stats.resched, retunes = d.stats.retunes, router = ?d.router_counters(), router_missed = d.router_missed, prof_ms = ?d.prof.map(|x| (x * 1e3 / (d.stats.frames - prof_f0).max(1) as f64 * 10.0).round() / 10.0), "DVB-T2 demodulator");
+                                tracing::info!(demod_cpu = format!("{:.1} %", 100.0 * busy_s / t_log.elapsed().as_secs_f64()), mer_db = d.stats.mer_db, freq_hz = d.stats.freq_hz, frames = d.stats.frames, gaps = d.stats.gaps, p1_missed = d.stats.p1_missed, resched = d.stats.resched, retunes = d.stats.retunes, l1_ok_unchecked_failed = ?(d.stats.l1_ok, d.stats.l1_unchecked, d.stats.l1_failed), router = ?d.router_counters(), router_missed = d.router_missed, prof_ms = ?d.prof.map(|x| (x * 1e3 / (d.stats.frames - prof_f0).max(1) as f64 * 10.0).round() / 10.0), "DVB-T2 demodulator");
                                 (busy_s, t_log) = (0.0, std::time::Instant::now());
                                 d.prof = [0.0; 6];
                                 prof_f0 = d.stats.frames;
@@ -2260,6 +2528,7 @@ impl RxThread {
         st.ts_crc_bad = f.ts_crc_bad;
         st.blocks_lapped = f.blocks_lapped;
         st.ldpc_s = f.ldpc_s;
+        st.fec_cpu_s = f.fec_cpu_s;
         st.blocks_dropped = self.dropped.load(std::sync::atomic::Ordering::Relaxed);
         st.wall_s = self.started.elapsed().as_secs_f64();
         (st, s.msgs.drain(..).collect())
@@ -2640,6 +2909,43 @@ pub(crate) mod tests {
             }
         }
         (rx.stats, data.len(), dt)
+    }
+
+    /// With the FPGA's known-symbol accumulator (its model, s2trk::Unit):
+    /// it sees the words as they come, the receiver's commands reach it a
+    /// chunk late; once it follows the frames the receiver takes its
+    /// entries (with the AFC retuning the mixer through it) and decodes
+    /// every frame as without it.
+    #[test]
+    fn ring_with_the_fpga_accumulator() {
+        use super::super::fpga_tx::LongMode;
+        for mode in [LongMode::Qpsk12, LongMode::Psk8_34] {
+            let rs = 250e3;
+            let words = ring_words(mode, 8.0, 24, 900.0, rs);
+            let mut rx = Receiver::new_ring_spec(FrameSpec::long(mode), rs, 1_000, false, None);
+            rx.set_trk(true);
+            let mut unit = super::super::s2trk::Unit::new(1_000);
+            let mut out = Vec::new();
+            let mut at = 1_000u64;
+            let mut late = Vec::new();
+            for c in words.chunks(4096) {
+                for cmd in late.drain(..) {
+                    unit.ctl(&cmd);
+                }
+                unit.push(c);
+                let ents = std::mem::take(&mut unit.entries);
+                rx.push_trk(&ents);
+                rx.process_ring(at, c, &mut out);
+                at += c.len() as u64;
+                late = rx.trk_ctl();
+            }
+            let s = &rx.stats;
+            eprintln!("{mode:?}: frames {} bad {} esn0 {:.1} dB, blocks from the unit {} / made {}", s.frames, s.frames_bad, s.esn0_db, s.trk_hw, s.trk_model);
+            assert!(s.locked && s.frames >= 20 && s.ldpc_fail == 0, "{s:?}");
+            // all but the first two tracked frames' blocks from the unit (it
+            // follows from the frame after the load)
+            assert!(s.trk_hw >= 2 * s.trk_model, "{} / {}", s.trk_hw, s.trk_model);
+        }
     }
 
     #[test]

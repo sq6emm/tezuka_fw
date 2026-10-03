@@ -313,6 +313,9 @@ pub struct Mux {
     last_key: Option<u64>,
     /// Media time `ts_us` that maps to 90 kHz clock `pts90`.
     anchor: Option<(i64, u64)>,
+    /// The audio's own continuity: the (media time, PTS) of the frame
+    /// after the last PES flushed.
+    audio_cont: Option<(i64, u64)>,
     audio: Vec<(i64, Vec<u8>)>,
     video_dropping: bool,
     /// The browser should send a keyframe next.
@@ -348,6 +351,7 @@ impl Mux {
             last_key: None,
             start_unix: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64()),
             anchor: None,
+            audio_cont: None,
             audio: Vec::new(),
             video_dropping: false,
             want_key: false,
@@ -372,14 +376,44 @@ impl Mux {
         self.queue.len() as f64 / self.pps
     }
 
+    /// The nominal delay from a medium's time to its PTS, 90 kHz ticks.
+    fn delay90(&self) -> u64 {
+        ((DELAY_S + self.profile.audio_per_pes as f64 * 0.02).min(self.profile.tstd_max_s) * 90_000.0) as u64
+    }
+
+    /// The PTS lead over the mux clock from which [`Self::pts90`] takes the
+    /// browser's clock as having run ahead (live media after stale, a
+    /// new stream) and anchors afresh: three times the nominal delay.
+    fn far_ahead90(&self) -> u64 {
+        self.clock27(self.sent) / 300 + 3 * self.delay90()
+    }
+
     fn pts90(&mut self, ts_us: i64) -> u64 {
         let now90 = self.clock27(self.sent) / 300;
-        let delay90 = ((DELAY_S + self.profile.audio_per_pes as f64 * 0.02).min(self.profile.tstd_max_s) * 90_000.0) as u64;
-        if let Some((t0, p0)) = self.anchor {
-            let pts = p0 as i64 + (ts_us - t0) * 9 / 100;
+        let delay90 = self.delay90();
+        let (late, far) = ((now90 + delay90 / 4) as i64, self.far_ahead90() as i64);
+        let pts_of = |(t0, p0): (i64, u64)| p0 as i64 + (ts_us - t0) * 9 / 100;
+        if let Some(a) = self.anchor {
+            let pts = pts_of(a);
             // Browser and board clocks drift apart slowly; re-anchor when late or far ahead.
-            if pts > (now90 + delay90 / 4) as i64 && pts < (now90 + 3 * delay90) as i64 {
+            if pts > late && pts < far {
                 return pts as u64;
+            }
+            // Far ahead: the browser's clock ran on (live media after stale),
+            // or only this clock stood still (the modulator takes a frame's
+            // packets at once, a second of them at 33 kS/s, after a late
+            // keyframe moved the timeline on). On the audio's own continuity
+            // when that is near enough (a delay past the limit): the sound
+            // never steps back into its previous PES. A stale start (12 s)
+            // is still anchored afresh, and caught by `late` after that.
+            if pts >= far {
+                if let Some(c) = self.audio_cont {
+                    let pts = pts_of(c);
+                    if pts > late && pts < far + delay90 as i64 {
+                        self.anchor = Some(c);
+                        return pts as u64;
+                    }
+                }
             }
         }
         self.anchor = Some((ts_us, now90 + delay90));
@@ -474,8 +508,17 @@ impl Mux {
                         self.dropped_frames += 1;
                     }
                     if self.late(pts) {
-                        let need = self.done_at_90() + (PTS_MARGIN_S * 90_000.0) as u64;
-                        // re-stamp: a new anchor so this and what follows are in time
+                        // Re-stamp: a new anchor so this and what follows are
+                        // in time. Never up to the lead pts90() takes for a
+                        // clock run ahead (a delay short of it: the modulator
+                        // takes a frame's packets at once, up to a second of
+                        // the clock): past it the anchor snapped back, the
+                        // audio (continuous) was stamped into its previous PES
+                        // and the next keyframe shifted it all again (33 kS/s
+                        // with 8 KB keyframes: the sound stepped back 0.8 s
+                        // every 3 s). A keyframe that alone takes longer than
+                        // that lead goes out late instead.
+                        let need = (self.done_at_90() + (PTS_MARGIN_S * 90_000.0) as u64).min(self.far_ahead90() - self.delay90()).max(pts);
                         let shift = need - pts;
                         if let Some((t0, p0)) = self.anchor {
                             self.anchor = Some((t0, p0 + shift));
@@ -505,6 +548,7 @@ impl Mux {
         let Some(&(ts, _)) = frames.first() else { return };
         let pts = self.pts90(ts);
         let pts = self.monotonic(1, pts);
+        self.audio_cont = Some((ts + frames.len() as i64 * 20_000, pts + frames.len() as u64 * 1800));
         let mut es = Vec::new();
         for (_, f) in &frames {
             // Opus control header (the Opus-in-MPEG-TS mapping, as ffmpeg writes it).
@@ -1297,6 +1341,136 @@ mod tests {
         let pat = finish_section(vec![0x00, 0xB0, 0, 0x00, 0x01, 0xC1, 0, 0, 0x00, 0x01, 0xF0, 0x00]);
         assert_eq!(crc32(&pat), 0);
         assert_eq!(crc32(b"123456789"), 0x0376_E6E7);
+    }
+
+    /// A transmission started again: media left over from before (12 s
+    /// old) arrives first, then live media. Audio and video PTS must
+    /// still agree (OTA: audio came out 16-18 s ahead of the picture).
+    #[test]
+    fn stale_media_first_keeps_av_together() {
+        let rate = 241_332.0;
+        let mut m = Mux::new(rate, "SQ6EMM");
+        let pps = rate / (TS_LEN as f64 * 8.0);
+        let old = 100_000_000i64; // us
+        let live = old + 12_000_000;
+        for i in 0..5 {
+            m.push(Media::Audio { ts_us: old + i * 20_000, data: vec![1; 60] });
+        }
+        m.push(Media::Video { ts_us: old, key: true, data: vec![0, 0, 0, 1, 0x65, 1, 2, 3] });
+        let mut d = Demux::default();
+        let mut got = Vec::new();
+        let (mut na, mut nv) = (live, live);
+        for n in 0..(20.0 * pps) as usize {
+            let t = live as f64 + n as f64 / pps * 1e6;
+            while (nv as f64) <= t {
+                m.push(Media::Video { ts_us: nv, key: (nv - live) % 2_000_000 == 0, data: vec![0, 0, 0, 1, 0x41, 9, 9, 9] });
+                nv += 100_000;
+            }
+            while (na as f64) <= t {
+                m.push(Media::Audio { ts_us: na, data: vec![2; 60] });
+                na += 20_000;
+            }
+            d.push(&m.next(), &mut got);
+        }
+        let pts = |k: u8| -> Vec<i64> {
+            got.iter().filter(|b| b[0] == k).map(|b| i64::from_le_bytes(b[if k == 6 { 2 } else { 1 }..][..8].try_into().unwrap())).collect()
+        };
+        let (v, a) = (pts(6), pts(7));
+        let (lv, la) = (*v.last().unwrap(), *a.last().unwrap());
+        // the last video and audio sent were within 0.1 s of each other
+        assert!((lv - la).abs() < 500_000, "video PTS {lv} us, audio PTS {la} us: {} ms apart", (lv - la) / 1000);
+    }
+
+    /// The lean profile with the browser's encoder over budget (33 kS/s
+    /// QPSK 1/2: 160x120 at 2 fps, a 3.7 KB keyframe every 2 s and after
+    /// each drop, as over the air): what the PTS of the two streams do.
+    /// The audio's data is continuous, so its PTS must never step back
+    /// into the previous PES (a decoder would play it twice) and the two
+    /// streams must keep the same clock.
+    #[test]
+    fn lean_profile_over_budget_pts() {
+        let rate = 31_856.0;
+        for (ksize, psize) in [(1700usize, 450usize), (3700, 300), (8000, 600), (12000, 800)] {
+        let mut m = Mux::new(rate, "SQ6EMM");
+        let p = m.profile;
+        let pps = rate / (TS_LEN as f64 * 8.0);
+        let (mut next_v, mut next_a, mut vi) = (0.0f64, 0.0f64, 0u64);
+        let mut d = Demux::default();
+        let mut got = Vec::new();
+        let mut want_key = false;
+        let mut backlog_max = 0f64;
+        // (the FPGA modulator takes a BBFRAME's packets at once: 32128 bits,
+        // a second of the stream)
+        let per_frame = (32_128.0 / (TS_LEN as f64 * 8.0)).ceil() as usize;
+        let mut pulled = 0usize;
+        for n in 0..(60.0 * pps) as usize {
+            let t = n as f64 / pps;
+            backlog_max = backlog_max.max(m.backlog_s());
+            while next_v <= t {
+                let key = vi % 4 == 0 || want_key;
+                want_key = false;
+                let size = if key { ksize } else { psize };
+                let data = [vec![0, 0, 0, 1, if key { 0x65 } else { 0x41 }], vec![(vi % 251) as u8; size]].concat();
+                m.push(Media::Video { ts_us: (next_v * 1e6) as i64, key, data });
+                vi += 1;
+                next_v += 1.0 / p.fps;
+            }
+            while next_a <= t {
+                m.push(Media::Audio { ts_us: (next_a * 1e6) as i64, data: vec![0xAB; (p.audio_bps / 8.0 * 0.02) as usize] });
+                next_a += 0.02;
+            }
+            if m.take_key_request() {
+                want_key = true;
+            }
+            if n + 1 >= pulled + per_frame {
+                for _ in 0..per_frame {
+                    d.push(&m.next(), &mut got);
+                }
+                pulled += per_frame;
+            }
+        }
+        let pts = |k: u8| -> Vec<i64> {
+            got.iter().filter(|b| b[0] == k).map(|b| i64::from_le_bytes(b[if k == 6 { 2 } else { 1 }..][..8].try_into().unwrap())).collect()
+        };
+        let (v, a) = (pts(6), pts(7));
+        // (a picture's PTS against the latest audio PTS before it in the
+        // stream: what a receiver has to hold the sound back by)
+        let mut la = None;
+        let mut ahead: Vec<i64> = Vec::new();
+        for b in &got {
+            if b[0] == 7 {
+                la = Some(i64::from_le_bytes(b[1..9].try_into().unwrap()));
+            } else if let Some(la) = la {
+                ahead.push((i64::from_le_bytes(b[2..10].try_into().unwrap()) - la) / 1000);
+            }
+        }
+        eprintln!("picture PTS ahead of the audio's at arrival, ms: {ahead:?}");
+        eprintln!("key {ksize} B, P {psize} B: dropped {} of {vi}, video out {}, audio frames out {}, backlog max {backlog_max:.2} s", m.dropped_frames, v.len(), a.len());
+        let mut back = 0;
+        let mut fwd = 0;
+        for w in a.windows(2) {
+            let d = w[1] - w[0];
+            if d != 20_000 {
+                eprintln!("audio step {:+} ms at {:.2} s", d / 1000, w[0] as f64 / 1e6);
+            }
+            if d < 0 {
+                back += 1;
+            } else if d > 200_000 {
+                fwd += 1;
+            }
+        }
+        for w in v.windows(2) {
+            let d = w[1] - w[0];
+            if !(400_000..=600_000).contains(&d) {
+                eprintln!("video step {:+} ms at {:.2} s", d / 1000, w[0] as f64 / 1e6);
+            }
+        }
+        eprintln!("audio: {back} steps back, {fwd} jumps over 200 ms");
+        assert_eq!(back, 0, "key {ksize} B: audio PTS stepped back into the previous PES");
+        // the clock moves on while the keyframes find their delay, then stays
+        assert!(fwd <= 3, "key {ksize} B: {fwd} jumps in the audio's clock");
+        assert!(v.len() >= 25, "key {ksize} B: {} pictures in 60 s", v.len());
+        }
     }
 
     /// Every audio packet the browser hands the mux comes out of the

@@ -45,6 +45,25 @@ pub const EQ_WORDS: usize = CARRIERS.div_ceil(2);
 /// front end never sends it: a carrier header for symbol 255).
 pub const GAP: u32 = 0xFFFF_FFFF;
 
+/// Report records (maia-hdl t2p1.py, t2eq.py): a carrier header with one of
+/// these symbol numbers, then [`REPORT_WORDS`] words of 16 bits each
+/// ([`report_value`]). P1: the best P1 window's start (2 words), |C| + |B|
+/// (2), E (2) per frame-length block; GI: the frame's guard-interval
+/// correlation re (2), im (2), the frame's start (2); MER: the pilots'
+/// error sum >> 4 (2), their number, the frame's start's low 21 bits (2), 0.
+/// A record's words come together but may sit inside a symbol's carriers.
+pub const P1_J: u8 = 253;
+pub const GI_J: u8 = 252;
+pub const MER_J: u8 = 251;
+pub const REPORT_WORDS: usize = 6;
+/// The t2_features bits a bitstream with the reports has.
+pub const FEATURES_REPORTS: u32 = 0b111;
+
+/// The 16 bits a report word carries.
+pub fn report_value(w: u32) -> u16 {
+    (((w >> 1) & 0x7FFF) | ((w >> 17) & 1) << 15) as u16
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Word {
     Gap,
@@ -89,6 +108,9 @@ pub enum Ctl {
     /// re | im << 16 (16 bits each, a z unit of [`EQ_Z_UNIT`] `gshift` bits
     /// up).
     EqTable { g: Vec<u32>, gshift: u32 },
+    /// Equalized symbols into the ring: all (0) or only symbol j (the
+    /// router takes them all).
+    EqRing(u8),
 }
 
 /// NCO step removing `hz` at `fs`.
@@ -149,6 +171,125 @@ pub mod model {
         /// prbs, pn; the table once loaded.
         eq: Option<(usize, usize, usize, usize, Vec<u8>, Vec<u8>)>,
         eq_g: Option<(Vec<Complex32>, u32)>,
+        /// Reports (t2p1.py, t2eq.py) when enabled: P1 / GI model, the MER
+        /// sum of the frame, which equalized symbols go out.
+        reports: Option<P1Model>,
+        mer: (u64, u32),
+        ring_j: u8,
+    }
+
+    /// maia-hdl t2p1.Model in Rust (bit-exact).
+    pub struct P1Model {
+        block_len: u64,
+        k: i64,
+        cos: Vec<i64>,
+        sin: Vec<i64>,
+        mem: std::collections::VecDeque<([i64; 2], [i64; 2])>,
+        count: u64,
+        c: [i64; 2],
+        b: [i64; 2],
+        e: i64,
+        gi: [i64; 2],
+        blk: u64,
+        best: Option<(i64, u32, u32, u32)>,
+    }
+
+    fn wrap48(v: i64) -> i64 {
+        (v << 16) >> 16
+    }
+
+    impl P1Model {
+        pub fn new(block_len: u64, k_q8: u32) -> P1Model {
+            let ph = |i: usize| std::f64::consts::TAU * i as f64 / 1024.0;
+            P1Model {
+                block_len,
+                k: k_q8 as i64,
+                cos: (0..1024).map(|i| (32767.0 * ph(i).cos()).round() as i64).collect(),
+                sin: (0..1024).map(|i| (32767.0 * ph(i).sin()).round() as i64).collect(),
+                mem: Default::default(),
+                count: 0,
+                c: [0; 2],
+                b: [0; 2],
+                e: 0,
+                gi: [0; 2],
+                blk: 0,
+                best: None,
+            }
+        }
+
+        fn tap(&self, d: u64) -> ([i64; 2], [i64; 2]) {
+            if self.count < d {
+                ([0; 2], [0; 2])
+            } else {
+                self.mem[self.mem.len() - d as usize]
+            }
+        }
+
+        fn words(j: u8, v: [u32; 3]) -> Vec<u32> {
+            let mut out = vec![Model::header(j as u32, true)];
+            for x in v {
+                for h in [x & 0xFFFF, x >> 16] {
+                    out.push(((h & 0x7FFF) << 1) | (((h >> 15) & 1) << 1 | 1) << 16);
+                }
+            }
+            out
+        }
+
+        pub fn push(&mut self, x: [i16; 2], t: u64, tail: bool, last: bool, frame_start: u64) -> Vec<u32> {
+            let mut out = Vec::new();
+            let sat = |v: i64| v.clamp(-32768, 32767);
+            let x0 = [x[0] as i64, x[1] as i64];
+            let (c, s) = (self.cos[(t & 1023) as usize], self.sin[(t & 1023) as usize]);
+            let y0 = [sat((x0[0] * c + x0[1] * s + (1 << 14)) >> 15), sat((x0[1] * c - x0[0] * s + (1 << 14)) >> 15)];
+            let mc = |a: [i64; 2], b: [i64; 2]| [a[0] * b[0] + a[1] * b[1], a[1] * b[0] - a[0] * b[1]];
+            let (x482, y482) = self.tap(482);
+            let (x964, _) = self.tap(964);
+            let (x1024, _) = self.tap(1024);
+            let (_, y1506) = self.tap(1506);
+            let (x2048, y2048) = self.tap(2048);
+            self.e = wrap48(self.e + x0[0] * x0[0] + x0[1] * x0[1] - x2048[0] * x2048[0] - x2048[1] * x2048[1]);
+            let (ba, br, ca, cr) = (mc(y0, x482), mc(y482, x964), mc(y1506, x482), mc(y2048, x1024));
+            for i in 0..2 {
+                self.b[i] = wrap48(self.b[i] + ba[i] - br[i]);
+                self.c[i] = wrap48(self.c[i] + ca[i] - cr[i]);
+            }
+            if tail && self.count >= N as u64 {
+                let g = mc(x0, x2048);
+                for i in 0..2 {
+                    self.gi[i] = wrap48(self.gi[i] + g[i]);
+                }
+            }
+            self.mem.push_back((x0, y0));
+            if self.mem.len() > 2048 {
+                self.mem.pop_front();
+            }
+            self.count += 1;
+            let mag = |z: [i64; 2]| {
+                let (a, b) = (z[0].abs(), z[1].abs());
+                a.max(b) + ((3 * a.min(b)) >> 3)
+            };
+            if self.count > N as u64 {
+                let cb = ((mag(self.c) + mag(self.b)) >> 10) & 0xFFFF_FFFF;
+                let e = (self.e >> 10) & 0xFFFF_FFFF;
+                let score = cb - ((self.k * e) >> 8);
+                if self.best.is_none_or(|b| score > b.0) {
+                    self.best = Some((score, (t.wrapping_sub(N as u64 - 1)) as u32, cb as u32, e as u32));
+                }
+            }
+            self.blk += 1;
+            if self.blk == self.block_len {
+                self.blk = 0;
+                if let Some((_, s, cb, e)) = self.best.take() {
+                    out.extend(Self::words(P1_J, [s, cb, e]));
+                }
+            }
+            if last {
+                let g = |v: i64| (v >> 16) as u32;
+                out.extend(Self::words(GI_J, [g(self.gi[0]), g(self.gi[1]), frame_start as u32]));
+                self.gi = [0; 2];
+            }
+            out
+        }
     }
 
     impl Model {
@@ -184,7 +325,16 @@ pub mod model {
                 },
                 eq: None,
                 eq_g: None,
+                reports: None,
+                mer: (0, 0),
+                ring_j: 0,
             }
+        }
+
+        /// Reports on (as trxd turns them on: P1, GI, MER, no raw samples
+        /// while searching or around the guard intervals).
+        pub fn enable_reports(&mut self, k_q8: u32) {
+            self.reports = Some(P1Model::new(self.frame_len, k_q8));
         }
 
         /// Equalize data symbols (from `p2` on) as the FPGA's t2eq does, once
@@ -206,8 +356,10 @@ pub mod model {
             self.eq = Some((p2, dx, dy, fc_j, prbs, pn));
         }
 
-        /// The equalized words of symbol `j` from its carriers (by k).
-        fn equalize(&self, j: usize, c: &[Complex32]) -> Vec<u32> {
+        /// The equalized words of symbol `j` from its carriers (by k), and
+        /// its pilots' MER terms (t2eq.py: (8 I - s 213)^2 + (8 Q)^2; sum,
+        /// count).
+        fn equalize(&self, j: usize, c: &[Complex32]) -> (Vec<u32>, (u64, u32)) {
             let (_, dx, dy, fc_j, prbs, pn) = self.eq.as_ref().unwrap();
             let (g, gs) = self.eq_g.as_ref().unwrap();
             let sc = 1.0 / (1u64 << gs) as f32;
@@ -220,15 +372,22 @@ pub mod model {
             let cp: Complex32 = pil.iter().map(|&(k, v)| v * Complex32::from_polar(1.0, -slope * k as f32)).sum();
             let a = cp.arg();
             let u = EQ_UNIT as f32 / EQ_Z_UNIT;
-            let q = |v: f32| (v * u).round().clamp(-63.0, 63.0) as i32 as u32 & 0x7F;
-            let cells: Vec<(u32, u32)> = (0..CARRIERS)
+            let qi = |v: f32| (v * u).round().clamp(-63.0, 63.0) as i32;
+            let ci: Vec<(i32, i32)> = (0..CARRIERS)
                 .map(|k| {
                     let v = z[k] * Complex32::from_polar(1.0, -(a + slope * k as f32));
-                    (q(v.re), q(v.im))
+                    (qi(v.re), qi(v.im))
                 })
-                .chain(std::iter::once((0, 0)))
                 .collect();
-            cells.chunks(2).map(|p| p[0].0 << 1 | p[0].1 << 8 | 1 << 16 | p[1].0 << 17 | p[1].1 << 24).collect()
+            let mut mer = (0u64, 0u32);
+            for k in (k0..CARRIERS).step_by(d) {
+                let r = 8 * ci[k].0 as i64 - if prbs[k] ^ pn[j] == 1 { -213 } else { 213 };
+                mer.0 += (r * r + (8 * ci[k].1 as i64).pow(2)) as u64;
+                mer.1 += 1;
+            }
+            let m7 = |v: i32| v as u32 & 0x7F;
+            let cells: Vec<(u32, u32)> = ci.iter().map(|&(a, b)| (m7(a), m7(b))).chain(std::iter::once((0, 0))).collect();
+            (cells.chunks(2).map(|p| p[0].0 << 1 | p[0].1 << 8 | 1 << 16 | p[1].0 << 17 | p[1].1 << 24).collect(), mer)
         }
 
         pub fn apply(&mut self, c: Ctl) {
@@ -248,6 +407,7 @@ pub mod model {
                     let v = |x: u32| x as u16 as i16 as f32;
                     self.eq_g = Some((g.iter().map(|&w| Complex32::new(v(w), v(w >> 16))).collect(), gshift));
                 }
+                Ctl::EqRing(j) => self.ring_j = j,
             }
         }
 
@@ -280,7 +440,9 @@ pub mod model {
                 let ph = self.phase as f64 / 4_294_967_296.0 * std::f64::consts::TAU;
                 let y = Complex32::new(v[0] as f32, v[1] as f32) * Complex32::new(ph.cos() as f32, ph.sin() as f32);
                 self.phase = self.phase.wrapping_add(self.freq);
-                let (mut raw, mut in_win, mut j) = (true, false, 0u64);
+                let hw = self.reports.is_some();
+                let (mut raw, mut in_win, mut j) = (!hw, false, 0u64);
+                let (mut tail, mut last, fs) = (false, false, self.f);
                 if self.scheduled && self.running {
                     let r = self.counter as i64 - self.f as i64;
                     let (fl, gi) = (self.frame_len as i64, self.gi as i64);
@@ -297,9 +459,10 @@ pub mod model {
                             let (jj, q) = (u / sl, u % sl);
                             if (jj as u64) < self.nsym {
                                 j = jj as u64;
-                                if q < gi || q >= N as i64 {
+                                if (q < gi || q >= N as i64) && !hw {
                                     raw = true;
                                 }
+                                tail = q >= N as i64;
                                 let lo = gi - early(gi as usize) as i64;
                                 if q >= lo && q < lo + N as i64 {
                                     in_win = true;
@@ -308,6 +471,7 @@ pub mod model {
                         }
                     }
                     if r == fl - 1 {
+                        last = true;
                         self.f = self.pending.take().unwrap_or(self.f + self.frame_len);
                         self.skip = false;
                     } else if r >= fl {
@@ -317,6 +481,9 @@ pub mod model {
                     }
                 } else if self.scheduled {
                     raw = false;
+                }
+                if let Some(p1) = self.reports.as_mut() {
+                    out.extend(p1.push(v, self.counter, tail, last, fs));
                 }
                 if raw {
                     if self.run_len % 65536 == 0 {
@@ -346,8 +513,21 @@ pub mod model {
                                     c[k] = Complex32::new(q(z.re), q(z.im));
                                 }
                             }
-                            out.push(Self::header(self.win_tag | 1 << 29, true));
-                            out.extend(self.equalize(jj, &c));
+                            let (words, mer) = self.equalize(jj, &c);
+                            if self.ring_j == 0 || self.ring_j as usize == jj {
+                                out.push(Self::header(self.win_tag | 1 << 29, true));
+                                out.extend(words);
+                            }
+                            if self.reports.is_some() {
+                                self.mer.0 += mer.0;
+                                self.mer.1 += mer.1;
+                                if jj as u64 == self.nsym - 1 {
+                                    let f21 = (self.win_tag >> 8) & 0x1F_FFFF;
+                                    let err = (self.mer.0 >> 4) as u32;
+                                    out.extend(P1Model::words(MER_J, [err, self.mer.1 | (f21 & 0xFFFF) << 16, f21 >> 16]));
+                                    self.mer = (0, 0);
+                                }
+                            }
                             self.win.clear();
                             self.counter += 1;
                             continue;
@@ -367,5 +547,66 @@ pub mod model {
                 self.counter += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model::P1Model;
+    use super::{report_value, GI_J, P1_J};
+
+    /// P1Model against maia-hdl t2p1.Model: the same input (an LCG and two
+    /// P1-like C A B structures, as made by the Python below) gives the same
+    /// words. The words came from:
+    /// md = Model(5000, 64); md.push(re, im, t, t % 2300 >= 2100, t in
+    /// {6000, 11000}, {6000: 1000, 11000: 6000}.get(t, 0)) for each sample.
+    #[test]
+    fn p1_model_matches_the_python_one() {
+        let want: [u32; 28] = [0x000101fb, 0x00011388, 0x00010000, 0x0003052a, 0x000100c0, 0x0003a046, 0x0001016a, 0x000101f9, 0x00010354, 0x00010000, 0x0001017a, 0x00010000, 0x000107d0, 0x00010000, 0x000101fb, 0x00013a98, 0x00010000, 0x00011c4e, 0x000100ca, 0x0003f87c, 0x0001017a, 0x000101f9, 0x000104be, 0x00010000, 0x0003ffd4, 0x0003fffe, 0x00012ee0, 0x00010000];
+        let mut st: u64 = 12345;
+        let mut rnd = || {
+            st = (st * 1103515245 + 12345) & 0x7FFF_FFFF;
+            ((st >> 8) % 2001) as i64 - 1000
+        };
+        let n = 12000;
+        let mut x: Vec<(i64, i64)> = (0..n).map(|_| (rnd(), rnd())).collect();
+        let rot = |i: usize| {
+            let p = std::f64::consts::TAU * i as f64 / 1024.0;
+            (p.cos(), p.sin())
+        };
+        for s0 in [2500usize, 7500] {
+            let a: Vec<(i64, i64)> = (0..1024).map(|i| (x[s0 + 542 + i].0 * 3, x[s0 + 542 + i].1 * 3)).collect();
+            for i in 0..1024 {
+                x[s0 + 542 + i] = a[i];
+            }
+            let shifted = |v: (i64, i64), i: usize| {
+                let (c, s) = rot(i);
+                let (re, im) = (v.0 as f64 * c - v.1 as f64 * s, v.0 as f64 * s + v.1 as f64 * c);
+                (re.round() as i64, im.round() as i64)
+            };
+            for i in 0..542 {
+                x[s0 + i] = shifted(a[482 + i], i);
+            }
+            for i in 0..482 {
+                x[s0 + 1566 + i] = shifted(a[542 + i], i);
+            }
+        }
+        let mut md = P1Model::new(5000, 64);
+        let mut got = Vec::new();
+        for (t, &(re, im)) in x.iter().enumerate() {
+            let v = [re.clamp(-32768, 32767) as i16, im.clamp(-32768, 32767) as i16];
+            let fs = match t {
+                6000 => 1000,
+                11000 => 6000,
+                _ => 0,
+            };
+            got.extend(md.push(v, t as u64, t % 2300 >= 2100, t == 6000 || t == 11000, fs));
+        }
+        assert_eq!(got, want);
+        // the P1s where they were put, the GI reports with their frames
+        let recs: Vec<(u8, u32)> = got.chunks(7).map(|r| (((r[0] >> 1) & 0xFF) as u8, report_value(r[5]) as u32 | (report_value(r[6]) as u32) << 16)).collect();
+        let starts: Vec<(u8, u32)> = got.chunks(7).map(|r| (((r[0] >> 1) & 0xFF) as u8, report_value(r[1]) as u32 | (report_value(r[2]) as u32) << 16)).collect();
+        assert_eq!(starts.iter().filter(|r| r.0 == P1_J).map(|r| r.1).collect::<Vec<_>>(), [2500, 7500]);
+        assert_eq!(recs.iter().filter(|r| r.0 == GI_J).map(|r| r.1).collect::<Vec<_>>(), [1000, 6000]);
     }
 }

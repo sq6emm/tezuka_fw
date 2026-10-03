@@ -260,6 +260,285 @@ mod tests {
         }
     }
 
+    #[test]
+    fn t2_through_the_front_end_with_reports() {
+        use super::super::fe::{model::Model, Ctl};
+        let p = Params::amateur();
+        let mut m = Modulator::new(p);
+        let mut n = 0u32;
+        let mut next = || {
+            let mut pkt = [0u8; TS_LEN];
+            pkt[0] = 0x47;
+            pkt[1] = 0x01;
+            pkt[4..8].copy_from_slice(&n.to_be_bytes());
+            n += 1;
+            pkt
+        };
+        let mut x = Vec::new();
+        for _ in 0..8 {
+            m.frame(&mut next, &mut x);
+        }
+        let fs = 131e6 / 71.0;
+        let y = super::resample(&x[100_000..], fs, fs / (1.0 + 20e-6));
+        let mut seed = 7u64;
+        let mut g = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.05
+        };
+        let q = |v: f32| (v * 3000.0).round().clamp(-32768.0, 32767.0) as i16;
+        let samples: Vec<[i16; 2]> = y
+            .iter()
+            .enumerate()
+            .map(|(k, z)| {
+                let ph = std::f64::consts::TAU * 27_000.0 * k as f64 / fs;
+                let v = z * Complex32::new(ph.cos() as f32, ph.sin() as f32) + Complex32::new(g(), g());
+                [q(v.re), q(v.im)]
+            })
+            .collect();
+        let bins: Vec<usize> = (0..1705).map(|k| super::super::ofdm::Ofdm::new(p).bin(k)).collect();
+        let mut fe = Model::new(p.frame_samples() as u64, p.symbols() as u64, p.guard.samples() as u64, &bins);
+        // T2EQ=0: without the FPGA's equalizer (in the model)
+        if std::env::var("T2EQ").map_or(true, |v| v != "0") {
+            let (dx, dy) = p.pilots.dxdy();
+            fe.enable_eq(super::super::N_P2, dx, dy, p.symbols() - 1);
+        }
+        fe.enable_reports(64);
+        let mut d = super::super::stream::Demod::new(p, fs);
+        // searching from the P1 reports, the frequency from the GI
+        // reports, the frame's end with its MER report (no raw samples
+        // but the P1 windows)
+        d.hw = true;
+        let mut raw_words = 0usize;
+        d.set_center(25_000.0);
+        let mut fec = crate::dvbs2::rx::Fec::new(crate::dvbs2::FrameSpec::long(crate::dvbs2::fpga_tx::LongMode::Qpsk12));
+        let mut stats = crate::dvbs2::rx::Stats::default();
+        let (mut words, mut blocks, mut ctl, mut packets) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut late: Vec<(usize, Ctl)> = Vec::new();
+        let chunk = 9225; // 5 ms
+        for (i, c) in samples.chunks(chunk).enumerate() {
+            // Commands reach the front end two chunks (10 ms) later.
+            for (_, cmd) in late.iter().filter(|(at, _)| *at == i) {
+                fe.apply(cmd.clone());
+            }
+            words.clear();
+            fe.run(c, &mut words);
+            raw_words += words.iter().filter(|&&w| w & 0x0001_0000 == 0).count();
+            d.push_words(&words, &mut blocks, &mut ctl);
+            late.extend(ctl.drain(..).map(|cmd| (i + 2, cmd)));
+            for llr in blocks.drain(..) {
+                fec.frame_q(&llr.llrs(), &mut stats, &mut packets);
+            }
+        }
+        eprintln!("frames {}, blocks {}, packets {}, MER {:.1} dB, freq {:.0} Hz, P1 missed {}, LDPC failures {}", d.stats.frames, d.stats.blocks, packets.len(), d.stats.mer_db, d.stats.freq_hz, d.stats.p1_missed, stats.ldpc_fail);
+        // (the first frame after the P1 report only gives the frequency)
+        assert!(d.stats.frames >= 3, "{} frames", d.stats.frames);
+        // raw words: the P1 windows only (2 x 64 + 2048 + headers a frame)
+        eprintln!("raw words {raw_words} for {} samples", samples.len());
+        assert!(raw_words < samples.len() / 50, "{raw_words} raw words");
+        assert_eq!(stats.ldpc_fail, 0);
+        assert_eq!((d.stats.l1_ok, d.stats.l1_mismatch), (d.stats.frames, 0), "{:?}", d.stats);
+        assert!((d.stats.freq_hz - 2000.0).abs() < 30.0);
+        let data: Vec<_> = packets.iter().filter(|p| p[1] == 0x01).collect();
+        let f0 = u32::from_be_bytes(data[0][4..8].try_into().unwrap());
+        for (i, pkt) in data.iter().enumerate() {
+            assert_eq!(u32::from_be_bytes(pkt[4..8].try_into().unwrap()), f0 + i as u32, "packet {i}");
+        }
+    }
+
+    /// With the reports, at a low MER and a sample-clock offset that moves
+    /// the frame every frame or two (as Libre 1 receiving in full duplex):
+    /// the A9's time per frame stays small
+    /// (cargo test --release t2_reports_low_mer_cost -- --ignored --nocapture;
+    /// T2NOISE, T2PPM change the noise and the offset).
+    #[test]
+    #[ignore]
+    fn t2_reports_low_mer_cost() {
+        use super::super::fe::{model::Model, Ctl};
+        let p = Params::amateur();
+        let mut m = Modulator::new(p);
+        let mut n = 0u32;
+        let mut next = || {
+            let mut pkt = [0u8; TS_LEN];
+            pkt[0] = 0x47;
+            pkt[1] = 0x01;
+            pkt[4..8].copy_from_slice(&n.to_be_bytes());
+            n += 1;
+            pkt
+        };
+        let mut x = Vec::new();
+        for _ in 0..12 {
+            m.frame(&mut next, &mut x);
+        }
+        let fs = 131e6 / 71.0;
+        let ppm: f64 = std::env::var("T2PPM").ok().and_then(|v| v.parse().ok()).unwrap_or(40.0);
+        let noise: f32 = std::env::var("T2NOISE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.45);
+        let y = super::resample(&x[100_000..], fs, fs / (1.0 + ppm * 1e-6));
+        let mut seed = 7u64;
+        let mut g = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * noise
+        };
+        let q = |v: f32| (v * 3000.0).round().clamp(-32768.0, 32767.0) as i16;
+        let samples: Vec<[i16; 2]> = y
+            .iter()
+            .enumerate()
+            .map(|(k, z)| {
+                let ph = std::f64::consts::TAU * 27_000.0 * k as f64 / fs;
+                let v = z * Complex32::new(ph.cos() as f32, ph.sin() as f32) + Complex32::new(g(), g());
+                [q(v.re), q(v.im)]
+            })
+            .collect();
+        let bins: Vec<usize> = (0..1705).map(|k| super::super::ofdm::Ofdm::new(p).bin(k)).collect();
+        let mut fe = Model::new(p.frame_samples() as u64, p.symbols() as u64, p.guard.samples() as u64, &bins);
+        // T2EQ=0: without the FPGA's equalizer (in the model)
+        if std::env::var("T2EQ").map_or(true, |v| v != "0") {
+            let (dx, dy) = p.pilots.dxdy();
+            fe.enable_eq(super::super::N_P2, dx, dy, p.symbols() - 1);
+        }
+        fe.enable_reports(64);
+        let mut d = super::super::stream::Demod::new(p, fs);
+        // searching from the P1 reports, the frequency from the GI
+        // reports, the frame's end with its MER report (no raw samples
+        // but the P1 windows)
+        d.hw = true;
+        let mut raw_words = 0usize;
+        let mut busy = 0f64;
+        let mut steady: Option<(f64, u64)> = None;
+        d.set_center(25_000.0);
+        let mut fec = crate::dvbs2::rx::Fec::new(crate::dvbs2::FrameSpec::long(crate::dvbs2::fpga_tx::LongMode::Qpsk12));
+        let mut stats = crate::dvbs2::rx::Stats::default();
+        let (mut words, mut blocks, mut ctl, mut packets) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut late: Vec<(usize, Ctl)> = Vec::new();
+        let chunk = 9225; // 5 ms
+        for (i, c) in samples.chunks(chunk).enumerate() {
+            // Commands reach the front end two chunks (10 ms) later.
+            for (_, cmd) in late.iter().filter(|(at, _)| *at == i) {
+                fe.apply(cmd.clone());
+            }
+            words.clear();
+            fe.run(c, &mut words);
+            raw_words += words.iter().filter(|&&w| w & 0x0001_0000 == 0).count();
+            let t0 = std::time::Instant::now();
+            d.push_words(&words, &mut blocks, &mut ctl);
+            busy += t0.elapsed().as_secs_f64();
+            // steady state: from the second frame on (the first L1 LDPC
+            // verification before it)
+            if steady.is_none() && d.stats.frames >= 2 {
+                steady = Some((busy, d.stats.frames));
+            }
+            late.extend(ctl.drain(..).map(|cmd| (i + 2, cmd)));
+            for llr in blocks.drain(..) {
+                fec.frame_q(&llr.llrs(), &mut stats, &mut packets);
+            }
+        }
+        let _ = raw_words;
+        let nf = d.stats.frames.max(1) as f64;
+        let (b0, f0) = steady.unwrap();
+        let ms = (busy - b0) * 1e3 / (d.stats.frames - f0).max(1) as f64;
+        eprintln!("frames {}, packets {}, MER {:.1} dB, LDPC failures {}, resched {}, P1 missed {}, L1 ok {} failed {}; A9 {:.1} ms a frame, prof ms a frame {:?}; steady state {ms:.2} ms a frame",
+            d.stats.frames, packets.len(), d.stats.mer_db, stats.ldpc_fail, d.stats.resched, d.stats.p1_missed, d.stats.l1_ok, d.stats.l1_failed,
+            busy * 1e3 / nf, d.prof.map(|v| (v * 1e4 / nf).round() / 10.0));
+        assert!(d.stats.frames >= 5, "{:?}", d.stats);
+        // (the PC is about 20 times the A9: 1 ms here is 8 % of an A9 core)
+        assert!(ms < 1.5, "{ms:.2} ms a frame");
+    }
+
+    /// With the reports: samples cut out mid-stream (the P1s jump out of
+    /// the track window), the receiver loses the frames, searches again
+    /// from the P1 records and decodes again
+    /// (cargo test --release t2_reports_reacquire -- --ignored --nocapture).
+    #[test]
+    #[ignore]
+    fn t2_reports_reacquire() {
+        use super::super::fe::{model::Model, Ctl};
+        let p = Params::amateur();
+        let mut m = Modulator::new(p);
+        let mut n = 0u32;
+        let mut next = || {
+            let mut pkt = [0u8; TS_LEN];
+            pkt[0] = 0x47;
+            pkt[1] = 0x01;
+            pkt[4..8].copy_from_slice(&n.to_be_bytes());
+            n += 1;
+            pkt
+        };
+        let mut x = Vec::new();
+        for _ in 0..22 {
+            m.frame(&mut next, &mut x);
+        }
+        let fs = 131e6 / 71.0;
+        let mut y = super::resample(&x[100_000..], fs, fs / (1.0 + 20e-6));
+        // (after three good frames)
+        y.drain(3_200_000..3_250_000);
+        let cut_at = 3_200_000usize;
+        let mut seed = 7u64;
+        let mut g = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.05
+        };
+        let q = |v: f32| (v * 3000.0).round().clamp(-32768.0, 32767.0) as i16;
+        let samples: Vec<[i16; 2]> = y
+            .iter()
+            .enumerate()
+            .map(|(k, z)| {
+                let ph = std::f64::consts::TAU * 27_000.0 * k as f64 / fs;
+                let v = z * Complex32::new(ph.cos() as f32, ph.sin() as f32) + Complex32::new(g(), g());
+                [q(v.re), q(v.im)]
+            })
+            .collect();
+        let bins: Vec<usize> = (0..1705).map(|k| super::super::ofdm::Ofdm::new(p).bin(k)).collect();
+        let mut fe = Model::new(p.frame_samples() as u64, p.symbols() as u64, p.guard.samples() as u64, &bins);
+        // T2EQ=0: without the FPGA's equalizer (in the model)
+        if std::env::var("T2EQ").map_or(true, |v| v != "0") {
+            let (dx, dy) = p.pilots.dxdy();
+            fe.enable_eq(super::super::N_P2, dx, dy, p.symbols() - 1);
+        }
+        fe.enable_reports(64);
+        let mut d = super::super::stream::Demod::new(p, fs);
+        // searching from the P1 reports, the frequency from the GI
+        // reports, the frame's end with its MER report (no raw samples
+        // but the P1 windows)
+        d.hw = true;
+        let mut raw_words = 0usize;
+        let mut packets_at_cut: Option<usize> = None;
+        let mut last_frames = 0u64;
+        d.set_center(25_000.0);
+        let mut fec = crate::dvbs2::rx::Fec::new(crate::dvbs2::FrameSpec::long(crate::dvbs2::fpga_tx::LongMode::Qpsk12));
+        let mut stats = crate::dvbs2::rx::Stats::default();
+        let (mut words, mut blocks, mut ctl, mut packets) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut late: Vec<(usize, Ctl)> = Vec::new();
+        let chunk = 9225; // 5 ms
+        for (i, c) in samples.chunks(chunk).enumerate() {
+            // Commands reach the front end two chunks (10 ms) later.
+            for (_, cmd) in late.iter().filter(|(at, _)| *at == i) {
+                fe.apply(cmd.clone());
+            }
+            words.clear();
+            if i * chunk >= cut_at && packets_at_cut.is_none() {
+                packets_at_cut = Some(packets.len());
+            }
+            fe.run(c, &mut words);
+            raw_words += words.iter().filter(|&&w| w & 0x0001_0000 == 0).count();
+            d.push_words(&words, &mut blocks, &mut ctl);
+            if d.stats.frames != last_frames && std::env::var_os("T2PROGRESS").is_some() {
+                last_frames = d.stats.frames;
+                eprintln!("chunk {i}: frames {} ldpc_fail {} packets {} l1_ok {} mer {:.1}", d.stats.frames, stats.ldpc_fail, packets.len(), d.stats.l1_ok, d.stats.mer_db);
+            }
+            late.extend(ctl.drain(..).map(|cmd| (i + 2, cmd)));
+            for llr in blocks.drain(..) {
+                fec.frame_q(&llr.llrs(), &mut stats, &mut packets);
+            }
+        }
+        let _ = raw_words;
+        // before the cut, and after the lock was lost (6 misses) and found
+        // again (192 packets a frame)
+        let before = packets_at_cut.unwrap();
+        let after = packets.len() - before;
+        eprintln!("frames {}, blocks {}, packets {}, MER {:.1} dB, freq {:.0} Hz, P1 missed {}, LDPC failures {}; packets before the cut {before}, after {after}", d.stats.frames, d.stats.blocks, packets.len(), d.stats.mer_db, d.stats.freq_hz, d.stats.p1_missed, stats.ldpc_fail);
+        assert!(d.stats.p1_missed >= 6, "lock never lost: {:?}", d.stats);
+        assert!(before >= 2 * 192 && after >= 2 * 192, "{before} packets before the cut, {after} after");
+    }
+
     /// A board's front-end words (`touch /tmp/t2-words` on it) through the
     /// receiver: `T2WORDS=<file> cargo test --release t2_words -- --ignored
     /// --nocapture` (T2CENTER=<Hz>: the LO offset trxd told it).

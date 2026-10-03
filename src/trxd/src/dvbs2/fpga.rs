@@ -83,12 +83,39 @@ const REG_SYMSYNC: usize = 0x38;
 const REG_OMEGA: usize = 0x3C;
 const T2: u32 = 1 << 12;
 const REG_T2_CONTROL: usize = 0x40;
+/// The S2 known-symbol accumulator (maia-hdl s2trk.py; the s2 mode
+/// bitstream, in the window T2 has elsewhere): control (enable 0, load 1,
+/// pilots 2, pilot blocks 7:3), the frame's base and length, the mixer's
+/// step, the header table (addr 6:0, q 8:7, we 9), the FIFO's entry (6
+/// words), status (level 9:0, overflow 10, synced 11), pop, features (bit 16).
+const REG_S2TRK_CONTROL: usize = 0x40;
+const REG_S2TRK_BASE: usize = 0x44;
+const REG_S2TRK_LEN: usize = 0x48;
+const REG_S2TRK_DTH: usize = 0x4C;
+const REG_S2TRK_HDR: usize = 0x50;
+const REG_S2TRK_ENTRY: usize = 0x54;
+const REG_S2TRK_STATUS: usize = 0x6C;
+const REG_S2TRK_POP: usize = 0x70;
+const REG_S2TRK_FEATURES: usize = 0x7C;
+const S2TRK_FEATURE: u32 = 1 << 16;
 const REG_T2_FRAME_LEN: usize = 0x44;
 const REG_T2_LAYOUT: usize = 0x48;
 const REG_T2_TRACK: usize = 0x4C;
 const REG_T2_FREQ: usize = 0x50;
 const REG_T2_NEXT_START: usize = 0x54;
 const REG_T2_STATUS: usize = 0x5C;
+/// The P1 / GI / MER reports (maia-hdl t2p1.py; registers 14 and 15 of the
+/// T2 window): control, and the features a bitstream has (0: none).
+const REG_T2_EXT: usize = 0x78;
+const REG_T2_FEATURES: usize = 0x7C;
+const T2_EXT_P1: u32 = 1;
+const T2_EXT_ACQ_RAW_OFF: u32 = 1 << 9;
+const T2_EXT_GI_RAW_OFF: u32 = 1 << 10;
+const T2_EXT_MER: u32 = 1 << 11;
+const T2_EXT_RING_J_SHIFT: u32 = 12;
+const T2_EXT_REF8_SHIFT: u32 = 20;
+/// P1 threshold factor (Q8) for the detector's best-window score.
+const T2_P1_K_Q8: u32 = 64;
 // The T2 equalizer (maia-hdl t2eq.py), bitstreams that have it: control (0
 // enable, 1 gbank, 9:2 p2, 14:10 gshift, 22:15 fc_j), pilots (5:0 dx, 8:6
 // dy), 1/D (15:0 data symbols, 31:16 the frame closing one, x 65536), the
@@ -188,6 +215,10 @@ pub struct FrontEnd {
     /// The equalizer reports the bank it took (newer cores; cleared after a
     /// wait for it timed out: an older core reads 0 there).
     eq_bank_seen: std::cell::Cell<bool>,
+    /// The T2 report control word when the reports are on.
+    t2_ext: std::cell::Cell<Option<u32>>,
+    /// DVB-S2: the known-symbol accumulator is on (s2trk).
+    s2trk: bool,
     /// Ring bytes a second (lap detection without the wrap counter).
     ring_rate: f64,
     /// The recorder counts its wraps (0x1C).
@@ -266,10 +297,22 @@ impl FrontEnd {
             flagged = want && regs.rd32(REG_SYMSYNC) & (1 << 11) != 0;
             regs.wr32(REG_SYMSYNC, 1 | ss.kp_shift << 1 | ss.ki_shift << 6 | (flagged as u32) << 11);
         }
+        // The known-symbol accumulator (a bitstream that has it; with the
+        // header detector's symbols): TRXD_S2_TRK=0 leaves it off (A/B: the
+        // receiver then makes the same sums from the ring's words).
+        let s2trk = flagged
+            && regs.rd32(REG_S2TRK_FEATURES) & S2TRK_FEATURE != 0
+            && std::env::var("TRXD_S2_TRK").map_or(true, |v| v != "0");
+        if s2trk {
+            regs.wr32(REG_S2TRK_CONTROL, 1);
+        }
         // 16-bit mode (0), start: the ring fills from RING_START.
         regs.wr32(REG_REC_CONTROL, 1);
         let ring_rate = 4.0 * if symbols { rs } else { design.fs_out() };
-        Ok(FrontEnd::new(mem, regs, ring, design.fs_out(), center_hz, generation, symbols, flagged, false, None, ring_rate))
+        let mut fe = FrontEnd::new(mem, regs, ring, design.fs_out(), center_hz, generation, symbols, flagged, false, None, ring_rate);
+        fe.s2trk = s2trk;
+        tracing::info!(s2trk, "DVB-S2 front end: known-symbol accumulator");
+        Ok(fe)
     }
 
     /// DVB-T2: the recorder takes the T2 resampler's samples at (about)
@@ -345,13 +388,36 @@ impl FrontEnd {
                 t2_eq = Some(base);
             }
         }
+        // The P1, GI and MER reports (a bitstream that has them, with the
+        // equalizer): searching and frequency tracking without raw samples
+        // (stream.rs). TRXD_T2_HW=0: the raw-sample path (A/B).
+        let mut t2_ext = None;
+        if t2_fe && t2_eq.is_some() && std::env::var("TRXD_T2_HW").map_or(true, |v| v != "0") {
+            let feats = regs.rd32(REG_T2_FEATURES) & 0xFF;
+            if feats & crate::dvbt2::fe::FEATURES_REPORTS == crate::dvbt2::fe::FEATURES_REPORTS {
+                let boost = match p.pilots {
+                    crate::dvbt2::Pilots::PP1 | crate::dvbt2::Pilots::PP2 => 4.0 / 3.0,
+                    crate::dvbt2::Pilots::PP3 | crate::dvbt2::Pilots::PP4 => 7.0 / 4.0,
+                    _ => 7.0 / 3.0,
+                };
+                let ref8 = ((8.0 * crate::dvbt2::fe::EQ_UNIT as f64 * boost).round() as u32).min(1023);
+                let ext = T2_EXT_P1 | T2_P1_K_Q8 << 1 | T2_EXT_ACQ_RAW_OFF | T2_EXT_GI_RAW_OFF | T2_EXT_MER | ref8 << T2_EXT_REF8_SHIFT;
+                regs.wr32(REG_T2_EXT, ext);
+                if regs.rd32(REG_T2_EXT) == ext {
+                    t2_ext = Some(ext);
+                }
+            }
+        }
         regs.wr32(REG_SYMSYNC, T2);
         if t2_fe {
             regs.wr32(REG_T2_CONTROL, T2_ENABLE);
         }
         regs.wr32(REG_REC_CONTROL, 1);
         let fs_out = resamp::rate_out(FS_IN, step);
-        Ok(FrontEnd::new(mem, regs, ring, fs_out, 0.0, generation, false, false, t2_fe, t2_eq, 4.0 * fs_out))
+        let fe = FrontEnd::new(mem, regs, ring, fs_out, 0.0, generation, false, false, t2_fe, t2_eq, 4.0 * fs_out);
+        fe.t2_ext.set(t2_ext);
+        tracing::info!(reports = t2_ext.is_some(), "DVB-T2 front end: P1 / GI / MER reports");
+        Ok(fe)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -371,6 +437,8 @@ impl FrontEnd {
             t2_eq,
             eq_bank: std::cell::Cell::new(0),
             eq_bank_seen: std::cell::Cell::new(true),
+            t2_ext: std::cell::Cell::new(None),
+            s2trk: false,
             ring_rate,
             wraps_hw,
             total: 0,
@@ -441,6 +509,53 @@ impl FrontEnd {
         self.t2_fe
     }
 
+    /// DVB-S2: the known-symbol accumulator runs ([`Self::read_trk`]).
+    pub fn s2trk(&self) -> bool {
+        self.s2trk
+    }
+
+    /// The accumulator's entries so far (its FIFO emptied).
+    pub fn read_trk(&mut self, out: &mut Vec<[u32; super::s2trk::ENTRY_WORDS]>) {
+        if !self.s2trk {
+            return;
+        }
+        let n = self.regs.rd32(REG_S2TRK_STATUS) & 0x3FF;
+        for _ in 0..n {
+            let mut e = [0u32; super::s2trk::ENTRY_WORDS];
+            for (i, w) in e.iter_mut().enumerate() {
+                *w = self.regs.rd32(REG_S2TRK_ENTRY + 4 * i);
+            }
+            self.regs.wr32(REG_S2TRK_POP, 1);
+            out.push(e);
+        }
+    }
+
+    /// A command from the receiver for the accumulator.
+    pub fn trk_ctl(&mut self, c: &super::s2trk::Ctl) {
+        if !self.s2trk {
+            return;
+        }
+        use super::s2trk::Ctl;
+        match c {
+            Ctl::Header(q) => {
+                for (a, &q) in q.iter().enumerate() {
+                    self.regs.wr32(REG_S2TRK_HDR, a as u32 | (q as u32 & 3) << 7 | 1 << 9);
+                }
+            }
+            Ctl::Dth(d) => self.regs.wr32(REG_S2TRK_DTH, *d),
+            Ctl::Load { base, len, pilots, npil } => {
+                self.regs.wr32(REG_S2TRK_BASE, *base as u32);
+                self.regs.wr32(REG_S2TRK_LEN, *len);
+                self.regs.wr32(REG_S2TRK_CONTROL, 1 | 1 << 1 | (*pilots as u32) << 2 | (*npil as u32 & 31) << 3);
+            }
+        }
+    }
+
+    /// DVB-T2: the front end sends the P1 / GI / MER reports.
+    pub fn t2_hw(&self) -> bool {
+        self.t2_ext.get().is_some()
+    }
+
     /// DVB-T2 front end: do what the receiver asks.
     pub fn t2_ctl(&self, c: crate::dvbt2::fe::Ctl) {
         use crate::dvbt2::fe::Ctl;
@@ -456,6 +571,13 @@ impl FrontEnd {
                 self.regs.wr32(REG_T2_CONTROL, en | T2_SCHEDULED | T2_LOAD);
             }
             Ctl::Freq(f) => self.regs.wr32(REG_T2_FREQ, f),
+            Ctl::EqRing(j) => {
+                if let Some(ext) = self.t2_ext.get() {
+                    let ext = ext & !(0xFF << T2_EXT_RING_J_SHIFT) | (j as u32) << T2_EXT_RING_J_SHIFT;
+                    self.regs.wr32(REG_T2_EXT, ext);
+                    self.t2_ext.set(Some(ext));
+                }
+            }
             Ctl::EqTable { g, gshift } => {
                 let Some(base) = self.t2_eq else { return };
                 // into the bank not in use, then flip (taken, with gshift,
@@ -771,6 +893,9 @@ impl Drop for FrontEnd {
             return;
         }
         self.regs.wr32(REG_REC_CONTROL, 1 << 1);
+        if self.s2trk {
+            self.regs.wr32(REG_S2TRK_CONTROL, 0);
+        }
         let ctl = self.regs.rd32(REG_DDC_CONTROL);
         self.regs.wr32(REG_DDC_CONTROL, ctl & !(1 << 24));
     }

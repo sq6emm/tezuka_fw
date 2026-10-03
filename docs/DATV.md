@@ -22,6 +22,17 @@ RX  trxd:    stream IQ -> dvbs2::rx::RxThread (own thread): NCO + RRC matched fi
     browser: VideoDecoder -> canvas, AudioDecoder -> AudioContext (short jitter buffer)
 ```
 
+A/V in the browser: the sound plays back to back from a short adaptive lead
+(0.15 s, more each time the buffer runs dry; it starts afresh only after a
+pause in reception); each frame's own stream PTS maps the stream's clock
+onto the sound card's, and pictures wait for their PTS on that clock. A
+picture that comes after its time (at the low rates the sound arrives up to
+a second before its PTS, a picture just in time) holds the sound back once by
+that much, so the next are in time; the panel's A/V sync figure is the
+median picture timing error. The transmitter's clock re-stamps (a late
+keyframe) are gaps in the stream's time, not resets: the decoder and the
+buffer are kept (a reset there lost 40 frames a PES at 33 kS/s).
+
 Web UI: header button **DATV**. START sends on the TX frequency (the VFO, or the
 split TX VFO); RECEIVE decodes on the RX frequency. Both use the panel's symbol
 rate, code rate and pilots settings, which must match the other station.
@@ -76,7 +87,17 @@ T-STD timing: every PES is in whole before its PTS, at most 1 s after its
 first byte (lean profile 1.4 s), and a stream's PTS never steps back. Audio has its own queue and goes before video (its PES
 are few and small). A video frame that would come in after its PTS is
 dropped (a keyframe asked for); a late keyframe drops the video queued
-before it, and if still late takes a later PTS (the timeline moves on).
+before it, and if still late takes a later PTS (the timeline moves on,
+but never past twice the nominal delay: a keyframe larger than that lead
+goes out late by itself). Beyond three times the delay the mux takes the
+browser's clock as run ahead (live media after stale) and anchors it
+afresh, unless the audio's own continuity is near enough: then it anchors
+on that, so the continuous sound never steps back into its previous PES.
+The FPGA modulator takes a frame's packets at once (a second of the mux
+clock at 33 kS/s), which is why the margins are that wide; without them
+the clock snapped back 0.8 s every few seconds at 33 kS/s.
+`lean_profile_over_budget_pts` pulls packets a frame at a time and checks
+1.7 (measured), 3.7, 8 and 12 KB keyframes.
 Keyframes: the browser sends one every 2 s; the mux asks for one if none
 came for 2 s, and puts the last SPS/PPS in front of a keyframe that comes
 without them. `repetition_meets_tr101290` checks PES arrival against PTS

@@ -88,7 +88,9 @@ impl SymSync {
             return None;
         }
         let y = self.interp(self.t);
-        let mid = self.interp(self.t - (self.omega as u64 >> 1));
+        // (modular, as the FPGA's counter: at the start t is under half a
+        // symbol and the mid-point sample lies before sample 0)
+        let mid = self.interp(self.t.wrapping_sub(self.omega as u64 >> 1));
         let e = (self.prev[0] - y[0]) as i64 * mid[0] as i64 + (self.prev[1] - y[1]) as i64 * mid[1] as i64;
         let p = y[0] as i64 * y[0] as i64 + y[1] as i64 * y[1] as i64;
         self.agc += (p - self.agc) >> 10;

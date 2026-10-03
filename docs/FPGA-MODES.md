@@ -9,6 +9,17 @@ its own bitstream, and trxd loads the one a feature needs while Linux runs.
 | `all` | everything (the single bitstream as before) | 75 % | 139.5 | 195 |
 | `trx` | radio, wide scope, CW-RS network (front end and temporal layers, weights in DDR over HP0) | 34 % | 86 | 101 |
 | `datv` | radio, wide scope, DVB-S2/T2 receive and transmit, LDPC | 71 % | 124.5 | 191 |
+| `s2` | radio, wide scope, DVB-S2 receive (DDC, symsync, hdrdet) and transmit, LDPC | 52 % | 108.5 | 115 |
+| `t2` | radio, wide scope, DVB-T2 receive (OFDM front end with P1/GI/MER reports, t2eq, cell router) and transmit (IFFT), LDPC | 70 % | 117.5 | 208 |
+
+On LibreSDR BASIC+ carries `trx` (boot), `s2` and `t2`: trxd loads `s2`
+for a DVB-S2 mode and `t2` for a DVB-T2 one (`fpgamode::datv_part`: the
+rate's "T2-" prefix). `datv` (both) stays a mode trxd accepts, so an image
+that still has it, or a board running it, needs no switch; a DATV command
+takes s2/t2, then datv, then all, whichever the image has. With the
+two halves apart each has room again: the T2 receiver's P1 detector and
+reports went into `t2` (docs/DVBT2.md), and `s2` has 48 % of the LUTs
+free for more of the S2 receiver.
 
 "Radio" is the AD936x interface, the DMAs, the x8 decimator/interpolator,
 refmeter and on Libre `vctcxo_lock` and the XO corrector: in every mode, at
@@ -87,14 +98,24 @@ compresses to 0.6 MB (the `all` one took 1.3 MB).
 ```bash
 /data/claude/fwbuild/fpga-build.sh libre trx    # -> bitstream/simple-trx.xsa
 /data/claude/fwbuild/fpga-build.sh libre datv   # -> bitstream/simple-datv.xsa
+/data/claude/fwbuild/fpga-build.sh libre s2     # -> bitstream/simple-s2.xsa
+/data/claude/fwbuild/fpga-build.sh libre t2     # -> bitstream/simple-t2.xsa
 /data/claude/fwbuild/fpga-build.sh libre        # all -> bitstream/simple.xsa
 ```
 
 maia-hdl: `FPGA_MODE` (projects/simple system_project.tcl) picks the parts
-(system_bd.tcl, maia_scope.tcl); Maia cores `maia_iio_lite_trx`
-(spectrometer only, platform 0xD6: trxd leaves its recorder alone) and
-`maia_iio_lite_s2` (DATV without the T2 front end, `datv_t2 = False`, for
-a later s2/t2 split).
+(system_bd.tcl, maia_scope.tcl, datv_tx.tcl); Maia cores `maia_iio_lite_trx`
+(spectrometer only, platform 0xD6: trxd leaves its recorder alone),
+`maia_iio_lite_s2` (DATV without the T2 front end, `datv_t2 = False`) and
+`maia_iio_lite_t2` (without symsync/hdrdet, `datv_s2 = False`). In `t2`
+the DVB-S2 encoder is a stub (`datv_noenc.v`: takes everything, sends
+nothing) and in `s2` the T2 IFFT is left out (the raw TX path goes straight
+to the TX block).
+
+Image cost (each bitstream xz-compressed in the rootfs): `trx` 583 KiB
+(in the FIT, not the rootfs), `datv` 1167 KiB, `s2` 805 KiB, `t2` 1047
+KiB: s2 + t2 take about 685 KiB more than `datv` did (libre-plus had 937
+KiB free in its slot before).
 
 ## Checked (Libre 1, 2026-09-29)
 

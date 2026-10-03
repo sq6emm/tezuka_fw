@@ -28,6 +28,7 @@ pub mod ldpc;
 pub mod rx;
 pub mod s2cells;
 pub mod s2ring;
+pub mod s2trk;
 pub mod bbout;
 pub mod ts;
 

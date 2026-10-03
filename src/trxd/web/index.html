@@ -1670,12 +1670,21 @@ const DATV = (() => {
     // back, then 3 s of it being there for the answer.
     const up = () => !FPGA.busy && ws && ws.readyState === 1;
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-    for (let t = 0; t < 30000 && !up(); t += 200) await sleep(200);
-    DATV.resync(S.st, true);   // the receiver beside it, if the switch lost its settings
-    send({ cmd: "datv", on: true, ...settings() });
-    for (let t = 0, quiet = 0; t < 30000 && quiet < 3000 && !(S.st && S.st.datv) && !refusal; t += 100) {
-      await sleep(100);
-      quiet = up() ? quiet + 100 : 0;
+    // Sending can itself need the other DATV image (DVB-S2 and DVB-T2 have
+    // their own): the board switches, trxd restarts and the command is lost
+    // with it. Seen switching: wait for the board again and send once more.
+    for (let attempt = 0; attempt < 2 && !(S.st && S.st.datv) && !refusal; attempt++) {
+      for (let t = 0; t < 30000 && !up(); t += 200) await sleep(200);
+      DATV.resync(S.st, true);   // the receiver beside it, if the switch lost its settings
+      send({ cmd: "datv", on: true, ...settings() });
+      let switched = false;
+      for (let t = 0, quiet = 0; t < 30000 && quiet < 3000 && !(S.st && S.st.datv) && !refusal; t += 100) {
+        await sleep(100);
+        if (FPGA.busy) switched = true;
+        quiet = up() ? quiet + 100 : 0;
+        if (switched && up() && quiet >= 1000) break;
+      }
+      if (!switched) break;
     }
     if (!(S.st && S.st.datv)) { stop(false); alert("The board did not start DATV: " + (refusal || "already transmitting, TX not allowed, or a receive-only transverter") + "."); return; }
     cfg = S.st.datv; on = true; starting = false; frames = 0; sent = 0; aSamples = 0; aT0 = 0; micIn = 0; micOut = 0; micErr = "";
@@ -1759,10 +1768,15 @@ const DATV = (() => {
   // (AudioContext time): set by each audio frame scheduled. Pictures wait
   // for their PTS on that clock. avErr: recent picture timing errors, ms.
   let avOff = null, avTimers = [], avErr = [];
+  // The stream's own audio timestamps, in decode order: the decoder's output
+  // timestamps keep counting samples across a gap (Chromium), so after a
+  // pause in reception they no longer match the picture's.
+  let aPts = [], aNext = null, aPrev = null;
   function rxReset() {
     for (const d of [vdec, adec]) if (d && d.state !== "closed") try { d.close(); } catch { /* closed */ }
     vdec = adec = null; needKey = true; nextT = 0; aLead = 0.15;
     avOff = null; avErr = []; for (const t of avTimers) clearTimeout(t); avTimers = [];
+    aPts = []; aNext = null; aPrev = null; avNudgeT = -1;
   }
   function newVdec() {
     vdec = new VideoDecoder({
@@ -1779,7 +1793,7 @@ const DATV = (() => {
     const live = actx && actx.state === "running" && avOff !== null;
     const due = live ? pts + avOff - actx.currentTime : 0;
     if (!live || due < 0.02 || due > 6) {
-      if (live) noteAv(-due);
+      if (live) { noteAv(-due); nudge(-due); }
       draw(f); f.close(); return;
     }
     createImageBitmap(f).then((bm) => {
@@ -1791,6 +1805,17 @@ const DATV = (() => {
       avTimers.push(t);
     }).catch(() => {});
     f.close();
+  }
+  // A picture that came after its time on the sound's clock: the sound is
+  // held back by that much (once a second at most), so the next pictures
+  // are in time. At the low rates the sound arrives up to a second before
+  // its PTS and plays with a short lead while a picture comes just in time.
+  let avNudgeT = -1;
+  function nudge(late) {
+    if (late < 0.05 || !actx || nextT <= actx.currentTime || actx.currentTime < avNudgeT + 1) return;
+    const d = Math.min(late, 1.0);
+    nextT += d; if (avOff !== null) avOff += d;   // (the mapping moves with it, at once)
+    avNudgeT = actx.currentTime;
   }
   // How late (+) or early (-) a picture came against its sound, ms.
   function noteAv(s) { avErr.push(Math.round(s * 1000)); if (avErr.length > 30) avErr.shift(); }
@@ -1817,15 +1842,27 @@ const DATV = (() => {
     if (!adec || adec.state === "closed") {
       adec = new AudioDecoder({ output: play, error: (e) => { console.warn("DATV audio", e); adec = null; } });
       adec.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1 });
+      aPts = [];   // (a decoder that failed took its queued frames with it)
     }
     const ts = Number(new DataView(u8.buffer, u8.byteOffset).getBigInt64(1, true));
+    // A jump in the stream's timestamps. The sound itself is continuous
+    // whenever the transmitter re-stamped its clock (a late keyframe at
+    // the low rates moves it on): it keeps playing back to back and avOff
+    // follows the new mapping. Only after a pause in reception (the buffer
+    // ran dry: a new transmission) does the lead start small again. The
+    // decoder is never thrown away: its queued frames would go with it.
+    if (aNext !== null && Math.abs(ts - aNext) > 200e3 && actx && nextT < actx.currentTime) { nextT = 0; aLead = 0.15; }
+    aNext = ts + 20000;
+    aPts.push(ts);
+    if (aPts.length > 200) aPts.shift();
     try { adec.decode(new EncodedAudioChunk({ type: "key", timestamp: ts, data: u8.subarray(9) })); } catch (e) { console.warn(e); adec = null; }
   }
   function play(ad) {
+    const sp = aPts.shift();   // this frame's own timestamp (decode order)
     if (!actx || !gain) { ad.close(); return; }
     // (Everything read before close(): a closed AudioData reports 0 for its
     // sample rate, which once made every frame of a PES start at once.)
-    const n = ad.numberOfFrames, pts = ad.timestamp / 1e6, buf = actx.createBuffer(1, n, ad.sampleRate), ch = new Float32Array(n);
+    const n = ad.numberOfFrames, pts = (sp !== undefined ? sp : ad.timestamp) / 1e6, buf = actx.createBuffer(1, n, ad.sampleRate), ch = new Float32Array(n);
     ad.copyTo(ch, { planeIndex: 0, format: "f32-planar" }); ad.close();
     buf.copyToChannel(ch, 0);
     const src = actx.createBufferSource(); src.buffer = buf; src.connect(gain);   // AF and AUDIO apply
@@ -1835,11 +1872,16 @@ const DATV = (() => {
     // again further ahead (0.15 s, up to 2.5 s). Never two frames on top of
     // each other: one that would land more than 4 s ahead is dropped.
     const now = actx.currentTime;
+    // A step forward in the stream's time (the transmitter moved its clock
+    // on after a late keyframe): the gap is kept, as a receiver following
+    // the PTS would, so the pictures stamped after it stay in time.
+    if (aPrev !== null && nextT > now) { const gap = pts - aPrev - 0.02; if (gap > 0.2 && gap < 4) nextT += gap; }
+    aPrev = pts;
     if (nextT < now + 0.02) {
       if (nextT > 0) aLead = Math.min(aLead + 0.25, 2.5);
       nextT = now + aLead;
     }
-    if (nextT > now + 4.0) return;
+    if (nextT > now + 8.0) return;
     src.start(nextT); avOff = nextT - pts; nextT += buf.duration;
   }
   // Constellation: fade the previous frames a little, draw this one's points.

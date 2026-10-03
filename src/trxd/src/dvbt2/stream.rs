@@ -37,6 +37,13 @@ const TRACK: usize = 64;
 const P1_OK: f32 = 0.2;
 /// ... when tracking (within +-4 samples of where it should be).
 const P1_TRACK_OK: f32 = 0.15;
+/// The FPGA's P1 detector (t2p1.py): (|C| + |B|) / E of a P1 found while
+/// searching (about 0.5 clean, under 0.1 in noise; the raw window around
+/// the scheduled P1 then confirms it).
+const P1_HW_OK: f32 = 0.15;
+/// With the reports and the cell router: the one equalized symbol a frame
+/// that still goes into the ring (the browser's constellation).
+const RING_J: u8 = N_P2 as u8 + 2;
 /// Equalized cells to 8 bits: unit amplitude = CELL_SCALE.
 const CELL_SCALE: f32 = 40.0;
 const CARRIERS: usize = 1705;
@@ -63,7 +70,18 @@ pub struct Stats {
     pub l1_ok: u64,
     pub l1_mismatch: u64,
     pub l1_failed: u64,
+    /// Taken without the L1 LDPC: the hard decisions did not check, L1 was
+    /// verified within the last [`L1_LDPC_EVERY`] frames.
+    pub l1_unchecked: u64,
 }
+
+/// At a low MER L1's hard decisions rarely check and the float LDPC (two
+/// 16K blocks) cost the A9 most of a core (Libre 1, full duplex, MER 8 dB:
+/// demodulator 52-76 %; one LDPC there takes longer than a frame). L1 does
+/// not change: once verified, the LDPC runs again only when it has not been
+/// verified for this many frames (another configuration is still seen
+/// within about 8 s; its data blocks fail meanwhile anyway).
+const L1_LDPC_EVERY: u64 = 32;
 
 /// With the cell router: the MER from every 4th data symbol's pilots.
 const MER_EVERY: usize = 4;
@@ -230,6 +248,8 @@ pub struct Demod {
     l1_post: super::l1::PostDecoder,
     post_gather: Vec<u32>,
     l1_bad: Option<Vec<&'static str>>,
+    /// stats.frames when L1 last decoded as expected.
+    l1_ok_frame: Option<u64>,
     bins: Vec<usize>,
     /// Per carrier: undoes the FFT window's early start, and the scaling.
     early_rot: Vec<Complex32>,
@@ -295,6 +315,10 @@ pub struct Demod {
     pub car_err: Option<Vec<(f64, f64)>>,
     /// This frame's pilot error and count (the MER shown).
     pil_err: (f64, f64),
+    /// The front end sends the P1, GI and MER reports (maia-hdl t2p1.py,
+    /// t2eq.py): no raw samples while searching or around the guard
+    /// intervals; a frame ends with its MER report.
+    pub hw: bool,
 }
 
 impl Demod {
@@ -378,6 +402,7 @@ impl Demod {
             l1_post: super::l1::PostDecoder::new(&p),
             post_gather,
             l1_bad: None,
+            l1_ok_frame: None,
             bins,
             early_rot,
             early,
@@ -421,6 +446,7 @@ impl Demod {
             car_err: std::env::var_os("T2SYMERR").map(|_| vec![(0.0, 0.0); CARRIERS / 64 + 1]),
             sym_err_frame: vec![(0.0, 0.0); 256],
             pil_err: (0.0, 0.0),
+            hw: false,
         }
     }
 
@@ -909,15 +935,27 @@ impl Demod {
         let l1llr: Vec<f32> = self.pre_gather.iter().map(|&i| (4.0 * cell(i).re / sigma2).clamp(-64.0, 64.0)).collect();
         let k = 2.0 * std::f32::consts::SQRT_2 / sigma2;
         let post_llr: Vec<f32> = self.post_gather.iter().flat_map(|&i| [(k * cell(i).re).clamp(-64.0, 64.0), (k * cell(i).im).clamp(-64.0, 64.0)]).collect();
-        let l1 = match self.l1.decode(&l1llr) {
-            super::l1::PreOutcome::Ok => self.l1_post.decode(&post_llr),
-            other => other,
+        let recent = self.l1_ok_frame.is_some_and(|f| self.stats.frames - f < L1_LDPC_EVERY);
+        let l1 = if recent {
+            use super::l1::PreOutcome::{Mismatch, Ok, Unchecked};
+            match (self.l1.decode_hard(&l1llr), self.l1_post.decode_hard(&post_llr)) {
+                (m @ Mismatch(_), _) | (_, m @ Mismatch(_)) => m,
+                (Ok, Ok) => Ok,
+                _ => Unchecked,
+            }
+        } else {
+            match self.l1.decode(&l1llr) {
+                super::l1::PreOutcome::Ok => self.l1_post.decode(&post_llr),
+                other => other,
+            }
         };
         match l1 {
             super::l1::PreOutcome::Ok => {
                 self.stats.l1_ok += 1;
                 self.l1_bad = None;
+                self.l1_ok_frame = Some(self.stats.frames);
             }
+            super::l1::PreOutcome::Unchecked => self.stats.l1_unchecked += 1,
             super::l1::PreOutcome::Failed => self.stats.l1_failed += 1,
             super::l1::PreOutcome::Mismatch(f) => {
                 self.stats.l1_mismatch += 1;
@@ -1144,6 +1182,21 @@ struct FeState {
     raw_all_asked: bool,
     /// Samples in the raw run so far.
     run_len: usize,
+    /// A report record coming in: its symbol number and the words so far.
+    rec: Option<(u8, Vec<u16>)>,
+    /// The last frame's guard-interval report: its start (low 32 bits) and
+    /// the correlation.
+    gi: Option<(u32, Complex32)>,
+    /// Found by the FPGA's P1 detector: the first P1 window still to give
+    /// the coarse frequency, the first GI report to give it outright.
+    fresh_p1: bool,
+    fresh_gi: bool,
+    /// The ring's equalized symbols chosen (Ctl::EqRing sent).
+    ring_set: bool,
+    /// A frame finished before its GI report came.
+    track_wait: Option<u64>,
+    /// The next frame's MER is not shown (just acquired).
+    settle: bool,
 }
 
 impl Demod {
@@ -1172,14 +1225,38 @@ impl Demod {
                 p1_skip: false,
                 raw_all_asked: false,
                 run_len: 0,
+                rec: None,
+                gi: None,
+                fresh_p1: false,
+                fresh_gi: false,
+                ring_set: false,
+                track_wait: None,
+                settle: false,
             })
         });
+        // With the router the A9 needs one equalized symbol a frame (the
+        // reports carry the MER): the others stay out of the ring.
+        if self.hw && self.router.is_some() && !self.router_check() && self.sym_err.is_none() && !fe.ring_set {
+            ctl.push(super::fe::Ctl::EqRing(RING_J));
+            fe.ring_set = true;
+        }
         let t_in = std::time::Instant::now();
         let mut acq: Vec<Complex32> = Vec::new();
         let mut i = 0;
         while i < words.len() {
             let w = words[i];
             i += 1;
+            // A report record's words (they come together, possibly inside
+            // a symbol's carriers).
+            if fe.rec.is_some() && w != super::fe::GAP {
+                let vals = &mut fe.rec.as_mut().unwrap().1;
+                vals.push(super::fe::report_value(w));
+                if vals.len() == super::fe::REPORT_WORDS {
+                    let (k, v) = fe.rec.take().unwrap();
+                    self.fe_record(&mut fe, k, &v, out, ctl);
+                }
+                continue;
+            }
             // Fast paths (most words): a run of carrier words into the FFT
             // buffer, a run of raw samples onto the current run (header bit
             // 0 clear; bit 16 marks carriers; a gap word has bit 0 set).
@@ -1244,6 +1321,7 @@ impl Demod {
             match decode(w) {
                 Word::Gap => {
                     // Words lost: nothing continues across it.
+                    fe.rec = None;
                     fe.raw_next = None;
                     fe.run_len = 0;
                     fe.car = None;
@@ -1298,6 +1376,9 @@ impl Demod {
                         fe.raw_all_asked = false;
                     }
                 }
+                Word::CarHeader { j, .. } if (super::fe::MER_J..=super::fe::P1_J).contains(&j) => {
+                    fe.rec = Some((j, Vec::with_capacity(super::fe::REPORT_WORDS)));
+                }
                 Word::CarHeader { j, f21, eq } => {
                     if fe.acquiring && fe.raw_next.is_some() && !fe.raw_all_asked {
                         // The front end is already scheduled (the receiver
@@ -1333,7 +1414,9 @@ impl Demod {
             self.buf.extend_from_slice(&acq);
             self.fe_acquire(&mut fe, ctl);
         } else if let Some(next) = fe.p1_check {
-            if fe.now >= next + (P1_LEN + 2 * super::fe::TRACK as usize) as u64 {
+            // (the window is next - TRACK .. next + P1_LEN + TRACK: with the
+            // reports no raw sample follows it)
+            if fe.now >= next + (P1_LEN + super::fe::TRACK as usize) as u64 {
                 fe.p1_check = None;
                 self.fe_p1(&mut fe, next, ctl);
             }
@@ -1411,7 +1494,12 @@ impl Demod {
     /// One FFT from the front end: symbol `j` of the frame starting at `f`.
     /// A symbol of frame `f` is in: whether the frame has all of its
     /// symbols so far.
-    fn fe_frame_ok(fe: &mut FeState, j: usize, f: u64) -> bool {
+    fn fe_frame_ok(fe: &mut FeState, j: usize, f: u64, p2_only: bool) -> bool {
+        // With the reports only the P2 symbols must all come (the data
+        // symbols go to the router, one a frame to the ring).
+        if p2_only && j >= N_P2 {
+            return matches!(fe.frame, Some((ff, _, ok)) if ff == f && ok);
+        }
         match fe.frame {
             Some((ff, next, ok)) if ff == f => fe.frame = Some((f, j + 1, ok && j == next)),
             _ => fe.frame = Some((f, j + 1, j == 0)),
@@ -1422,7 +1510,7 @@ impl Demod {
     /// A symbol the FPGA equalized (t2eq): its cells as they are.
     fn fe_symbol_eq(&mut self, fe: &mut FeState, j: usize, f: u64, out: &mut Vec<T2Block>, ctl: &mut Vec<super::fe::Ctl>) {
         let nsym = self.p.symbols();
-        if !Self::fe_frame_ok(fe, j, f) || j < N_P2 {
+        if !Self::fe_frame_ok(fe, j, f, self.hw) || j < N_P2 {
             return;
         }
         let t0 = std::time::Instant::now();
@@ -1432,7 +1520,8 @@ impl Demod {
             fe.eq_cells = cells;
         }
         self.prof[2] += t0.elapsed().as_secs_f64();
-        if j == nsym - 1 {
+        // (with the reports the frame ends with its MER report)
+        if j == nsym - 1 && !self.hw {
             self.frame_f = f;
             self.finish(out);
             self.fe_track(fe, f, ctl);
@@ -1443,7 +1532,8 @@ impl Demod {
     /// cells for the browser: one data symbol in [`MER_EVERY`] is enough, the
     /// others' words are skipped unread.
     fn eq_skip(&self, j: usize) -> bool {
-        self.router.is_some() && !self.router_check() && self.sym_err.is_none() && j >= N_P2 && j % MER_EVERY != 0
+        self.router.is_some() && !self.router_check() && self.sym_err.is_none() && j >= N_P2
+            && if self.hw { j != RING_J as usize } else { j % MER_EVERY != 0 }
     }
 
     /// Symbol `j`'s cells from the FPGA (unit EQ_UNIT, carrier order): the
@@ -1457,8 +1547,11 @@ impl Demod {
             e += (Complex32::new(c[0] as f32 * u, c[1] as f32 * u) - rf).norm_sqr() as f64;
             n += 1.0;
         }
-        self.pil_err.0 += e;
-        self.pil_err.1 += n;
+        if !self.hw {
+            // (with the reports the MER comes from the FPGA)
+            self.pil_err.0 += e;
+            self.pil_err.1 += n;
+        }
         if self.sym_err.is_some() {
             self.sym_err_frame[j].0 += e;
             self.sym_err_frame[j].1 += n;
@@ -1503,7 +1596,7 @@ impl Demod {
 
     fn fe_symbol(&mut self, fe: &mut FeState, j: usize, f: u64, out: &mut Vec<T2Block>, ctl: &mut Vec<super::fe::Ctl>) {
         let nsym = self.p.symbols();
-        if !Self::fe_frame_ok(fe, j, f) {
+        if !Self::fe_frame_ok(fe, j, f, self.hw) {
             return;
         }
         if j < N_P2 {
@@ -1524,16 +1617,99 @@ impl Demod {
             self.equalize_int(j, &fe.car_buf);
             self.prof[2] += t0.elapsed().as_secs_f64();
         }
-        if j == nsym - 1 {
+        if j == nsym - 1 && !self.hw {
             self.finish(out);
             self.fe_track(fe, f, ctl);
+        }
+    }
+
+    /// A report record from the front end (maia-hdl t2p1.py, t2eq.py).
+    fn fe_record(&mut self, fe: &mut FeState, kind: u8, v: &[u16], out: &mut Vec<T2Block>, ctl: &mut Vec<super::fe::Ctl>) {
+        use super::fe::{extend, freq_word, Ctl, GI_J, MER_J, P1_J};
+        if !self.hw {
+            return;
+        }
+        let at = |i: usize| v[i] as u32 | (v[i + 1] as u32) << 16;
+        let frame = self.p.frame_samples() as u64;
+        match kind {
+            P1_J if fe.acquiring => {
+                // Searching: a P1 strong enough, the frames from two on
+                // (well ahead of the ring and this thread).
+                let (s, cb, e) = (at(0), at(2), at(4));
+                // (no raw samples while searching: time from the records)
+                let s = extend(s, 32, fe.now);
+                fe.now = fe.now.max(s);
+                if e == 0 || (cb as f32 / e as f32) < P1_HW_OK {
+                    return;
+                }
+                let start = s + 2 * frame;
+                ctl.push(Ctl::Schedule { start, freq: freq_word(fe.f_est, self.fs) });
+                fe.acquiring = false;
+                fe.nco_hz = fe.f_est;
+                fe.misses = 0;
+                fe.frame = None;
+                fe.p1_check = Some(start);
+                fe.p1_big = None;
+                fe.p1_skip = false;
+                fe.runs.clear();
+                fe.raw_next = None;
+                fe.gi = None;
+                fe.track_wait = None;
+                fe.fresh_p1 = true;
+                fe.fresh_gi = true;
+                self.stats.locked = true;
+                self.buf.clear();
+            }
+            GI_J => {
+                let cp = Complex32::new(at(0) as i32 as f32, at(2) as i32 as f32);
+                match fe.track_wait.take() {
+                    Some(f) if f as u32 == at(4) => self.fe_track_cp(fe, f, cp, ctl),
+                    _ => fe.gi = Some((at(4), cp)),
+                }
+            }
+            MER_J if !fe.acquiring => {
+                // The frame's end: its P2 symbols all here, the router has
+                // its data cells.
+                let (err, n, f21) = (at(0), v[2], v[3] as u32 | (v[4] as u32 & 0x1F) << 16);
+                let Some((f, _, ok)) = fe.frame.filter(|fr| fr.0 as u32 & 0x1F_FFFF == f21) else { return };
+                if !ok {
+                    // a P2 symbol lost: not decoded, but the next P1 is
+                    // still checked (misses counted, re-acquisition)
+                    fe.p1_check = Some(f + frame);
+                    fe.gi = None;
+                    return;
+                }
+                // The first frame after the FPGA found the P1 came in at the
+                // search frequency until the coarse one from its P1 window:
+                // only its GI report counts.
+                if !fe.fresh_gi {
+                    let t0 = std::time::Instant::now();
+                    // (sum >> 4 of (8 I - s ref8)^2 + (8 Q)^2: in data
+                    // cells, a unit of 20, x 64; not shown for the first
+                    // frame after acquisition: its P2 symbols came before
+                    // the fine frequency took)
+                    let settle = std::mem::take(&mut fe.settle);
+                    self.pil_err = if settle { (0.0, 0.0) } else { (err as f64 / 1600.0, n as f64) };
+                    self.frame_f = f;
+                    self.finish(out);
+                    self.prof[2] += t0.elapsed().as_secs_f64();
+                }
+                // the frame's GI report: before or after this one
+                match fe.gi.take().filter(|g| g.0 == f as u32) {
+                    Some((_, cp)) => self.fe_track_cp(fe, f, cp, ctl),
+                    None => {
+                        fe.p1_check = Some(f + frame);
+                        fe.track_wait = Some(f);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
     /// After a frame: its frequency from the guard intervals, the next
     /// frame's P1 against where the front end put it.
     fn fe_track(&mut self, fe: &mut FeState, f: u64, ctl: &mut Vec<super::fe::Ctl>) {
-        use super::fe::{freq_word, Ctl};
         let gi = self.p.guard.samples();
         let sl = FFT + gi;
         let mut cp = Complex32::default();
@@ -1545,7 +1721,23 @@ impl Demod {
                 }
             }
         }
-        if cp.norm() > 0.0 {
+        self.fe_track_cp(fe, f, cp, ctl);
+    }
+
+    /// [`Self::fe_track`] with the frame's guard-interval correlation.
+    fn fe_track_cp(&mut self, fe: &mut FeState, f: u64, cp: Complex32, ctl: &mut Vec<super::fe::Ctl>) {
+        use super::fe::{freq_word, Ctl};
+        if cp.norm() > 0.0 && fe.fresh_gi && !fe.fresh_p1 {
+            // just found by the FPGA's P1 detector: the frequency from the
+            // coarse estimate outright
+            fe.fresh_gi = false;
+            fe.settle = true;
+            fe.f_est = self.resolve_freq(cp, fe.f_est);
+            fe.jumps = 0;
+            fe.nco_hz = fe.f_est;
+            ctl.push(Ctl::Freq(freq_word(fe.f_est, self.fs)));
+            self.stats.freq_hz = (fe.f_est - self.center_hz) as f32;
+        } else if cp.norm() > 0.0 {
             // The carrier moves slowly: follow small changes halfway a
             // frame; a jump (a frame hit by a fade or a slip, its guard
             // intervals' phase on the other side of the wrap) only when
@@ -1596,8 +1788,16 @@ impl Demod {
             return;
         }
         match found.filter(|v| v.2 >= P1_TRACK_OK) {
-            Some((s, _, _)) => {
+            Some((s, coarse, _)) => {
                 fe.misses = 0;
+                if std::mem::take(&mut fe.fresh_p1) {
+                    // (found by the FPGA's P1 detector: the coarse frequency
+                    // from this window, the GI report refines it)
+                    fe.f_est = coarse;
+                    fe.nco_hz = coarse;
+                    ctl.push(Ctl::Freq(freq_word(coarse, self.fs)));
+                    self.stats.freq_hz = (coarse - self.center_hz) as f32;
+                }
                 // Off by more than a couple of samples: move the frame after
                 // it, while it is still ahead of the front end. The clocks'
                 // drift moves it a few samples at a time; a large offset
