@@ -60,6 +60,9 @@ pub const RING_SPAN_WORDS: u64 = 65536 * RING_WORDS;
 /// The DDC's input: the AD936x rate before the x8 decimator.
 pub const FS_IN: f64 = 3_072_000.0;
 const PLATFORM_DATV: u32 = 0xD5;
+/// The trx bitstream's core: the DDC feeds the ring with the radio's
+/// channel (maia_iio_lite_trx, platform 0xD7).
+const PLATFORM_CHAN: u32 = 0xD7;
 const DT_RING: &str = "/proc/device-tree/reserved-memory/maia_sdr_datv_ring@16100000";
 
 /// The newest front end started. A receiver being replaced lets go of the
@@ -192,6 +195,19 @@ fn is_datv_core(regs: &Mapping) -> bool {
     regs.rd32(REG_ID).to_le_bytes() == *b"maia" && regs.rd32(REG_VERSION) >> 24 == PLATFORM_DATV
 }
 
+/// The core's platform byte, read a few times over: its registers live in
+/// the sampling clock domain and right after the radio was set up the
+/// first reads came back as garbage (maia.rs).
+fn platform(regs: &Mapping) -> Option<u32> {
+    for _ in 0..20 {
+        if regs.rd32(REG_ID).to_le_bytes() == *b"maia" {
+            return Some(regs.rd32(REG_VERSION) >> 24);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    None
+}
+
 /// The running front end: DDC set up for one symbol rate, recorder running.
 pub struct FrontEnd {
     _mem: File,
@@ -221,6 +237,8 @@ pub struct FrontEnd {
     s2trk: bool,
     /// Ring bytes a second (lap detection without the wrap counter).
     ring_rate: f64,
+    /// The channel's words scaled to unity passband gain (start_channel).
+    chan_gain: f32,
     /// The recorder counts its wraps (0x1C).
     wraps_hw: bool,
     /// Bytes read since the start (with the wrap counter: the DMA's bytes
@@ -281,28 +299,23 @@ impl FrontEnd {
                 | (r.bypass3 as u32) << 23
                 | 1 << 24,
         );
-        // Timing recovery in the FPGA when the bitstream has it (and it is
-        // not turned off for comparison: TRXD_NO_SYMSYNC=1). Always written:
-        // disabled, it also resets the loop.
+        // Timing recovery in the FPGA when the bitstream has it. Always
+        // written: disabled, it also resets the loop.
         let ss = super::symsync::Params::new(design.fs_out(), rs);
         regs.wr32(REG_SYMSYNC, 0);
         regs.wr32(REG_OMEGA, ss.omega);
-        let symbols = regs.rd32(REG_OMEGA) == ss.omega && std::env::var_os("TRXD_NO_SYMSYNC").is_none();
+        let symbols = regs.rd32(REG_OMEGA) == ss.omega;
         let mut flagged = false;
         if symbols {
-            // The header detector too, if this core has it (its bit reads
-            // back) and it is not turned off (TRXD_NO_HDRDET=1).
-            let want = std::env::var_os("TRXD_NO_HDRDET").is_none();
-            regs.wr32(REG_SYMSYNC, ss.kp_shift << 1 | ss.ki_shift << 6 | (want as u32) << 11);
-            flagged = want && regs.rd32(REG_SYMSYNC) & (1 << 11) != 0;
+            // The header detector too, if this core has it (its bit reads back).
+            regs.wr32(REG_SYMSYNC, ss.kp_shift << 1 | ss.ki_shift << 6 | 1 << 11);
+            flagged = regs.rd32(REG_SYMSYNC) & (1 << 11) != 0;
             regs.wr32(REG_SYMSYNC, 1 | ss.kp_shift << 1 | ss.ki_shift << 6 | (flagged as u32) << 11);
         }
         // The known-symbol accumulator (a bitstream that has it; with the
-        // header detector's symbols): TRXD_S2_TRK=0 leaves it off (A/B: the
-        // receiver then makes the same sums from the ring's words).
-        let s2trk = flagged
-            && regs.rd32(REG_S2TRK_FEATURES) & S2TRK_FEATURE != 0
-            && std::env::var("TRXD_S2_TRK").map_or(true, |v| v != "0");
+        // header detector's symbols; without it the receiver makes the same
+        // sums from the ring's words).
+        let s2trk = flagged && regs.rd32(REG_S2TRK_FEATURES) & S2TRK_FEATURE != 0;
         if s2trk {
             regs.wr32(REG_S2TRK_CONTROL, 1);
         }
@@ -313,6 +326,62 @@ impl FrontEnd {
         fe.s2trk = s2trk;
         tracing::info!(s2trk, "DVB-S2 front end: known-symbol accumulator");
         Ok(fe)
+    }
+
+    /// The radio's channel out of the trx bitstream's DDC: `fs_out` (48
+    /// kHz) with `pass_hz` flat each side, the channel `center_hz` from the
+    /// LO, into the ring. None on a core without it (the software DDC then).
+    pub fn start_channel(fs_out: f64, pass_hz: f64, center_hz: f64) -> Result<FrontEnd, String> {
+        if !std::path::Path::new(DT_RING).exists() {
+            return Err("no ring reserved in the device tree".into());
+        }
+        let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let (mem, regs) = Self::open_regs()?;
+        if platform(&regs) != Some(PLATFORM_CHAN) {
+            return Err(format!("the FPGA has no channel ring (version {:#010x})", regs.rd32(REG_VERSION)));
+        }
+        let ring = Mapping::new(&mem, RING_BYTES, RING_START as u64).map_err(|e| format!("map channel ring: {e}"))?;
+        let design = super::ddc::design_channel(FS_IN, fs_out, pass_hz)?;
+        let r = design.registers();
+        stop_recorder(&regs);
+        out_of_reset(&regs);
+        for &(addr, c) in &r.coeffs {
+            regs.wr32(REG_COEFF_ADDR, addr as u32);
+            regs.wr32(REG_COEFF, 1 | (((c as u32) & 0x3_FFFF) << 1));
+        }
+        regs.wr32(REG_DECIMATION, r.decimation[0] as u32 | (r.decimation[1] as u32) << 7 | (r.decimation[2] as u32) << 13);
+        regs.wr32(REG_FREQUENCY, frequency_word(center_hz, FS_IN) & 0x0FFF_FFFF);
+        regs.wr32(
+            REG_DDC_CONTROL,
+            r.operations_minus_one[0] as u32
+                | (r.operations_minus_one[1] as u32) << 7
+                | (r.operations_minus_one[2] as u32) << 13
+                | (r.odd_operations[0] as u32) << 20
+                | (r.odd_operations[1] as u32) << 21
+                | (r.bypass2 as u32) << 22
+                | (r.bypass3 as u32) << 23
+                | 1 << 24,
+        );
+        // 16-bit mode (0), start: the ring fills from RING_START.
+        regs.wr32(REG_REC_CONTROL, 1);
+        let mut fe = FrontEnd::new(mem, regs, ring, design.fs_out(), center_hz, generation, false, false, false, None, 4.0 * design.fs_out());
+        // Scaled to the stream path's units (the x8 decimator's output at
+        // 1/2048, which the S-meter calibration is in): the DDC's quantised
+        // passband gain undone, and a half (measured: the same noise read
+        // 6.0 dB higher through the DDC, the meter on the filter band).
+        fe.chan_gain = 0.5 / super::ddc::passband_gain(&design);
+        tracing::info!(fs_out = design.fs_out(), taps = r.coeffs.len(), gain = fe.chan_gain, "radio channel from the FPGA DDC");
+        Ok(fe)
+    }
+
+    /// The ring's words as the channel's samples (16-bit I low, Q high),
+    /// appended to `out`; None when the reader was lapped (samples lost).
+    pub fn read_channel(&mut self, words: &mut Vec<u32>, out: &mut Vec<Complex32>) -> Option<u64> {
+        words.clear();
+        let at = self.read_raw(words);
+        let g = self.chan_gain / 32768.0;
+        out.extend(words.iter().map(|&w| Complex32::new((w as u16 as i16) as f32 * g, ((w >> 16) as u16 as i16) as f32 * g)));
+        at
     }
 
     /// DVB-T2: the recorder takes the T2 resampler's samples at (about)
@@ -362,23 +431,21 @@ impl FrontEnd {
         let layout = p.symbols() as u32 | (gi as u32) << 8 | early(gi) << 18;
         regs.wr32(REG_T2_CONTROL, 0);
         regs.wr32(REG_T2_LAYOUT, layout);
-        let t2_fe = regs.rd32(REG_T2_LAYOUT) == layout
-            && std::env::var_os("TRXD_NO_T2FE").is_none()
-            && !std::path::Path::new("/tmp/t2-nofe").exists();
+        let t2_fe = regs.rd32(REG_T2_LAYOUT) == layout;
         if t2_fe {
             regs.wr32(REG_T2_FRAME_LEN, p.frame_samples() as u32);
             regs.wr32(REG_T2_TRACK, TRACK);
             regs.wr32(REG_T2_FREQ, 0);
         }
         // The equalizer, if there (its pilot layout reads back); on once the
-        // receiver sends the first channel inverse. TRXD_NO_T2EQ=1: off.
+        // receiver sends the first channel inverse.
         let (dx, dy) = p.pilots.dxdy();
         let pilots = dx as u32 | (dy as u32) << 6;
         let mut t2_eq = None;
         if t2_fe {
             regs.wr32(REG_T2EQ_CONTROL, 0);
             regs.wr32(REG_T2EQ_PILOTS, pilots);
-            if regs.rd32(REG_T2EQ_PILOTS) == pilots && std::env::var_os("TRXD_NO_T2EQ").is_none() {
+            if regs.rd32(REG_T2EQ_PILOTS) == pilots {
                 let (_, n_fc, _) = p.data_cells();
                 let fc_j = if n_fc != 0 { p.symbols() as u32 - 1 } else { 255 };
                 let rec = |d: usize| ((65536.0 / d as f64).round() as u32).min(0xFFFF);
@@ -390,9 +457,9 @@ impl FrontEnd {
         }
         // The P1, GI and MER reports (a bitstream that has them, with the
         // equalizer): searching and frequency tracking without raw samples
-        // (stream.rs). TRXD_T2_HW=0: the raw-sample path (A/B).
+        // (stream.rs).
         let mut t2_ext = None;
-        if t2_fe && t2_eq.is_some() && std::env::var("TRXD_T2_HW").map_or(true, |v| v != "0") {
+        if t2_fe && t2_eq.is_some() {
             let feats = regs.rd32(REG_T2_FEATURES) & 0xFF;
             if feats & crate::dvbt2::fe::FEATURES_REPORTS == crate::dvbt2::fe::FEATURES_REPORTS {
                 let boost = match p.pilots {
@@ -439,6 +506,7 @@ impl FrontEnd {
             eq_bank_seen: std::cell::Cell::new(true),
             t2_ext: std::cell::Cell::new(None),
             s2trk: false,
+            chan_gain: 1.0,
             ring_rate,
             wraps_hw,
             total: 0,

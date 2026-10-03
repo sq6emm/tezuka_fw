@@ -18,7 +18,7 @@
 //! rsnn_weights).
 //!
 //! One engine: the first detector to open it has it (the others run on the
-//! CPU). TRXD_NO_RSNN_FPGA=1: never.
+//! CPU).
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
@@ -79,9 +79,6 @@ impl FpgaFront {
     /// The engine loaded with `net`'s front, if the bitstream has one, it is
     /// free and the network fits.
     pub fn open(net: &Net, temporal: Option<(Vec<i16>, Vec<i32>, Vec<usize>)>) -> Option<FpgaFront> {
-        if std::env::var_os("TRXD_NO_RSNN_FPGA").is_some() {
-            return None;
-        }
         let (c2, c1) = net.channels();
         let (w, b) = net.fpga_image();
         if c2 > C2MAX || c1 > C1MAX || w.len() > WMAX || b.len() > BMAX {

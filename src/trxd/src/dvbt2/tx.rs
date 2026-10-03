@@ -130,13 +130,9 @@ impl T2Tx {
         let block = block * TX_BLOCKS;
         let fs = mode.fs() * OS4 as f64 / 4.0;
         // The bitstream's transmit IFFT when there is one (it takes the
-        // OFDM half off the A9: about 60 % of a core); TRXD_NO_T2IFFT=1 keeps
-        // it on the CPU.
+        // OFDM half off the A9: about 60 % of a core).
         use crate::dvbs2::fpga_tx::{has_t2ifft, RawMode};
-        // TRXD_T2_TONE=1: a tone 200 kHz above the LO instead (checks the
-        // raw FPGA path on an analyser; samples, so no IFFT).
-        let tone = std::env::var_os("TRXD_T2_TONE").is_some();
-        let ifft = OS4 == 4 && !tone && std::env::var_os("TRXD_NO_T2IFFT").is_none() && has_t2ifft();
+        let ifft = OS4 == 4 && has_t2ifft();
         let fpga = crate::dvbs2::fpga_tx::RawTransmitter::start(fs, if ifft { RawMode::T2Ifft } else { RawMode::Samples8 })?;
         tracing::info!(fpga_ifft = ifft, "DVB-T2 transmitter");
         // About a T2 frame of packets queued ahead of the modulator.
@@ -341,33 +337,19 @@ fn run(p: Params, cells_in: Receiver<Vec<Cell>>, frames_out: Sender<Vec<u8>>, st
     crate::stream::thread_nice(TX_NICE);
     let o = OfdmStage::new(p, OS4);
     let mut iq = Vec::with_capacity(o.frame_samples());
-    let tone = std::env::var_os("TRXD_T2_TONE").is_some();
     // Debug: `echo 68 > /tmp/t2-scale` drives harder (RMS in 8-bit units).
     let scale: f32 = std::fs::read_to_string("/tmp/t2-scale").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(drive);
     if scale != SCALE {
         tracing::info!(scale, "DVB-T2 TX scale (trx.t2_drive_db, or /tmp/t2-scale)");
     }
     let (mut frames, mut ofdm_s, mut conv_s) = (0u64, 0f64, 0f64);
-    let mut ph = 0f64;
     for cells in cells_in.iter() {
         if stop.load(Ordering::Relaxed) {
             return;
         }
         iq.clear();
         let t0 = std::time::Instant::now();
-        if tone {
-            // A complex exponential by recursion (cheap on the A9).
-            let w = std::f64::consts::TAU * 200e3 / (131e6 / 71.0 * OS4 as f64 / 4.0);
-            let step = num_complex::Complex32::new(w.cos() as f32, w.sin() as f32);
-            let mut z = num_complex::Complex32::from_polar(1.0, ph as f32);
-            for _ in 0..o.frame_samples() {
-                iq.push(z);
-                z *= step;
-            }
-            ph = z.arg() as f64;
-        } else {
-            o.frame(&cells, &mut iq);
-        }
+        o.frame(&cells, &mut iq);
         ofdm_s += t0.elapsed().as_secs_f64();
         let t1 = std::time::Instant::now();
         let mut bytes = vec![0u8; 2 * iq.len()];
@@ -379,7 +361,7 @@ fn run(p: Params, cells_in: Receiver<Vec<Cell>>, frames_out: Sender<Vec<u8>>, st
         frames += 1;
         if frames % 40 == 0 {
             let ms = |s: f64| (s / 40.0 * 1e3).round();
-            tracing::info!(frames, ofdm_ms = ms(ofdm_s), conv_ms = ms(conv_s), tone, "DVB-T2 OFDM");
+            tracing::info!(frames, ofdm_ms = ms(ofdm_s), conv_ms = ms(conv_s), "DVB-T2 OFDM");
             (ofdm_s, conv_s) = (0.0, 0.0);
         }
         // To the writer (blocks while two frames wait: that is the pacing).

@@ -280,3 +280,5 @@ temporal layers, bit-exact with the batch forward pass.
 - A language model (callsign structure, repeated calls combined): the
   near misses above would mostly go.
 - FSK beacons (see Training).
+
+The `TRXD_*` A/B environment switches mentioned above were removed on 2026-10-03: on a board the FPGA paths are the only ones, and the software equivalents live on as the models the tests run. The mentions are history.

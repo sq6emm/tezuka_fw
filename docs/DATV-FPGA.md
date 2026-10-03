@@ -529,3 +529,5 @@ all blocks from the unit after the first two tracked frames.
 Bitstream `s2` with the unit (Libre, Vivado 2023.1): WNS +0.144 ns, WHS
 +0.015 ns; LUTs 53.9 % (52.1 % before), BRAM 111.5 tiles (108.5: the
 FIFO and the table), DSPs 121 (115); 830 KiB xz in the image (805).
+
+The `TRXD_*` A/B environment switches mentioned above were removed on 2026-10-03: on a board the FPGA paths are the only ones, and the software equivalents live on as the models the tests run. The mentions are history.

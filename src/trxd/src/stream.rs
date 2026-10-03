@@ -150,6 +150,9 @@ pub const TX_PREFILL_BLOCKS: usize = 2;
 pub enum TxBlock {
     Iq(Vec<Complex32>),
     Raw(Vec<u8>),
+    /// A block of zeros (the transmitter idle): written from a buffer kept
+    /// here, no block made and converted each cycle.
+    Silence,
 }
 
 pub fn spawn_tx(mut tx: Box<dyn TxStream>, block: usize) -> Sender<TxBlock> {
@@ -171,6 +174,7 @@ pub fn spawn_tx(mut tx: Box<dyn TxStream>, block: usize) -> Sender<TxBlock> {
                 let r = match b {
                     TxBlock::Iq(b) => tx.write(&b),
                     TxBlock::Raw(b) => tx.write_raw(&b),
+                    TxBlock::Silence => tx.write(&silence),
                 };
                 if let Err(e) = r {
                     error!("{e}");

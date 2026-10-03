@@ -217,6 +217,62 @@ fn quantize(h1: (Vec<f64>, usize), h2: Option<(Vec<f64>, usize)>, h3: (Vec<f64>,
 }
 
 /// The FPGA limits maia-httpd checks before writing a stage.
+/// The radio's channel: `fs_in` down to `fs_out` (an integer factor, 16
+/// or more, even) with the passband `pass_hz` each side (the widest SSB
+/// filter), 60 dB down from the next stage's fold-over: three lowpass
+/// stages, the larger factors first, FIR3 by 2 as the core has it.
+pub fn design_channel(fs_in: f64, fs_out: f64, pass_hz: f64) -> Result<Design, String> {
+    let d = (fs_in / fs_out).round() as usize;
+    if d < 16 || d % 2 != 0 || (fs_in / d as f64 - fs_out).abs() > 1e-6 {
+        return Err(format!("{fs_in} to {fs_out} S/s: not an even decimation of 16 or more"));
+    }
+    let rem = d / 2;
+    let d2 = (2..=rem).rev().find(|d| rem % d == 0 && d * d <= rem).unwrap_or(1);
+    let d1 = rem / d2;
+    let budget = |fs: f64, d: usize, folded: bool, max_addr: usize| {
+        let ops = ((CLOCK_HZ / fs).floor() as usize).min(MAX_OPERATIONS).min(max_addr / d);
+        (if folded { 2 * ops } else { ops }) * d
+    };
+    let mut fs = fs_in;
+    let fir1 = {
+        let fs_next = fs / d1 as f64;
+        let h = lowpass(fs, pass_hz, fs_next - pass_hz, budget(fs, d1, true, NUM_ADDR[0]));
+        fs = fs_next;
+        (h, d1)
+    };
+    let fir2 = (d2 > 1).then(|| {
+        let fs_next = fs / d2 as f64;
+        let h = lowpass(fs, pass_hz, fs_next - pass_hz, budget(fs, d2, false, NUM_ADDR[1]));
+        fs = fs_next;
+        (h, d2)
+    });
+    let fir3 = (lowpass(fs, pass_hz, fs / 2.0 - pass_hz, budget(fs, 2, true, NUM_ADDR[2])), 2);
+    let (fir1, fir2, fir3) = quantize(fir1, fir2, fir3);
+    let d = Design { fs_in, rs: fs_out / 2.0, fir1, fir2, fir3: Some(fir3) };
+    check(&d)?;
+    Ok(d)
+}
+
+/// The design's gain in the passband (the quantised stages truncate: about
+/// -3 dB), from the model on a tone; the channel's reader scales by it.
+pub fn passband_gain(d: &Design) -> f32 {
+    let f = d.fs_out() / 16.0;
+    let n = (d.decimation() * 2048).max(1 << 15);
+    let x: Vec<[i16; 2]> = (0..n)
+        .map(|i| {
+            let z = Complex32::from_polar(600.0, (std::f64::consts::TAU * f * i as f64 / d.fs_in) as f32);
+            [z.re.round() as i16, z.im.round() as i16]
+        })
+        .collect();
+    let mut m = DdcModel::new(d, 0);
+    let mut y = Vec::new();
+    m.process(&x, &mut y);
+    let mut c = Vec::new();
+    to_complex(&y[y.len() / 2..], &mut c);
+    let rms = (c.iter().map(|z| z.norm_sqr()).sum::<f32>() / c.len().max(1) as f32).sqrt();
+    rms / (600.0 / 2048.0)
+}
+
 fn check(d: &Design) -> Result<(), String> {
     let mut fs = d.fs_in;
     for (i, st) in [Some(&d.fir1), d.fir2.as_ref(), d.fir3.as_ref()].into_iter().enumerate() {
@@ -428,6 +484,40 @@ pub fn to_complex(iq: &[[i16; 2]], out: &mut Vec<Complex32>) {
 mod tests {
     use super::super::{Modulator, Params, Rate, TS_LEN, rx::Receiver, symsync::SymSync, hdrdet::HdrDet};
     use super::*;
+
+    /// The radio's 48 kHz channel out of the 3.072 MS/s ADC stream: the
+    /// decimation the core takes, flat to 12 kHz, 60 dB down past the fold.
+    #[test]
+    fn channel_design_fits_the_core() {
+        let d = design_channel(3_072_000.0, 48_000.0, 12_000.0).unwrap();
+        assert_eq!(d.decimation(), 64);
+        assert!((d.fs_out() - 48_000.0).abs() < 1e-6);
+        let r = d.registers();
+        assert!(r.coeffs.len() <= 640);
+        // the response: a tone at 5 kHz through, one at 40 kHz (folds onto
+        // 8 kHz after FIR2 if not stopped) gone
+        let n = 1 << 16;
+        let gain = |f: f64| {
+            let x: Vec<[i16; 2]> = (0..n)
+                .map(|i| {
+                    let z = Complex32::from_polar(600.0, (std::f64::consts::TAU * f * i as f64 / 3_072_000.0) as f32);
+                    [z.re.round() as i16, z.im.round() as i16]
+                })
+                .collect();
+            let mut m = DdcModel::new(&d, 0);
+            let mut y = Vec::new();
+            m.process(&x, &mut y);
+            let mut c = Vec::new();
+            to_complex(&y[y.len() / 2..], &mut c);
+            let rms = (c.iter().map(|z| z.norm_sqr()).sum::<f32>() / c.len() as f32).sqrt();
+            rms / (600.0 / 2048.0)
+        };
+        let g = passband_gain(&d);
+        assert!(g > 0.5 && g < 1.0, "passband gain {g}");
+        let (pass, stop) = (gain(5_000.0) / g, gain(40_000.0) / g);
+        assert!(pass > 0.97 && pass < 1.03, "passband flatness {pass}");
+        assert!(stop < 0.002, "stopband gain {stop}");
+    }
 
     const FS: f64 = 3_072_000.0;
 

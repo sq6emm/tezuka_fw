@@ -229,3 +229,5 @@ MER dB (median) / % of frames decoded after lock.
 | T2 2.0 QPSK 1/2 | 5.1 / 100 | -22.4 / 0.5 | 28.3 / 100 | 28.0 / 100 | 1.9 / 66.8 | 13.8 / 100 |
 | T2 2.0 16QAM 1/2 | 5.6 / 61.5 | -22.4 / 0.8 | 28.0 / 100 | 27.8 / 100 | 1.4 / 0.5 | 14.1 / 100 |
 | T2 1.35 QPSK 1/2 | 4.7 / 99.2 | -3.9 / 0.5 | 29.9 / 100 | 28.7 / 100 | 1.7 / 94.4 | 14.8 / 100 |
+
+The `TRXD_*` A/B environment switches mentioned above were removed on 2026-10-03: on a board the FPGA paths are the only ones, and the software equivalents live on as the models the tests run. The mentions are history.

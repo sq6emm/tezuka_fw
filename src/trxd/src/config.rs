@@ -95,6 +95,12 @@ pub struct RadioConfig {
     /// Use the simple bitstream's x8 FIR decimator / interpolator. Off streams
     /// the full `adc_rate` to the ARM (works with any ADI bitstream, costs CPU).
     pub fpga_decimation: bool,
+    /// The radio's 48 kHz channel from the trx bitstream's DDC (NCO and
+    /// decimation in the fabric, the channel read from a ring in DDR) when
+    /// the loaded bitstream has it; off, or without one, the ARM makes it
+    /// from the 384 kS/s stream (about a tenth of a core).
+    #[serde(default = "default_true")]
+    pub fpga_ddc: bool,
     pub rf_bandwidth: u32,
     pub rx_gain_mode: GainMode,
     /// Manual RX gain, dB (0..73 on the AD9363).
@@ -130,6 +136,7 @@ impl Default for RadioConfig {
             backend: Backend::Iio,
             adc_rate: 3_072_000,
             fpga_decimation: true,
+            fpga_ddc: true,
             rf_bandwidth: 1_000_000,
             rx_gain_mode: GainMode::SlowAttack,
             rx_gain_db: 40.0,
@@ -465,4 +472,8 @@ mod tests {
         assert!(Config::parse("bogus = 1").is_err());
         assert!(Config::parse("[radio]\nadc_rate = 1000000").is_err());
     }
+}
+
+fn default_true() -> bool {
+    true
 }

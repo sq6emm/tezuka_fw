@@ -1777,7 +1777,7 @@ const DATV = (() => {
         ctx.drawImage(v, (sw - cw) / 2, (sh - ch) / 2, cw, ch, 0, 0, W, H);
       }
       const vf = new VideoFrame(cv, { timestamp: Math.round(performance.now() * 1000) });
-      venc.encode(vf, { keyFrame: forceKey || frames % Math.round(2 * cfg.fps) === 0 });
+      venc.encode(vf, { keyFrame: forceKey || frames % Math.round((cfg.key_every_s || 2) * cfg.fps) === 0 });
       vf.close(); forceKey = false; frames++;
     }, 1000 / cfg.fps);
   }

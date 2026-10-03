@@ -159,7 +159,9 @@ static INSTALLED: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mut
 /// board, and trxd restarts for an FPGA bitstream switch. Users of DeepCW
 /// call [`wait_installed`] first.
 pub fn install_background(source: String) {
-    STARTED.store(true, std::sync::atomic::Ordering::Release);
+    if STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
     let spawned = std::thread::Builder::new().name("model".into()).spawn(move || {
         // Marked done however install ends, a panic included (with
         // panic = "abort" a panic ends trxd anyway; this is for unwinding).

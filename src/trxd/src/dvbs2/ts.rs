@@ -45,7 +45,6 @@ const T_EIT: usize = 4;
 /// Every PES must be in by its PTS (T-STD); this much to spare.
 const PTS_MARGIN_S: f64 = 0.05;
 /// A keyframe at least this often (the browser is asked for one).
-const KEY_EVERY_S: f64 = 2.0;
 pub const PID_VIDEO: u16 = 0x0100;
 pub const PID_AUDIO: u16 = 0x0101;
 /// 27 MHz system clock.
@@ -88,6 +87,10 @@ pub struct Profile {
     pub psi_every_s: f64,
     /// A PCR at least this often, seconds.
     pub pcr_every_s: f64,
+    /// The browser sends a keyframe this often (and when asked), seconds.
+    /// A keyframe is 1.3-1.9 KB at 160x120: 2 s of them at the lean
+    /// profile left room for a third of the pictures.
+    pub key_every_s: f64,
     /// PTS at most this long after the data arrives, seconds: 1 s
     /// (13818-1's T-STD limit) except in the lean profile.
     pub tstd_max_s: f64,
@@ -103,16 +106,16 @@ impl Profile {
             // and so PTS up to 1.4 s after the data (13818-1's T-STD allows
             // 1 s): with 1 s the audio PES (4 packets at 15-30 a second)
             // and large pictures miss their PTS.
-            Profile { width: 160, height: 120, fps: 2.0, audio_bps: 6_000.0, audio_per_pes: 40, psi_every_s: 1.0, pcr_every_s: 0.5, tstd_max_s: 1.4 }
+            Profile { width: 160, height: 120, fps: 2.0, audio_bps: 6_000.0, audio_per_pes: 40, psi_every_s: 1.0, pcr_every_s: 0.5, key_every_s: 6.0, tstd_max_s: 1.4 }
         } else if ts_rate < 80_000.0 {
             // (audio 8 kbit/s, 300 ms to a PES: 12 kbit/s in 200 ms PES took
             // a third of the packets at 46 kbit/s and left no picture)
-            Profile { width: 320, height: 240, fps: 5.0, audio_bps: 8_000.0, audio_per_pes: 15, psi_every_s: 0.5, pcr_every_s: 0.09, tstd_max_s: DELAY_MAX_S }
+            Profile { width: 320, height: 240, fps: 5.0, audio_bps: 8_000.0, audio_per_pes: 15, psi_every_s: 0.5, pcr_every_s: 0.09, key_every_s: 2.0, tstd_max_s: DELAY_MAX_S }
         } else if ts_rate < 200_000.0 {
-            Profile { width: 320, height: 240, fps: 10.0, audio_bps: 16_000.0, audio_per_pes: 10, psi_every_s: 0.5, pcr_every_s: 0.09, tstd_max_s: DELAY_MAX_S }
+            Profile { width: 320, height: 240, fps: 10.0, audio_bps: 16_000.0, audio_per_pes: 10, psi_every_s: 0.5, pcr_every_s: 0.09, key_every_s: 2.0, tstd_max_s: DELAY_MAX_S }
         } else {
             // 192 kS/s and up at 2/3-3/4 (FPGA front end): 240-360 kbit/s.
-            Profile { width: 640, height: 480, fps: 10.0, audio_bps: 24_000.0, audio_per_pes: 10, psi_every_s: 0.5, pcr_every_s: 0.04, tstd_max_s: DELAY_MAX_S }
+            Profile { width: 640, height: 480, fps: 10.0, audio_bps: 24_000.0, audio_per_pes: 10, psi_every_s: 0.5, pcr_every_s: 0.04, key_every_s: 2.0, tstd_max_s: DELAY_MAX_S }
         }
     }
 
@@ -445,14 +448,18 @@ impl Mux {
     }
 
     /// Should the browser send a keyframe? After a dropped frame, or when
-    /// none came for KEY_EVERY_S (decoders start and recover at
+    /// none came for the profile's key_every_s (decoders start and recover at
     /// keyframes). Asking resets both, so it is asked once.
     pub fn take_key_request(&mut self) -> bool {
-        let overdue = self.last_key.is_some_and(|k| (self.sent - k) as f64 > KEY_EVERY_S * self.pps);
+        let overdue = self.last_key.is_some_and(|k| (self.sent - k) as f64 > self.profile.key_every_s * self.pps);
         if overdue {
             self.last_key = Some(self.sent);
         }
-        std::mem::take(&mut self.want_key) || overdue
+        // (one asked for after a drop waits for the queue to drain: sent
+        // into a backlog it was late itself, dropped the rest and asked
+        // again, a keyframe every other frame at 33 kS/s)
+        let drained = self.backlog_s() < BACKLOG_S / 2.0;
+        (drained && std::mem::take(&mut self.want_key)) || overdue
     }
 
     pub fn push(&mut self, m: Media) {
@@ -1469,7 +1476,8 @@ mod tests {
         assert_eq!(back, 0, "key {ksize} B: audio PTS stepped back into the previous PES");
         // the clock moves on while the keyframes find their delay, then stays
         assert!(fwd <= 3, "key {ksize} B: {fwd} jumps in the audio's clock");
-        assert!(v.len() >= 25, "key {ksize} B: {} pictures in 60 s", v.len());
+        // (one a keyframe interval at least; nearly all with the keyframes measured)
+        assert!(v.len() >= if ksize <= 2000 { 100 } else { 10 }, "key {ksize} B: {} pictures in 60 s", v.len());
         }
     }
 
@@ -1675,7 +1683,7 @@ mod tests {
     }
 
     /// A keyframe without SPS/PPS gets the last ones; a keyframe is asked
-    /// for after KEY_EVERY_S without one.
+    /// for after key_every_s without one.
     #[test]
     fn keyframes_carry_parameter_sets_and_come_often() {
         let mut m = Mux::new(300_000.0, "SQ6EMM");
@@ -1697,7 +1705,7 @@ mod tests {
         let video: Vec<&Vec<u8>> = msgs.iter().filter(|m| m[0] == 6).collect();
         assert!(video.len() >= 2);
         assert!(video[1].windows(sps_pps.len()).any(|w| w == sps_pps), "second keyframe without SPS/PPS");
-        for _ in 0..(KEY_EVERY_S * m.pps) as usize {
+        for _ in 0..(m.profile.key_every_s * m.pps) as usize {
             m.next();
         }
         assert!(m.take_key_request(), "no keyframe asked for");

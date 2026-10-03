@@ -7,7 +7,7 @@ its own bitstream, and trxd loads the one a feature needs while Linux runs.
 | Mode | What is in it | LUTs | BRAM tiles | DSPs |
 |---|---|---|---|---|
 | `all` | everything (the single bitstream as before) | 75 % | 139.5 | 195 |
-| `trx` | radio, wide scope, CW-RS network (front end and temporal layers, weights in DDR over HP0) | 34 % | 86 | 101 |
+| `trx` | radio, wide scope, the radio's channel DDC (Maia's DDC into the DDR ring, platform 0xD7; docs/PERFORMANCE.md), CW-RS network (front end and temporal layers, weights in DDR over HP0) | 35 % | 86 | 101 |
 | `datv` | radio, wide scope, DVB-S2/T2 receive and transmit, LDPC | 71 % | 124.5 | 191 |
 | `s2` | radio, wide scope, DVB-S2 receive (DDC, symsync, hdrdet) and transmit, LDPC | 52 % | 108.5 | 115 |
 | `t2` | radio, wide scope, DVB-T2 receive (OFDM front end with P1/GI/MER reports, t2eq, cell router) and transmit (IFFT), LDPC | 70 % | 117.5 | 208 |

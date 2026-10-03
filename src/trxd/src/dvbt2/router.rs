@@ -79,9 +79,9 @@ unsafe impl Send for Router {}
 
 impl Router {
     /// The router, if the bitstream has it and the device tree reserves its
-    /// memory (TRXD_NO_T2ROUTER=1: never).
+    /// memory.
     pub fn open() -> Option<Router> {
-        if std::env::var_os("TRXD_NO_T2ROUTER").is_some() || !std::path::Path::new(DT).exists() {
+        if !std::path::Path::new(DT).exists() {
             return None;
         }
         let mem = OpenOptions::new().read(true).write(true).custom_flags(libc::O_SYNC).open("/dev/mem").ok()?;

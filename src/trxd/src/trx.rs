@@ -45,6 +45,9 @@ use crate::stream::{RxBlock, time_synced};
 
 /// Channel (audio) rate.
 const CH_RATE: f64 = 48_000.0;
+/// What the FPGA channel DDC passes flat each side of the VFO (the widest
+/// filter is narrower).
+const CHAN_PASS_HZ: f64 = 12_000.0;
 /// Demodulator rate for the narrow modes (SSB, CW, data): a quarter of the
 /// channel, where their 3 kHz fits with room to spare. The demodulator's
 /// passband FIR is the engine's biggest cost at 48 kHz (measured ~45 % of a
@@ -214,6 +217,10 @@ pub struct Trx {
 
     // Receive DSP
     ddc: Ddc,
+    /// The channel from the trx bitstream's DDC (a ring in DDR) instead:
+    /// the NCO and the decimation off the ARM (docs/PERFORMANCE.md).
+    chan_fpga: Option<crate::dvbs2::fpga::FrontEnd>,
+    chan_words: Vec<u32>,
     demod: Box<dyn Demodulator>,
     agc: Agc,
     agc_mode: AgcMode,
@@ -500,6 +507,8 @@ impl Trx {
             key_env: 0.0,
             scope_center: false,
             ddc: Ddc::new(rate, CH_RATE),
+            chan_fpga: None,
+            chan_words: Vec::new(),
             demod: make_demod(mode, CH_RATE).expect("sideband demod"),
             agc,
             agc_mode: AgcMode::Med,
@@ -593,7 +602,22 @@ impl Trx {
             t.temps = crate::temps::start();
             t.maia = crate::maia::start(t.cfg.radio.adc_rate as f64, 15.0);
         }
+        if t.cfg.radio.fpga_ddc && t.cfg.radio.backend == crate::config::Backend::Iio && !t.datv_mode {
+            match crate::dvbs2::fpga::FrontEnd::start_channel(CH_RATE, CHAN_PASS_HZ, t.chan_offset()) {
+                Ok(fe) => t.chan_fpga = Some(fe),
+                Err(e) => info!("the channel on the ARM: {e}"),
+            }
+        }
         t
+    }
+
+    /// The channel's offset from the LO as the DDC (either) mixes it down:
+    /// through an inverting transverter the AD936x sees the mirror image,
+    /// so the FPGA's DDC takes the negated offset and its output is
+    /// conjugated (the software one gets the stream mirrored first).
+    fn chan_offset(&self) -> f64 {
+        let off = self.rx_eff() - self.center;
+        if self.chan_fpga.is_some() && self.xvtr.as_ref().is_some_and(|t| t.inverted) { -off } else { off }
     }
 
     fn caps(cfg: &Config, rate: f64) -> DeviceCaps {
@@ -846,7 +870,7 @@ impl Trx {
     /// The TX analog filter for what is sent: DVB-T2 is wider than the
     /// default (1 MHz). Set before RF goes on.
     fn datv_tx_bw(&mut self) {
-        let want = self.datv.as_ref().and_then(|d| d.t2.as_ref()).filter(|_| std::env::var_os("TRXD_NO_TXBW").is_none()).map_or(self.cfg.radio.rf_bandwidth, |t| {
+        let want = self.datv.as_ref().and_then(|d| d.t2.as_ref()).map_or(self.cfg.radio.rf_bandwidth, |t| {
             self.cfg.radio.rf_bandwidth.max((t.mode.bw_hz * 1.3) as u32)
         });
         if want != self.tx_bw {
@@ -897,6 +921,10 @@ impl Trx {
 
     fn apply_offsets(&mut self) {
         self.ddc.set_offset_hz(self.rx_eff() - self.center);
+        let off = self.chan_offset();
+        if let Some(fe) = &mut self.chan_fpga {
+            fe.set_center(off);
+        }
         let tx_off = self.tx_eff() - self.center;
         self.tx_nco.set_freq(tx_off, self.rate);
     }
@@ -1420,7 +1448,7 @@ impl Trx {
         match &self.datv {
             Some(d) => {
                 serde_json::json!({"sr": d.sr, "rate": d.rate_label, "pilots": d.pilots, "ts_rate": d.ts_rate.round(), "fpga": d.fpga.is_some() || d.t2.is_some(),
-                    "video_bps": d.video_bps.round(), "audio_bps": d.profile.audio_bps, "fps": d.profile.fps,
+                    "video_bps": d.video_bps.round(), "audio_bps": d.profile.audio_bps, "fps": d.profile.fps, "key_every_s": d.profile.key_every_s,
                     "width": d.profile.width, "height": d.profile.height})
             }
             None => serde_json::Value::Null,
@@ -1958,7 +1986,7 @@ impl Trx {
         // left no P1 to find), and closes again after.
         // DVB-S2 beside the LO (datv_lo_offset): open it over both.
         let s2 = self.datv_rx_half().zip(self.datv_lo_offset()).map(|(half, off)| 2.0 * (half + off));
-        let want = self.datv_rx.as_ref().and_then(|r| r.t2_bw).or(s2).filter(|_| std::env::var_os("TRXD_NO_RXBW").is_none()).map_or(self.cfg.radio.rf_bandwidth, |bw| {
+        let want = self.datv_rx.as_ref().and_then(|r| r.t2_bw).or(s2).map_or(self.cfg.radio.rf_bandwidth, |bw| {
             self.cfg.radio.rf_bandwidth.max((bw * 1.3) as u32)
         });
         if want != self.rx_bw {
@@ -1982,6 +2010,14 @@ impl Trx {
             let n = self.chan_frac.floor();
             self.chan_frac -= n;
             self.chan.resize(n as usize, Complex32::default());
+        } else if let Some(fe) = &mut self.chan_fpga {
+            // (lapped: the samples lost are lost; the ring goes on)
+            fe.read_channel(&mut self.chan_words, &mut self.chan);
+            if inverted {
+                for z in &mut self.chan {
+                    *z = z.conj();
+                }
+            }
         } else {
             self.ddc.process(iq, &mut self.chan);
         }
@@ -2360,6 +2396,13 @@ impl Trx {
             }
         }
 
+        // Idle: the transmit thread writes its own zeros.
+        if self.tx_on.is_none() && self.tx_bb.is_empty() && self.tx_out.is_empty() {
+            if self.tx_sink.try_send(crate::stream::TxBlock::Silence).is_err() {
+                debug!("TX queue full");
+            }
+            return;
+        }
         // Up to the stream rate and out to the VFO.
         let mut block = vec![Complex32::default(); self.block];
         if !self.tx_bb.is_empty() {
@@ -2969,7 +3012,13 @@ impl Trx {
                     w.send_json_to(client, &self.calib_json());
                 }
             }
-            "cw_engine" => self.cwlive.set_engine(m["engine"].as_str().unwrap_or("timing")),
+            "cw_engine" => {
+                let e = m["engine"].as_str().unwrap_or("timing");
+                if e == "neural" {
+                    crate::model::install_background(self.cfg.cw_model.clone());
+                }
+                self.cwlive.set_engine(e)
+            }
             "decoder" => {
                 let kind = match m["kind"].as_str() {
                     Some("q65") => Some(DecoderKind::Q65),

@@ -33,7 +33,7 @@
 //! remainder of the first Nbch is in 0xFF4C..0xFF60 (status bit 3: zero, a
 //! valid codeword). The receiver ([`Ldpc::want_bb`]) then neither unpacks
 //! bits nor divides by g(x) nor descrambles: [`Ldpc::take_bb`].
-//! TRXD_S2_SW_BCH=1: not used (the bits as before, for an A/B on a board).
+//!
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
@@ -117,8 +117,8 @@ impl Window {
         w.lanes = lanes.min(4);
         w.qam16 = lanes == 6;
         w.feat = w.rd(0xFF30) & 63;
-        w.bb = w.feat & 32 != 0 && std::env::var_os("TRXD_S2_SW_BCH").is_none();
-        if lanes >= 5 && std::path::Path::new(DT_DMA).exists() && std::env::var_os("TRXD_NO_LDPC_DMA").is_none() {
+        w.bb = w.feat & 32 != 0;
+        if lanes >= 5 && std::path::Path::new(DT_DMA).exists() {
             // SAFETY: MAP_SHARED of the reserved (no-map) buffer memory;
             // accessed below as aligned words inside it, unmapped on drop.
             let d = unsafe {
@@ -421,7 +421,7 @@ pub fn available() -> bool {
 /// Does the FPGA decoder take DVB-T2 QPSK cells (it makes the LLRs)?
 pub fn cells_available() -> bool {
     static CELLS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CELLS.get_or_init(|| Window::open().is_ok_and(|w| w.dma.is_some()) && std::env::var_os("TRXD_NO_LDPC_CELLS").is_none())
+    *CELLS.get_or_init(|| Window::open().is_ok_and(|w| w.dma.is_some()))
 }
 
 /// DVB-S2 8PSK cells (0xFF30 bit 3: the max-log demapper and the 3-column
@@ -435,7 +435,7 @@ pub fn psk8_cells_available() -> bool {
 /// s2front.py, the CPU no longer touches the data symbols)?
 pub fn ring_available() -> bool {
     static RING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *RING.get_or_init(|| psk8_cells_available() && Window::open().is_ok_and(|w| w.feat & 16 != 0) && std::env::var_os("TRXD_S2_NO_RING").is_none())
+    *RING.get_or_init(|| psk8_cells_available() && Window::open().is_ok_and(|w| w.feat & 16 != 0))
 }
 
 /// And 16QAM cells (four LLRs a cell and the bit deinterleaver there too)?
@@ -525,6 +525,11 @@ impl Ldpc {
         if let Ldpc::Fpga { bb, .. } = self {
             bb.bytes = v;
         }
+    }
+
+    /// The FPGA decoder (fast enough for the full budget with a queue).
+    pub fn is_fpga(&self) -> bool {
+        matches!(self, Ldpc::Fpga { .. })
     }
 
     /// At most `n` iterations (fewer when frames queue up behind this one).

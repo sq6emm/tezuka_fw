@@ -269,9 +269,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // The transceiver always reads CW; a beacon receiver when asked to.
-    let wants_cw = cfg.role == Role::Trx || cfg.beacon_rx.decoders.contains(&config::DecoderKind::Cw);
-    if wants_cw && cfg.role != Role::BeaconTx {
+    // The DeepCW model (15 MB from the flash, 5 s) only when the neural CW
+    // engine is the configured one; selecting it later loads it then.
+    if cfg.role != Role::BeaconTx && cfg.trx.cw_engine == "neural" {
         model::install_background(cfg.cw_model.clone());
     }
     let rate = radio.control.stream_rate();

@@ -32,5 +32,5 @@ pub mod decode;
 pub mod demod;
 pub mod spec;
 
-pub use decode::{Pi4Decode, decode_window};
+pub use decode::decode_window;
 pub use spec::Variant;

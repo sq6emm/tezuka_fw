@@ -868,13 +868,6 @@ impl Demod {
         }
     }
 
-    /// TRXD_T2ROUTER_CHECK=1: the A9 scatters the cells too, and the first
-    /// frames' blocks are compared with the router's.
-    fn router_check(&self) -> bool {
-        static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *CHECK.get_or_init(|| std::env::var_os("TRXD_T2ROUTER_CHECK").is_some())
-    }
-
     /// The router's counters (frames, symbols, words lost), if it runs.
     pub fn router_counters(&self) -> Option<(u32, u32, u32)> {
         self.router.as_ref().map(|r| r.counters())
@@ -1009,23 +1002,6 @@ impl Demod {
                 Some(b) => {
                     for &(g, d) in &self.p2_dests {
                         rt.write_cell(b, d as usize, self.cells[g as usize]);
-                    }
-                    if self.router_check() && self.stats.frames <= 4 {
-                        // TRXD_T2ROUTER_CHECK=1: the A9's own blocks (it
-                        // scattered the cells too) against the router's
-                        let (mut bad, mut first) = (0usize, None);
-                        let mut blk = Vec::new();
-                        for (r, ti) in self.cells.chunks(n).enumerate() {
-                            self.ci.block_gather(r, ti, &mut blk);
-                            for (q, &c) in blk.iter().enumerate() {
-                                let at = r * super::router::block_stride(n) + q;
-                                if rt.read_cell(b, at) != c {
-                                    bad += 1;
-                                    first.get_or_insert((r, q, c, rt.read_cell(b, at)));
-                                }
-                            }
-                        }
-                        tracing::info!(frame = self.stats.frames, buffer = b, bad, ?first, "DVB-T2 cell router check");
                     }
                     let tag = self.router_tags.as_ref().map(|t| DdrTag { tags: t.clone(), buffer: b, f21: self.frame_f as u32 });
                     for r in 0..p.fec_blocks {
@@ -1236,7 +1212,7 @@ impl Demod {
         });
         // With the router the A9 needs one equalized symbol a frame (the
         // reports carry the MER): the others stay out of the ring.
-        if self.hw && self.router.is_some() && !self.router_check() && self.sym_err.is_none() && !fe.ring_set {
+        if self.hw && self.router.is_some() && self.sym_err.is_none() && !fe.ring_set {
             ctl.push(super::fe::Ctl::EqRing(RING_J));
             fe.ring_set = true;
         }
@@ -1532,7 +1508,7 @@ impl Demod {
     /// cells for the browser: one data symbol in [`MER_EVERY`] is enough, the
     /// others' words are skipped unread.
     fn eq_skip(&self, j: usize) -> bool {
-        self.router.is_some() && !self.router_check() && self.sym_err.is_none() && j >= N_P2
+        self.router.is_some() && self.sym_err.is_none() && j >= N_P2
             && if self.hw { j != RING_J as usize } else { j % MER_EVERY != 0 }
     }
 
@@ -1556,7 +1532,7 @@ impl Demod {
             self.sym_err_frame[j].0 += e;
             self.sym_err_frame[j].1 += n;
         }
-        if self.router.is_some() && !self.router_check() {
+        if self.router.is_some() {
             // the router has the data cells; a few for the browser
             for &k in self.data[j].iter().step_by(97) {
                 let c = cells[k];

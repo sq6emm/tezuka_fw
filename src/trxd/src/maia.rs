@@ -125,7 +125,20 @@ pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Receiver<Vec<f32>>> {
             return None;
         }
     };
-    let id = regs.rd32(0).to_le_bytes();
+    // The core's registers live in its sampling clock domain (the AD936x's
+    // data clock): read right after the radio was set up, or with the core
+    // left in reset by the trxd before (fpga-mode stop-dma), the ID came
+    // back as garbage and the scope and DATV were off until the next
+    // bitstream reload. Out of reset first, then a few tries.
+    regs.wr32(REG_CONTROL, 0);
+    let mut id = regs.rd32(0).to_le_bytes();
+    for _ in 0..20 {
+        if &id == b"maia" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        id = regs.rd32(0).to_le_bytes();
+    }
     if &id != b"maia" {
         warn!("no Maia IP core at the maia-sdr UIO (id {id:?})");
         return None;

@@ -482,3 +482,5 @@ equalizer table, L1), one P1 window, the records.
 
 - 64QAM/256QAM, other FFT sizes, PAPR reduction.
 - A check with an independent T2 receiver (TV HAT / Ryde).
+
+The `TRXD_*` A/B environment switches mentioned above were removed on 2026-10-03: on a board the FPGA paths are the only ones, and the software equivalents live on as the models the tests run. The mentions are history.

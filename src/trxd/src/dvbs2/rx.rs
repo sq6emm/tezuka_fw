@@ -239,7 +239,7 @@ pub struct Receiver {
     llr: Vec<f32>,
     /// Long frames: the data symbols as cells for the LDPC engine.
     cells: Vec<[i8; 2]>,
-    /// Long frames with float LLRs made here instead (TRXD_S2_FLOAT_LLR=1:
+    /// Long frames with float LLRs made here instead (never on a board:
     /// the path before the engine's demapper, for comparisons).
     pub float_llr: bool,
     pub stats: Stats,
@@ -259,7 +259,7 @@ pub struct Receiver {
     /// The frame at `locked_at`: ours (None) or `others[i]`.
     cur: Option<usize>,
     /// Ring mode, tracking: the carrier fit, amplitude and noise from
-    /// per-block sums (s2trk; TRXD_S2_OLDFRAME=1: from every known symbol
+    /// per-block sums (s2trk; false: from every known symbol
     /// as before).
     sums: bool,
     ring: Option<RingRx>,
@@ -589,7 +589,7 @@ impl Receiver {
             fec: FecMode::Inline(Fec::new(spec)),
             llr: vec![0.0; spec.n],
             cells: Vec::with_capacity(spec.n / 2),
-            float_llr: std::env::var_os("TRXD_S2_FLOAT_LLR").is_some(),
+            float_llr: false,
             stats: Stats::default(),
             constellation: Vec::new(),
             constellation_seq: 0,
@@ -610,7 +610,7 @@ impl Receiver {
                 v
             },
             cur: None,
-            sums: std::env::var_os("TRXD_S2_OLDFRAME").is_none(),
+            sums: true,
             ring: None,
         }
     }
@@ -1991,11 +1991,23 @@ fn spawn_fec<B: FecBlock>(
                 // each fewer iterations rather than drop the next ones
                 // unread. 20 costs nothing measurable at 1/2 (ldpc.rs
                 // iteration_budget), 12 a few frames at the very edge.
-                fec.dec.set_max_iter(match frx.len() {
-                    0..=1 => 50,
-                    2..=7 => 20,
-                    8..=19 => 12,
-                    _ => 8,
+                // The FPGA decoder takes under a millisecond an iteration:
+                // a DVB-T2 frame's 9 blocks arrive at once, and the queue
+                // rule for the software decoders cut them to 12 (276 of
+                // 730 blocks unconverged at 1.7 MHz, BCH cleaning up).
+                fec.dec.set_max_iter(if fec.dec.is_fpga() {
+                    match frx.len() {
+                        0..=12 => 50,
+                        13..=24 => 30,
+                        _ => 16,
+                    }
+                } else {
+                    match frx.len() {
+                        0..=1 => 50,
+                        2..=7 => 20,
+                        8..=19 => 12,
+                        _ => 8,
+                    }
                 });
                 // Debug on a board: `touch /tmp/datv-dump` appends each
                 // frame's LLRs (f32 LE, 16200 a frame) to
