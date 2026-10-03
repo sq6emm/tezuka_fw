@@ -413,9 +413,13 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
           </div>
         </div>
         <div>
-          <h3>SEND <span class="note">camera and microphone, on the TX frequency</span></h3>
+          <h3>SEND <span class="note">on the TX frequency</span></h3>
           <video id="datv-preview" muted playsinline autoplay></video>
           <div class="row"><button class="k" id="datv-go" title="Start or stop sending (it also stops when this page goes quiet for 10 s)">START</button>
+            <select id="datv-src" title="What to send">
+              <option value="cam">camera + microphone</option>
+              <option value="test">test pattern: clock, callsign, Morse tone</option>
+            </select>
             <span class="note" id="datv-stat"></span></div>
         </div>
       </div>
@@ -1607,6 +1611,50 @@ const DATV = (() => {
   const PAYLOAD = { "1/4": 2992, "1/3": 5152, "1/2": 6952, "2/3": 10552, "3/4": 11632 };
   let on = false, starting = false, stream = null, venc = null, aenc = null, capNode = null, capSrc = null, timer = 0;
   let cfg = null, forceKey = false, frames = 0, sent = 0, aSamples = 0, aT0 = 0, micIn = 0, micOut = 0, micErr = "";
+  // The test pattern (no camera: a clock, the callsign, a tone keyed with
+  // the callsign in Morse), so one station can check a link by itself.
+  let testSrc = false, tone = null, toneGain = null, toneTimer = 0;
+  const myCall = () => ((S.st && S.st.call) || "NOCALL");
+  const MORSE = { A: ".-", B: "-...", C: "-.-.", D: "-..", E: ".", F: "..-.", G: "--.", H: "....", I: "..", J: ".---", K: "-.-", L: ".-..", M: "--", N: "-.", O: "---", P: ".--.", Q: "--.-", R: ".-.", S: "...", T: "-", U: "..-", V: "...-", W: ".--", X: "-..-", Y: "-.--", Z: "--..", 0: "-----", 1: ".----", 2: "..---", 3: "...--", 4: "....-", 5: ".....", 6: "-....", 7: "--...", 8: "---..", 9: "----.", "/": "-..-." };
+  function drawPattern(g, w, h) {
+    const now = new Date(), s = h / 240, c = myCall();
+    g.fillStyle = "#10233a"; g.fillRect(0, 0, w, h);
+    // colour bars across the top, a block moving with the seconds below them
+    const bars = ["#fff", "#ff0", "#0ff", "#0f0", "#f0f", "#f00", "#00f", "#000"];
+    bars.forEach((col, i) => { g.fillStyle = col; g.fillRect(i * w / 8, 0, w / 8 + 1, 28 * s); });
+    g.fillStyle = "#ffb547"; g.fillRect(((now.getSeconds() % 10) / 10) * (w - 20 * s), 30 * s, 20 * s, 10 * s);
+    g.textAlign = "center"; g.textBaseline = "middle"; g.fillStyle = "#fff";
+    g.font = `bold ${Math.round(46 * s)}px sans-serif`; g.fillText(c, w / 2, 75 * s);
+    g.font = `bold ${Math.round(40 * s)}px monospace`;
+    g.fillText(now.toISOString().slice(11, 19) + " UTC", w / 2, 125 * s);
+    g.font = `${Math.round(15 * s)}px sans-serif`; g.fillStyle = "#9fd3ff";
+    g.fillText(now.toISOString().slice(0, 10), w / 2, 152 * s);
+    const f = S.st ? (S.st.split ? (S.st.active === "B" ? S.st.vfo_a : S.st.vfo_b) : curFreq()) : 0;
+    g.font = `${Math.round(12 * s)}px sans-serif`;
+    g.fillText(`${$("datv-fec").value}${$("datv-fec").value.startsWith("T2-") ? "" : " " + (+$("datv-sr").value / 1000) + " kS/s"}${cfg ? " · " + cfg.width + "x" + cfg.height + " " + cfg.fps + " fps" : ""}`, w / 2, 178 * s);
+    g.fillText(f ? (f / 1e6).toFixed(3) + " MHz" : "", w / 2, 200 * s);
+    g.fillText("SQTRX DATV test · frame " + frames, w / 2, 222 * s);
+  }
+  // The tone: 800 Hz keyed with "VVV DE <call>" at 20 wpm, over and over,
+  // scheduled on the sound card's clock a few seconds ahead.
+  function startTone() {
+    tone = actx.createOscillator(); tone.frequency.value = 800; tone.type = "sine";
+    toneGain = actx.createGain(); toneGain.gain.value = 0;
+    tone.connect(toneGain); toneGain.connect(capNode); tone.start();
+    const dit = 0.06, text = "VVV DE " + myCall() + "  ";
+    let t = actx.currentTime + 0.1;
+    const key = (on_, len) => { toneGain.gain.setValueAtTime(on_ ? 0.5 : 0, t); t += len; };
+    const more = () => {
+      while (t < actx.currentTime + 4) {
+        for (const ch of text) {
+          if (ch === " ") { key(false, 4 * dit); continue; }
+          for (const e of MORSE[ch] || "") { key(true, e === "." ? dit : 3 * dit); key(false, dit); }
+          key(false, 2 * dit);
+        }
+      }
+    };
+    more(); toneTimer = setInterval(more, 1000);
+  }
   // Long frames (FPGA TX): [TS bits per frame, PLFRAME symbols with pilots].
   const LONG = { "L-QPSK-1/2": [32128, 33282], "L-QPSK-3/4": [48328, 33282], "L-8PSK-3/4": [48328, 22194] };
   // DVB-T2 (2K, GI 1/8, PP2, 190 data symbols, 9 QPSK or 18 16QAM FEC
@@ -1657,13 +1705,18 @@ const DATV = (() => {
   async function start() {
     if (!supported()) { alert("DATV needs WebCodecs: Chrome, Edge or Firefox 130 and later."); return; }
     starting = true; render();
-    try {
-      stream = await getMedia({
-        video: { width: { ideal: 320 }, height: { ideal: 240 }, frameRate: { ideal: 15 } },
-        audio: micConstraints({ channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }) });
-      audioDevices();
-    } catch (e) { starting = false; render(); alert("Camera/microphone: " + e.message); return; }
-    const v = $("datv-preview"); v.srcObject = stream; v.play().catch(() => {});
+    // (within the click: a browser lets the sound card run on a gesture)
+    if (actx) actx.resume().catch(() => {}); else audioStart().catch(() => {});
+    testSrc = $("datv-src").value === "test";
+    if (!testSrc) {
+      try {
+        stream = await getMedia({
+          video: { width: { ideal: 320 }, height: { ideal: 240 }, frameRate: { ideal: 15 } },
+          audio: micConstraints({ channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }) });
+        audioDevices();
+      } catch (e) { starting = false; render(); alert("Camera/microphone: " + e.message); return; }
+      const v = $("datv-preview"); v.srcObject = stream; v.play().catch(() => {});
+    }
     refusal = null;
     // Not while the board restarts (an FPGA switch: entering DATV mode
     // loads its image): the command would be lost. Up to 30 s for it to be
@@ -1712,11 +1765,17 @@ const DATV = (() => {
     // Frames from the preview <video>, on a timer at the profile's rate.
     const cv = document.createElement("canvas"); cv.width = W; cv.height = H;
     const ctx = cv.getContext("2d"), v = $("datv-preview");
+    if (testSrc && cv.captureStream) { v.srcObject = cv.captureStream(cfg.fps); v.play().catch(() => {}); }
     timer = setInterval(() => {
-      if (!on || v.readyState < 2 || !venc || venc.encodeQueueSize > 1) return;
-      const sw = v.videoWidth, sh = v.videoHeight; if (!sw || !sh) return;
-      const cw = Math.min(sw, sh * 4 / 3), ch = cw * 3 / 4;   // centre crop to 4:3
-      ctx.drawImage(v, (sw - cw) / 2, (sh - ch) / 2, cw, ch, 0, 0, W, H);
+      if (!on || !venc || venc.encodeQueueSize > 1) return;
+      if (testSrc) {
+        drawPattern(ctx, W, H);
+      } else {
+        if (v.readyState < 2) return;
+        const sw = v.videoWidth, sh = v.videoHeight; if (!sw || !sh) return;
+        const cw = Math.min(sw, sh * 4 / 3), ch = cw * 3 / 4;   // centre crop to 4:3
+        ctx.drawImage(v, (sw - cw) / 2, (sh - ch) / 2, cw, ch, 0, 0, W, H);
+      }
       const vf = new VideoFrame(cv, { timestamp: Math.round(performance.now() * 1000) });
       venc.encode(vf, { keyFrame: forceKey || frames % Math.round(2 * cfg.fps) === 0 });
       vf.close(); forceKey = false; frames++;
@@ -1731,8 +1790,8 @@ const DATV = (() => {
     // Never wait on resume(): a browser may hold that promise until a click
     // it trusts, and the sender would hang at STARTING.
     if (!actx) await audioStart(); else actx.resume().catch(() => {});
-    capSrc = actx.createMediaStreamSource(stream);
     capNode = new AudioWorkletNode(actx, "datv-capture");
+    if (testSrc) { startTone(); } else { capSrc = actx.createMediaStreamSource(stream); }
     capNode.port.onmessage = (e) => {
       micIn++;
       if (!on || !aenc || aenc.state !== "configured") return;
@@ -1746,13 +1805,16 @@ const DATV = (() => {
       try { aenc.encode(ad); } catch (err) { micErr = String(err.message || err); }
       ad.close();
     };
-    capSrc.connect(capNode);   // not to the speakers
+    if (capSrc) capSrc.connect(capNode);   // not to the speakers
   }
   function stop(tellBoard) {
     if (tellBoard) send({ cmd: "datv", on: false });
     on = false; starting = false;
     clearInterval(timer); timer = 0;
     if (capSrc) try { capSrc.disconnect(); } catch { /* gone */ }
+    clearInterval(toneTimer); toneTimer = 0;
+    if (tone) { try { tone.stop(); tone.disconnect(); toneGain.disconnect(); } catch { /* gone */ } }
+    tone = toneGain = null;
     if (capNode) { capNode.port.onmessage = null; try { capNode.disconnect(); } catch { /* gone */ } }
     capSrc = capNode = null;
     for (const e of [venc, aenc]) if (e && e.state !== "closed") try { e.close(); } catch { /* closed */ }
@@ -1902,7 +1964,7 @@ const DATV = (() => {
   function render() {
     const b = $("datv-go");
     b.textContent = on ? "STOP" : starting ? "STARTING…" : "START"; b.classList.toggle("on", on);
-    for (const id of ["datv-sr", "datv-fec"]) $(id).disabled = on || starting;
+    for (const id of ["datv-sr", "datv-fec", "datv-src"]) $(id).disabled = on || starting;
     limitModes();
     if (!on) $("datv-stat").textContent = "";
   }
@@ -1910,6 +1972,8 @@ const DATV = (() => {
     init() {
       $("datv-go").onclick = () => (on ? stop(true) : start());
       for (const id of ["datv-sr", "datv-fec"]) $(id).onchange = settingsChanged;
+      $("datv-src").value = store.get("datv_src", "cam");
+      $("datv-src").onchange = () => store.set("datv_src", $("datv-src").value);
       limitModes();
       window.addEventListener("pagehide", () => { if (on) stop(true); });
       info();
@@ -1935,12 +1999,13 @@ const DATV = (() => {
     get receiving() { return rxOn; },
     keyframe() { forceKey = true; },
     meter(d, r) {
+      if (!rxOn && d && d.rx_paused) $("datv-rxstat").textContent = d.rx_paused === "same band" ? "paused while sending: receiving on the same band never works (full duplex needs the RX and TX VFOs on two bands: SPLIT)" : "paused while sending (" + d.rx_paused + ")";
       if (rxOn && r && r.auto && !r.rx) { $("datv-rxstat").innerHTML = `<b>AUTO</b> ${r.auto}`; }
       else if (rxOn && r) $("datv-rxstat").innerHTML = (r.auto ? `auto: ${r.auto}<br>` : "") + `<b>${r.locked ? "LOCK" : "searching"}</b><br>MER ${r.mer.toFixed(1)} dB · Es/N0 ${r.esn0.toFixed(1)} dB<br>carrier ${r.freq >= 0 ? "+" : ""}${r.freq} Hz<br>frames ${r.frames - r.bad}/${r.frames} · shown ${rxFrames}<br>dropped: IQ ${r.dropped}, frames ${r.busy}<br>CPU: demod ${r.demod_pct} %, FEC ${r.fec_pct} %${S.st && S.st.datv_rx && S.st.datv_rx.fpga ? " · front end: FPGA" : ""}` + avText() + siHtml(r.si);
       if (!on || !cfg) return;
       $("datv-stat").textContent = `${cfg.width}x${cfg.height} ${cfg.fps} fps · video ${(cfg.video_bps / 1000).toFixed(0)}k · audio ${(cfg.audio_bps / 1000).toFixed(0)}k` +
         (d ? ` · queue ${d.backlog.toFixed(1)} s · dropped ${d.dropped}` : "") + ` · sent ${(sent / 1024).toFixed(0)} KiB` +
-        ` · mic ${micIn ? micOut + " frames" : actx ? "silent (" + actx.state + ")" : "off"}` + (micErr ? ` · audio error: ${micErr}` : "");
+        ` · ${testSrc ? "tone" : "mic"} ${micIn ? micOut + " frames" : actx ? "silent (" + actx.state + ")" : "off"}` + (micErr ? ` · audio error: ${micErr}` : "");
     },
   };
 })();

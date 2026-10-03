@@ -37,6 +37,18 @@ Web UI: header button **DATV**. START sends on the TX frequency (the VFO, or the
 split TX VFO); RECEIVE decodes on the RX frequency. Both use the panel's symbol
 rate, code rate and pilots settings, which must match the other station.
 
+Full duplex (the receiver on while sending, FPGA modulator) only across two
+bands (calib::BANDS; off the table, frequencies more than a twentieth apart):
+on one band the board's own transmitter is all its receiver hears. With SPLIT
+off, or both VFOs in one band, the receiver pauses while sending and the
+panel says so; it comes back when sending stops.
+
+The SEND source is the camera and microphone, or a test pattern for a
+station testing by itself: colour bars, a block moving with the seconds,
+the callsign (SET), the UTC clock with seconds and the date, the mode and
+TX frequency, a frame counter; its sound is an 800 Hz tone keyed with
+"VVV DE <call>" in Morse at 20 wpm. The choice is remembered per browser.
+
 ## Settings and what they carry
 
 QPSK, short FECFRAMEs, CCM, roll-off 0.35, pilots on (the receiver needs them).

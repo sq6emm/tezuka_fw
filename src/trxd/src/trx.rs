@@ -370,6 +370,18 @@ fn mode_name(m: Mode) -> &'static str {
     sdroxide_rigctld::to_hamlib_mode(m)
 }
 
+/// RX and TX in two bands (calib::BANDS; off the table, more than a
+/// twentieth of the frequency apart). Full duplex (the DATV receiver on
+/// while sending) only across bands: on one band the board's own
+/// transmitter is all its receiver hears.
+fn cross_band(rx: f64, tx: f64) -> bool {
+    let band = |f: f64| crate::calib::BANDS.iter().position(|b| f >= b.1 && f <= b.2);
+    match (band(rx), band(tx)) {
+        (Some(a), Some(b)) => a != b,
+        _ => (rx - tx).abs() > 0.05 * rx.max(tx),
+    }
+}
+
 impl Trx {
     pub fn new(
         cfg: Config,
@@ -1084,8 +1096,18 @@ impl Trx {
     fn datv_rx_alongside_tx(&self) -> bool {
         // (TRXD_TX_ALONE=1: never, for tests)
         self.datv.as_ref().is_none_or(|d| {
-            std::env::var_os("TRXD_TX_ALONE").is_none() && (d.fpga.is_some() || d.t2.as_ref().is_some_and(|t| t.fpga_ifft))
+            std::env::var_os("TRXD_TX_ALONE").is_none()
+                && (d.fpga.is_some() || d.t2.as_ref().is_some_and(|t| t.fpga_ifft))
+                && cross_band(self.rx_eff(), self.tx_eff())
         })
+    }
+
+    /// Why the receiver is not running while sending, for the page.
+    fn datv_rx_paused(&self) -> Option<&'static str> {
+        if self.datv.is_none() || self.datv_rx_req.is_none() || self.datv_rx.is_some() {
+            return None;
+        }
+        Some(if !cross_band(self.rx_eff(), self.tx_eff()) { "same band" } else { "the sender needs the cores" })
     }
 
     /// Tell the browser why DATV did not start.
@@ -2560,7 +2582,7 @@ impl Trx {
             });
             let mt = &self.meter;
             let dbm = mt.dbm;
-            let datv = self.datv.as_ref().map(|d| serde_json::json!({"backlog": (d.mux.backlog_s() * 10.0).round() / 10.0, "dropped": d.mux.dropped_frames}));
+            let datv = self.datv.as_ref().map(|d| serde_json::json!({"backlog": (d.mux.backlog_s() * 10.0).round() / 10.0, "dropped": d.mux.dropped_frames, "rx_paused": self.datv_rx_paused()}));
             let s = &self.datv_rx_stats;
             let datv_rx = (self.datv_rx.is_some() || self.datv_auto).then(|| serde_json::json!({"auto": self.datv_auto.then(|| self.datv_auto_note.clone()), "rx": self.datv_rx.is_some(), "locked": s.locked, "esn0": (s.esn0_db * 10.0).round() / 10.0,
                 "mer": (s.data_esn0_db * 10.0).round() / 10.0,
@@ -2749,7 +2771,7 @@ impl Trx {
                         // the RX VFO: split, cross band too). The software
                         // modulator needs the cores: receiving waits.
                         if !self.datv_rx_alongside_tx() && (self.datv_rx.is_some() || self.datv_scan.is_some()) {
-                            info!("DATV receive paused while sending");
+                            info!(why = self.datv_rx_paused(), "DATV receive paused while sending");
                             self.datv_rx = None;
                             self.datv_scan = None;
                         }
@@ -3075,6 +3097,16 @@ impl LoadMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_duplex_only_across_bands() {
+        assert!(!cross_band(2330e6, 2330e6));
+        assert!(!cross_band(2330e6, 2400e6));
+        assert!(cross_band(2330e6, 1255e6));
+        assert!(cross_band(436e6, 1290e6));
+        assert!(!cross_band(10368e6, 10370e6));
+        assert!(cross_band(10368e6, 5760e6));
+    }
     use std::sync::{Arc, Mutex};
 
     /// A radio that only writes down what it is told.
