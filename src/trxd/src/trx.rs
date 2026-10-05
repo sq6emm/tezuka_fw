@@ -69,17 +69,17 @@ const EDGE_MARGIN_HZ: f64 = 5_000.0;
 const RX_RECOVER: Duration = Duration::from_millis(150);
 /// DATV: baseband amplitude (RMS) before Drive; the RRC-shaped QPSK peaks
 /// stay under full scale.
-const DATV_AMPLITUDE: f32 = 0.5;
 /// DATV: unkey when the browser sent no video or audio for this long.
 const DATV_STARVE: Duration = Duration::from_secs(10);
 /// DATV symbol rates offered: whole samples per symbol at 384 kS/s.
-const DATV_RATES: [f64; 6] = [32_000.0, 48_000.0, 64_000.0, 96_000.0, 128_000.0, 192_000.0];
 /// Unkey after this long without TX audio from the keying TCI client.
 const TCI_STARVE: Duration = Duration::from_millis(1_500);
 /// CW keyer: stay keyed this long after the last element (semi break-in).
 const CW_HANG: Duration = Duration::from_millis(400);
 /// Web microphone: audio buffered before the first sample goes out (12 kHz).
 const MIC_PREROLL: usize = 1_200;
+/// Longest a released PTT waits for the microphone queue (0.5 s deep).
+const MIC_DRAIN_MAX: Duration = Duration::from_millis(1_500);
 /// Web microphone silent this long while keyed: the browser is gone.
 const MIC_STARVE: Duration = Duration::from_secs(2);
 /// Scope spans served from the 48 kS/s channel (finer bins) up to this. The
@@ -163,7 +163,6 @@ struct Datv {
     video_bps: f64,
     /// Software modulator (short frames at the stream rate), or None when
     /// the FPGA transmits (`fpga`).
-    modulator: Option<crate::dvbs2::Modulator>,
     fpga: Option<crate::dvbs2::fpga_tx::Transmitter>,
     /// DVB-T2 (its own thread; raw IQ through the FPGA interpolator).
     t2: Option<crate::dvbt2::tx::T2Tx>,
@@ -175,7 +174,6 @@ struct Datv {
     ts_rate: f64,
     mux: crate::dvbs2::ts::Mux,
     last_media: Instant,
-    buf: Vec<Complex32>,
 }
 
 pub struct Trx {
@@ -301,7 +299,7 @@ pub struct Trx {
     /// The receiver the browser asked for (symbol rate, mode, pilots): it
     /// pauses while this board sends DATV (the A9 cannot do both, a DVB-T2
     /// receiver starves the modulator) and resumes afterwards.
-    datv_rx_req: Option<(f64, String, bool)>,
+    datv_rx_req: Option<(f64, String)>,
     datv_rx_stats: crate::dvbs2::rx::Stats,
     /// Frames decoded, and frames seen, when the decoded count last moved.
     datv_rx_watch: (u64, u64, Instant),
@@ -360,6 +358,12 @@ pub struct Trx {
     mic_started: bool,
     mic_last: Instant,
     mic_buf: Vec<f32>,
+    /// PTT released with `drain`: transmit what the microphone queue still
+    /// holds (RADE's end-of-over frame), then unkey; at the latest then.
+    mic_drain_until: Option<Instant>,
+    /// RADE V2 in the page (src/rade.rs): DATA mode with the browsers'
+    /// decoder on; shared so that every page shows and decodes it.
+    rade: bool,
 
     // Control surfaces
     tci: Option<TciServerController>,
@@ -578,6 +582,8 @@ impl Trx {
             mic_started: false,
             mic_last: Instant::now(),
             mic_buf: Vec::new(),
+            mic_drain_until: None,
+            rade: false,
             tci,
             rig,
             last_rig: None,
@@ -993,6 +999,9 @@ impl Trx {
             }
         }
         self.mode = mode;
+        if mode != Mode::Digu {
+            self.rade = false;
+        }
         self.filter = mode.default_filter();
         self.rebuild_demod();
         self.cwlive.restart();
@@ -1146,12 +1155,12 @@ impl Trx {
     }
 
     /// Start DATV for `client`: validate, build the modulator and mux, key.
-    fn datv_start(&mut self, client: u64, sr: f64, rate: &str, pilots: bool) {
+    fn datv_start(&mut self, client: u64, sr: f64, rate: &str) {
         if sr == 0.0 && !rate.starts_with("T2-") {
             self.datv_refuse(client, "choose a symbol rate to send (Auto is for receiving)");
             return;
         }
-        use crate::dvbs2::{Modulator, Params, Rate, ts::Mux, ts::Profile};
+        use crate::dvbs2::{ts::Mux, ts::Profile};
         use crate::dvbs2::fpga_tx::{LongMode, Transmitter};
         // The FPGA's samples go to the DAC untouched: through an inverting
         // transverter they would go out mirrored (only the software path
@@ -1159,7 +1168,7 @@ impl Trx {
         let fpga_path = crate::dvbt2::tx::Mode::parse(rate).is_some() || LongMode::parse(rate).is_some();
         if fpga_path && self.settings.transverter(self.tx_eff()).is_some_and(|t| t.inverted) {
             warn!("DATV: the FPGA transmitter cannot send through an inverting transverter");
-            self.datv_refuse(client, "this mode is generated in the FPGA and would go out mirrored through an inverting transverter; use a short-frame mode");
+            self.datv_refuse(client, "DATV is generated in the FPGA and would go out mirrored through an inverting transverter");
             return;
         }
         if let Some(mode) = crate::dvbt2::tx::Mode::parse(rate) {
@@ -1179,7 +1188,6 @@ impl Trx {
                 sr: mode.bw_hz,
                 profile,
                 video_bps,
-                modulator: None,
                 fpga: None,
                 t2: Some(t2),
                 pending: Vec::new(),
@@ -1189,7 +1197,6 @@ impl Trx {
                 ts_rate,
                 mux: Mux::new(ts_rate, &self.callsign()).with_delivery(crate::dvbs2::ts::Delivery::T2 { freq_hz: self.tx_eff(), bw_hz: mode.bw_hz, plp_id: 0, t2_system_id: mode.p.t2_system_id }),
                 last_media: Instant::now(),
-                buf: Vec::new(),
             });
             self.key(TxSource::Datv(client));
             if self.tx_on != Some(TxSource::Datv(client)) {
@@ -1221,7 +1228,6 @@ impl Trx {
                 sr,
                 profile,
                 video_bps,
-                modulator: None,
                 fpga: Some(fx),
                 t2: None,
                 pending: Vec::new(),
@@ -1231,7 +1237,6 @@ impl Trx {
                 ts_rate,
                 mux: Mux::new(ts_rate, &self.callsign()).with_delivery(crate::dvbs2::ts::Delivery::S2 { freq_hz: self.tx_eff(), symbol_rate: sr, rolloff: 0.35, modcod: mode.modcod() }),
                 last_media: Instant::now(),
-                buf: Vec::new(),
             });
             self.key(TxSource::Datv(client));
             if self.tx_on != Some(TxSource::Datv(client)) {
@@ -1241,50 +1246,15 @@ impl Trx {
             info!(sr, mode = mode.label(), ts_rate = ts_rate.round(), video_bps = video_bps.round(), ?profile, "DATV on (FPGA)");
             return;
         }
-        let Some(rate) = Rate::parse(rate) else {
-            warn!(rate, "DATV: code rate must be 1/4, 1/3, 1/2, 2/3 or 3/4");
-            self.datv_refuse(client, "code rate must be 1/4, 1/3, 1/2, 2/3 or 3/4");
-            return;
-        };
-        let sps = self.rate / sr;
-        if !DATV_RATES.contains(&sr) || (sps - sps.round()).abs() > 1e-9 {
-            warn!(sr, stream = self.rate, "DATV: symbol rate not offered at this stream rate");
-            self.datv_refuse(client, "this symbol rate needs a long-frame mode (FPGA transmitter)");
-            return;
-        }
-        let p = Params { rate, pilots, rolloff: 0.35 };
-        let ts_rate = p.ts_rate(sr);
-        let profile = Profile::for_rate(ts_rate);
-        let video_bps = profile.video_budget(ts_rate);
-        self.datv = Some(Datv {
-            sr,
-            profile,
-            video_bps,
-            modulator: Some(Modulator::new(p, sps.round() as usize)),
-            fpga: None,
-            t2: None,
-            pending: Vec::new(),
-            rate_label: rate.label().into(),
-            pilots,
-            rolloff: 0.35,
-            ts_rate,
-            mux: Mux::new(ts_rate, &self.callsign()).with_delivery(crate::dvbs2::ts::Delivery::S2 { freq_hz: self.tx_eff(), symbol_rate: sr, rolloff: 0.35, modcod: rate.modcod() }),
-            last_media: Instant::now(),
-            buf: Vec::new(),
-        });
-        self.key(TxSource::Datv(client));
-        if self.tx_on != Some(TxSource::Datv(client)) {
-            self.datv = None;
-            return;
-        }
-        info!(sr, rate = rate.label(), pilots, ts_rate = ts_rate.round(), video_bps = video_bps.round(), ?profile, "DATV on");
+        warn!(rate, "DATV: not a mode this transmitter has (DVB-S2 long frames or DVB-T2)");
+        self.datv_refuse(client, "choose a DVB-S2 long-frame or DVB-T2 mode");
     }
 
     /// Start (or restart) the DVB-S2 receiver on the RX frequency: short
     /// frames at the stream rates (software) or anything the FPGA DDC takes;
     /// long frames (LDPC in the FPGA) through the DDC.
-    fn datv_rx_start(&mut self, sr: f64, rate: &str, pilots: bool) {
-        use crate::dvbs2::{FrameSpec, Params, Rate, ddc, fpga, fpga_tx::LongMode};
+    fn datv_rx_start(&mut self, sr: f64, rate: &str) {
+        use crate::dvbs2::{FrameSpec, ddc, fpga, fpga_tx::LongMode};
         self.datv_rx = None;
         self.datv_scan = None;
         self.datv_rx_stats = Default::default();
@@ -1311,8 +1281,6 @@ impl Trx {
             self.retune(false);
             return;
         }
-        let sps = self.rate / sr;
-        let software = DATV_RATES.contains(&sr) && (sps - sps.round()).abs() < 1e-9;
         let ddc = fpga::available() && ddc::symbol_rate_ok(fpga::FS_IN, sr);
         let center = self.rx_eff() - self.center;
         if let Some(mode) = LongMode::parse(rate) {
@@ -1321,19 +1289,11 @@ impl Trx {
                 return;
             }
             info!(sr, rate, "DATV receive on");
-            self.datv_rx = Some(crate::dvbs2::rx::RxThread::start_spec(FrameSpec::long(mode), mode.label().to_string(), self.rate, sr, center));
+            self.datv_rx = Some(crate::dvbs2::rx::RxThread::start_spec(FrameSpec::long(mode), mode.label().to_string(), sr, center));
             self.retune(false);
             return;
         }
-        match Rate::parse(rate) {
-            Some(rate) if software || ddc => {
-                let p = Params { rate, pilots, rolloff: 0.35 };
-                info!(sr, rate = rate.label(), "DATV receive on");
-                self.datv_rx = Some(crate::dvbs2::rx::RxThread::start(p, self.rate, sr, center));
-                self.retune(false);
-            }
-            _ => warn!(sr, rate, "DATV receive: symbol rate or code rate not offered"),
-        }
+        warn!(sr, rate, "DATV receive: not a mode this receiver has (DVB-S2 long frames or DVB-T2)");
     }
 
     /// Out of DATV mode: receiver off, a DATV transmission ends.
@@ -1379,9 +1339,9 @@ impl Trx {
         }
         if s.frames >= self.datv_rx_watch.1 + 8 && self.datv_rx_watch.2.elapsed() >= Duration::from_secs(3) && s.esn0_db < s.data_esn0_db - 3.0 {
             warn!(frames = s.frames - self.datv_rx_watch.1, esn0 = s.esn0_db, mer = s.data_esn0_db, "DATV receive: locked but nothing decodes; starting again");
-            if let Some((sr, rate, pilots)) = self.datv_rx_req.clone() {
+            if let Some((sr, rate)) = self.datv_rx_req.clone() {
                 self.datv_rx = None;
-                self.datv_rx_start(sr, &rate, pilots);
+                self.datv_rx_start(sr, &rate);
             }
             self.datv_rx_watch = (0, 0, Instant::now());
         }
@@ -1413,7 +1373,7 @@ impl Trx {
                             info!(sr, mode = mode.label(), offset_hz = offset_hz.round(), "DATV receive: automatic, receiving");
                             self.datv_auto_note = format!("found {} at {:.0} kS/s", pls.describe(), sr / 1e3);
                             let center = self.rx_eff() - self.center;
-                            self.datv_rx = Some(crate::dvbs2::rx::RxThread::start_spec(crate::dvbs2::FrameSpec::long(mode), label, self.rate, sr, center));
+                            self.datv_rx = Some(crate::dvbs2::rx::RxThread::start_spec(crate::dvbs2::FrameSpec::long(mode), label, sr, center));
                             self.datv_rx_stats = Default::default();
                             self.datv_auto_good = (0, Instant::now());
                         }
@@ -1501,6 +1461,7 @@ impl Trx {
             self.mic_started = false;
             self.mic_last = Instant::now();
         }
+        self.mic_drain_until = None;
         self.tx_fifo.clear();
         self.tx_out.clear();
         self.pace.rekey();
@@ -1721,6 +1682,7 @@ impl Trx {
         if self.tx_on.take().is_none() {
             return;
         }
+        self.mic_drain_until = None;
         self.tx_since = None;
         self.rx_quiet_until = Some(Instant::now() + RX_RECOVER);
         let datv = self.datv.take();
@@ -1730,8 +1692,8 @@ impl Trx {
         }
         if datv.is_some() {
             info!("DATV off");
-            if let Some((sr, rate, pilots)) = self.datv_rx_req.clone().filter(|_| self.datv_mode && self.datv_rx.is_none()) {
-                self.datv_rx_start(sr, &rate, pilots);
+            if let Some((sr, rate)) = self.datv_rx_req.clone().filter(|_| self.datv_mode && self.datv_rx.is_none()) {
+                self.datv_rx_start(sr, &rate);
             }
         }
         if self.tx_bw != self.cfg.radio.rf_bandwidth {
@@ -1979,7 +1941,7 @@ impl Trx {
         }
 
         if let Some(r) = &self.datv_rx {
-            r.feed(iq, self.rx_eff() - self.center);
+            r.set_center(self.rx_eff() - self.center);
         }
         // DVB-T2 reception: the RX filter opens to 1.3 x the channel (its
         // default, about 1 MHz, cut the outer carriers by up to 15 dB and
@@ -2282,18 +2244,6 @@ impl Trx {
                                 break;
                             }
                         }
-                    } else if let Some(m) = &mut d.modulator {
-                        // Straight at the stream rate: no DUC, only the offset from the LO.
-                        d.buf.resize(self.block, Complex32::default());
-                        let x = &mut d.mux;
-                        m.fill(&mut d.buf, &mut || x.next());
-                        let g = self.drive * DATV_AMPLITUDE;
-                        for z in d.buf.iter_mut() {
-                            *z *= g;
-                        }
-                        let mut mixed = Vec::with_capacity(d.buf.len());
-                        self.tx_nco.mix(&d.buf, &mut mixed);
-                        self.tx_out.extend(mixed);
                     }
                     if d.last_media.elapsed() > DATV_STARVE {
                         warn!("DATV: nothing from the browser for {} s; unkeying", DATV_STARVE.as_secs());
@@ -2315,13 +2265,16 @@ impl Trx {
             Some(TxSource::Web(_)) => {
                 let n12 = n48 / 4;
                 let mut audio12 = Vec::with_capacity(n12);
+                let draining = self.mic_drain_until.is_some();
+                let mut drained = self.mic_drain_until.is_some_and(|t| Instant::now() >= t);
                 if let Some(w) = &self.web {
-                    if !self.mic_started && w.mic_queued() >= MIC_PREROLL {
+                    if !self.mic_started && (draining || w.mic_queued() >= MIC_PREROLL) {
                         self.mic_started = true;
                     }
                     if self.mic_started && w.take_mic(n12, &mut audio12) > 0 {
                         self.mic_last = Instant::now();
                     }
+                    drained |= draining && audio12.len() < n12;
                 }
                 audio12.resize(n12, 0.0);
                 // x4: zero-stuff, low-pass, and make up the 4x energy loss.
@@ -2339,7 +2292,9 @@ impl Trx {
                     Some(m) => m.process(&audio, &mut self.tx_bb),
                     None => self.tx_bb.extend(audio.iter().map(|&a| Complex32::new(a, 0.0))),
                 }
-                if self.mic_last.elapsed() > MIC_STARVE {
+                if drained {
+                    self.unkey();
+                } else if self.mic_last.elapsed() > MIC_STARVE {
                     warn!("web microphone stopped; unkeying");
                     self.unkey();
                 }
@@ -2508,6 +2463,7 @@ impl Trx {
             "span_max": if self.maia.is_some() { self.cfg.radio.adc_rate as f64 } else { self.rate },
             "allow_tx": self.cfg.trx.allow_tx,
             "cw_engine": self.cwlive.engine(),
+            "rade": self.rade,
             "decoders": self.slots.iter().map(|(k, _)| match k {
                 DecoderKind::Q65 => "q65",
                 DecoderKind::Pi4 => "pi4",
@@ -2538,7 +2494,7 @@ impl Trx {
             "datv": self.datv_json(),
             "datv_mode": self.datv_mode,
             "datv_rx": match (&self.datv_rx, self.datv_auto) {
-                (Some(r), auto) => Some(serde_json::json!({"sr": r.sr, "rate": r.label, "pilots": r.spec.pilots, "fpga": r.uses_fpga(), "auto": auto})),
+                (Some(r), auto) => Some(serde_json::json!({"sr": r.sr, "rate": r.label, "pilots": r.spec.pilots, "fpga": true, "auto": auto})),
                 (None, true) => Some(serde_json::json!({"sr": 0, "rate": "auto", "pilots": true, "fpga": true, "auto": true})),
                 (None, false) => None,
             },
@@ -2772,6 +2728,9 @@ impl Trx {
                     }
                 } else if on {
                     self.key(TxSource::Web(client));
+                } else if m["drain"].as_bool() == Some(true) && self.tx_on == Some(TxSource::Web(client)) {
+                    // The rest of the over (RADE's EOO) still in the queue.
+                    self.mic_drain_until = Some(Instant::now() + MIC_DRAIN_MAX);
                 } else {
                     self.unkey();
                 }
@@ -2780,7 +2739,7 @@ impl Trx {
             "datv_mode" => {
                 if on {
                     self.datv_mode = true;
-                    self.datv_rx_start(num("sr").unwrap_or(64_000.0), m["rate"].as_str().unwrap_or("1/2"), m["pilots"].as_bool().unwrap_or(true));
+                    self.datv_rx_start(num("sr").unwrap_or(64_000.0), m["rate"].as_str().unwrap_or("L-QPSK-1/2"));
                 } else {
                     self.datv_leave();
                 }
@@ -2789,13 +2748,11 @@ impl Trx {
                 self.datv_rx = None;
                 self.datv_scan = None;
                 self.datv_rx_stats = Default::default();
-                self.datv_rx_req = on.then(|| {
-                    (num("sr").unwrap_or(64_000.0), m["rate"].as_str().unwrap_or("1/2").to_string(), m["pilots"].as_bool().unwrap_or(true))
-                });
+                self.datv_rx_req = on.then(|| (num("sr").unwrap_or(64_000.0), m["rate"].as_str().unwrap_or("L-QPSK-1/2").to_string()));
                 // Sending DATV the A9 cannot carry as well (DVB-T2, the
                 // software modulator): the receiver starts when that ends.
-                if let Some((sr, rate, pilots)) = self.datv_rx_req.clone().filter(|_| self.datv_rx_alongside_tx()) {
-                    self.datv_rx_start(sr, &rate, pilots);
+                if let Some((sr, rate)) = self.datv_rx_req.clone().filter(|_| self.datv_rx_alongside_tx()) {
+                    self.datv_rx_start(sr, &rate);
                 }
                 // The LO back beside the signal if no DVB-T2 receiver needs it on.
                 self.retune(false);
@@ -2807,7 +2764,7 @@ impl Trx {
                     } else {
                         let sr = num("sr").unwrap_or(64_000.0);
                         let rate = m["rate"].as_str().unwrap_or("1/2").to_string();
-                        self.datv_start(client, sr, &rate, m["pilots"].as_bool().unwrap_or(true));
+                        self.datv_start(client, sr, &rate);
                         // The FPGA's DVB-S2 transmitter (or DVB-T2 with the
                         // FPGA's IFFT) leaves the A9 room: the receiver goes
                         // on (the board hears itself, or another station on
@@ -3012,13 +2969,9 @@ impl Trx {
                     w.send_json_to(client, &self.calib_json());
                 }
             }
-            "cw_engine" => {
-                let e = m["engine"].as_str().unwrap_or("timing");
-                if e == "neural" {
-                    crate::model::install_background(self.cfg.cw_model.clone());
-                }
-                self.cwlive.set_engine(e)
-            }
+            "cw_engine" => self.cwlive.set_engine(m["engine"].as_str().unwrap_or("timing")),
+            // The page has set DATA mode and its filter first.
+            "rade" => self.rade = on && self.mode == Mode::Digu,
             "decoder" => {
                 let kind = match m["kind"].as_str() {
                     Some("q65") => Some(DecoderKind::Q65),

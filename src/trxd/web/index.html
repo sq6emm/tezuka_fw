@@ -148,6 +148,7 @@ table.xv input[type=text] { width: 100%; min-width: 60px; padding: 3px 5px; text
 body:not(.datv-mode) .datv-only { display: none !important; }
 /* BASIC firmware (docs/FLAVOURS.md): no DATV bitstream, no DATV button */
 body.no-datv [data-mode=DATV] { display: none !important; }
+body.no-rade [data-mode=RADE] { display: none !important; }
 body.datv-mode .voice-only { display: none !important; }
 body:not(.cw-mode) .cw-only, body:not(.ssb-mode) .ssb-only, body:not(.data-mode) .data-only, body.cw-mode .no-cw { display: none !important; }
 .txm { display: grid; grid-template-columns: auto 1fr auto; gap: 6px; align-items: center; font-size: 12px; color: var(--dim); }
@@ -183,7 +184,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
 #fpgabanner.done { border-color: var(--green); color: var(--green); }
 </style>
 </head>
-<body>
+<body class="no-rade">
 <div id="fpgabanner" role="status" aria-live="polite"></div>
 
 <div id="login" class="hidden">
@@ -256,6 +257,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
         <span class="tag" id="t-split">SPLIT</span>
         <span class="tag" id="t-txrx">RX</span>
         <span class="tag" id="t-src"></span>
+        <span class="tag hidden" id="t-rade" title="RADE V2 receiver: sync, SNR in 3 kHz, frequency offset"></span>
         <span class="tag hidden" id="t-xvtr"></span>
         <span class="tag hidden" id="t-port" title="Antenna sockets in use: RX1/TX1 or RX2/TX2">ANT1</span>
         <span class="tag hidden" id="t-lock">LOCK</span>
@@ -311,7 +313,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <h3>MODE · FILTER · DSP</h3>
       <div class="row" id="modes">
         <button class="k" data-mode="USB">USB</button>
-        <button class="k" data-mode="CW">CW</button><button class="k" data-mode="CWRS" title="CW through rain scatter (10 GHz and up): the rain-scatter decoder, the filter open to 200-3000 Hz so the whole Doppler spread gets in, AGC slow">CW-RS</button><button class="k" data-mode="PKTUSB">DATA</button>
+        <button class="k" data-mode="CW">CW</button><button class="k" data-mode="CWRS" title="CW through rain scatter (10 GHz and up): the rain-scatter decoder, the filter open to 200-3000 Hz so the whole Doppler spread gets in, AGC slow">CW-RS</button><button class="k" data-mode="PKTUSB">DATA</button><button class="k" data-mode="RADE" title="FreeDV RADE V2 digital voice (pre-release waveform, not for regular on-air use yet): decoded and encoded in this browser; DATA mode with a 250-2750 Hz filter">RADE</button>
         <button class="k" data-mode="AM">AM</button><button class="k" data-mode="FM">FM</button>
         <button class="k" data-mode="DATV" title="Digital TV: DVB-S2 from this browser's camera, and received pictures">DATV</button>
       </div>
@@ -343,7 +345,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       </div>
       <div class="note datv-only" id="datv-info">—</div>
       <div class="note datv-only">Both stations use the same settings. The picture adapts to the rate (160x120 at 2 fps
-        below 40 kbit/s, 320x240 at 5-10 fps above). <span id="datv-note">DVB-S2, short frames, roll-off 0.35.</span></div>
+        below 40 kbit/s, 320x240 at 5-10 fps above). <span id="datv-note">DVB-S2, long frames with pilots, roll-off 0.35.</span></div>
     </div>
 
     <div class="card">
@@ -503,6 +505,7 @@ async function boot() {
   $("app").classList.remove("hidden");
   buildStatic();
   connect();
+  RADE.info();
   requestAnimationFrame(frame);
 }
 
@@ -760,13 +763,14 @@ function renderState() {
   const st = S.st;
   document.body.classList.toggle("no-datv", !!(st.features && st.features.datv === false));
   DATV.state(st);
+  RADE.state(st);
   $("callsign").textContent = st.call || "";
   renderFreq();
   $("t-vfo").textContent = "VFO " + st.active;
   document.body.classList.toggle("cw-mode", !st.datv_mode && st.mode === "CW");
   document.body.classList.toggle("data-mode", !st.datv_mode && st.mode === "PKTUSB");
   document.body.classList.toggle("ssb-mode", !st.datv_mode && (st.mode === "USB" || st.mode === "LSB"));
-  $("t-mode").textContent = st.datv_mode ? "DATV" : st.mode === "PKTUSB" ? "DATA" : st.mode;
+  $("t-mode").textContent = st.datv_mode ? "DATV" : st.rade ? "RADE" : st.mode === "PKTUSB" ? "DATA" : st.mode;
   $("t-mode").className = "tag on";
   if (!S.filIdx) S.filIdx = store.get("filidx", {});
   $("t-fil").textContent = "FIL" + ((S.filIdx[st.mode] ?? 1) + 1) + " " + fmtHz(Math.round(st.filter[1] - st.filter[0]));
@@ -779,7 +783,7 @@ function renderState() {
   $("freq-b").textContent = fmtFreq(st.active === "B" ? st.vfo_a : st.vfo_b);
   const txf = (st.split ? (st.active === "B" ? st.vfo_a : st.vfo_b) : curFreq()) + (st.xit && st.xit[0] ? st.xit[1] : 0);
   $("freq-tx").textContent = fmtFreq(txf);
-  const shown = st.datv_mode ? "DATV" : st.mode === "CW" && st.cw_engine === "rs" ? "CWRS" : st.mode;
+  const shown = st.datv_mode ? "DATV" : st.rade ? "RADE" : st.mode === "CW" && st.cw_engine === "rs" ? "CWRS" : st.mode;
   document.querySelectorAll("#modes .k").forEach((b) => b.classList.toggle("on", b.dataset.mode === shown));
   document.querySelectorAll("#agcs .k").forEach((b) => b.classList.toggle("on", b.dataset.agc === st.agc));
   $("split").classList.toggle("on", st.split);
@@ -1215,6 +1219,7 @@ function audioIn(u8) {
   if (!rxNode || actx.state !== "running") return;
   const f = new Float32Array(u8.length);
   for (let i = 0; i < u8.length; i++) f[i] = MU[u8[i]];
+  if (RADE.rx(f)) return;
   rxNode.port.postMessage(f, [f.buffer]);
 }
 const MIC_VOICE = { echoCancellation: false, noiseSuppression: false, autoGainControl: true, channelCount: 1 };
@@ -1229,6 +1234,7 @@ async function micSwitch() {
   micStream.getTracks().forEach((t) => t.stop());
   micStream = st;
   micSrc = actx.createMediaStreamSource(st); micSrc.connect(micNode);
+  if (RADE.cap) micSrc.connect(RADE.cap);
 }
 async function micStart() {
   await audioStart();
@@ -1241,7 +1247,7 @@ async function micStart() {
   const src = micSrc;
   micNode = new AudioWorkletNode(actx, "mic-capture");
   micNode.port.onmessage = (e) => {
-    if (!S.st || !S.st.ptt || S.st.tx_source !== "web") return;
+    if (!S.st || !S.st.ptt || S.st.tx_source !== "web" || S.st.rade || RADE.tx || RADE.ending) return;
     const a = e.data, b = new Uint8Array(a.length + 1); b[0] = 3;
     for (let i = 0; i < a.length; i++) b[i + 1] = muEncode(a[i]);
     if (ws && ws.readyState === 1) ws.send(b);
@@ -1249,6 +1255,109 @@ async function micStart() {
   src.connect(micNode);
   $("mic").classList.add("on");
   return true;
+}
+
+// ============================================================ RADE V2
+// FreeDV's neural voice mode, run here: /rade-worker.js with /rade.wasm
+// (src/rade-web, src/trxd/src/rade.rs). Receive: the 12 kHz USB audio goes
+// to the worker, which returns decoded speech in sync and the band itself,
+// quieter, while searching. Transmit: the microphone at 48 kHz into the
+// encoder, its modem audio out as the web microphone; PTT up sends the rest
+// and the end-of-over frame, and trxd unkeys once that has gone out.
+const RADE = {
+  tag: undefined,     // module hash from /rade-info; null: none on this board
+  worker: null, ready: false, tx: false, ending: false, cap: null, endTimer: 0, last: null,
+  async info() {
+    try { const r = await (await fetch("/rade-info")).json(); this.tag = r.tag; if (r.loading) setTimeout(() => this.info(), 2000); }
+    catch { this.tag = null; }
+    document.body.classList.toggle("no-rade", !this.tag);
+    if (S.st) this.state(S.st);
+  },
+  state(st) {
+    const on = !!st.rade && !!this.tag;
+    if (on && !this.worker) this.start();
+    else if (!on && this.worker) this.stop();
+    const t = $("t-rade");
+    t.classList.toggle("hidden", !on);
+    if (on) this.show();
+  },
+  start() {
+    this.worker = new Worker("/rade-worker.js");
+    this.ready = false;
+    this.worker.onmessage = (e) => this.msg(e.data);
+    this.worker.postMessage({ init: "/rade.wasm?v=" + this.tag });
+  },
+  stop() {
+    if (this.tx) this.endNow();
+    this.worker.terminate(); this.worker = null; this.ready = false; this.last = null;
+    if (this.cap) { try { this.cap.disconnect(); } catch { /* gone */ } this.cap = null; }
+  },
+  msg(d) {
+    if (d.error) { $("t-rade").textContent = "RADE: " + d.error; console.warn("RADE", d.error); return; }
+    if (d.ready) { this.ready = true; this.show(); return; }
+    if (d.pcm) {
+      this.last = d;
+      if (d.pcm.length && rxNode) rxNode.port.postMessage(d.pcm, [d.pcm.buffer]);
+      this.show();
+    } else if (d.mod) {
+      this.sendMod(d.mod);
+      if (d.end) this.endNow(true);
+    }
+  },
+  show() {
+    const t = $("t-rade"), d = this.last;
+    if (!this.ready) { t.textContent = "RADE loading"; t.className = "tag"; return; }
+    if (this.tx || this.ending) { t.textContent = "RADE TX"; t.className = "tag tx"; return; }
+    if (d && d.sync) {
+      t.textContent = `RADE ${Math.round(d.snr)} dB ${d.foff >= 0 ? "+" : ""}${d.foff.toFixed(1)} Hz`;
+      t.className = "tag on";
+    } else { t.textContent = "RADE search"; t.className = "tag amber"; }
+  },
+  // Receive audio: true when the worker takes it (it returns what to play).
+  rx(f) {
+    if (!this.worker || !this.ready) return false;
+    if (this.tx || this.ending) return true;     // nothing to hear while sending
+    this.worker.postMessage({ rx: f }, [f.buffer]);
+    return true;
+  },
+  // PTT down: a 48 kHz capture of the microphone into the encoder.
+  txBegin() {
+    if (!this.ready) { alert("RADE is still loading"); return false; }
+    if (!this.cap) {
+      this.cap = new AudioWorkletNode(actx, "datv-capture");
+      this.cap.port.onmessage = (e) => { if (this.tx && this.worker) this.worker.postMessage({ tx: e.data }, [e.data.buffer]); };
+      micSrc.connect(this.cap);
+    }
+    clearTimeout(this.endTimer);
+    this.ending = false; this.tx = true;
+    this.worker.postMessage({ txStart: true });
+    this.show();
+    return true;
+  },
+  // (Not gated on the state's ptt: that comes back later than the first
+  // frames; trxd takes microphone audio only from the keyed browser anyway.)
+  sendMod(a) {
+    const b = new Uint8Array(a.length + 1); b[0] = 3;
+    for (let i = 0; i < a.length; i++) b[i + 1] = muEncode(a[i]);
+    if (ws && ws.readyState === 1) ws.send(b);
+  },
+  // PTT up: the worker sends the last frame and the EOO; then unkey with
+  // drain (trxd transmits what it still holds first).
+  txEnd() {
+    this.tx = false; this.ending = true;
+    this.worker.postMessage({ txEnd: true });
+    this.endTimer = setTimeout(() => this.endNow(), 600);   // the worker never answered
+  },
+  endNow(drain) {
+    clearTimeout(this.endTimer);
+    this.tx = false; this.ending = false;
+    send(drain ? { cmd: "ptt", on: false, drain: true } : { cmd: "ptt", on: false });
+    this.show();
+  },
+};
+function pttRelease() {
+  if (RADE.tx) RADE.txEnd();
+  else if (!RADE.ending) send({ cmd: "ptt", on: false });
 }
 
 // ============================================================ decodes
@@ -1312,7 +1421,20 @@ function buildStatic() {
       const [lo, hi] = filPreset("CWRS", 0); send({ cmd: "filter", lo, hi });
       return;
     }
+    // RADE: DATA mode (no compressor on TX), the browsers' decoder on
+    // (src/rade.rs), and a filter wide enough for its 1060-1940 Hz signal up
+    // to 600 Hz off frequency with flat noise beside it: the worker's coarse
+    // frequency search must not take the filter's edge for the signal's.
+    if (m === "RADE") {
+      if (!audioUserOff) audioStart().catch(() => {});
+      send({ cmd: "mode", mode: "PKTUSB" });
+      send({ cmd: "filter", lo: 250, hi: 2750 });
+      send({ cmd: "agc", mode: "slow" });
+      send({ cmd: "rade", on: true });
+      return;
+    }
     if (m === "CW" && S.st && S.st.cw_engine === "rs") send({ cmd: "cw_engine", engine: "timing" });
+    if (m === "PKTUSB" && S.st && S.st.rade) send({ cmd: "rade", on: false });
     send({ cmd: "mode", mode: m });   // (also leaves DATV mode)
     if (!S.filIdx) S.filIdx = store.get("filidx", {});
     const [lo, hi] = filPreset(m, S.filIdx[m] ?? 1); send({ cmd: "filter", lo, hi });
@@ -1409,9 +1531,10 @@ $("datv-sound").onclick = () => { audioUserOff = false; audioStart().then(() => 
     if (S.pttLatched) { pttUp(true); return; }
     if (S.st.mode !== "CW" && !(await micStart())) return;
     S.pttLatched = latch;
+    if (S.st.rade && !RADE.txBegin()) return;
     send({ cmd: "ptt", on: true });
   };
-  const pttUp = (force) => { if (S.pttLatched && !force) return; S.pttLatched = false; send({ cmd: "ptt", on: false }); };
+  const pttUp = (force) => { if (S.pttLatched && !force) return; S.pttLatched = false; pttRelease(); };
   $("ptt").addEventListener("pointerdown", (e) => { e.preventDefault(); pttDown(e.shiftKey); });
   $("ptt").addEventListener("pointerup", () => pttUp(false));
   $("ptt").addEventListener("pointerleave", () => { if (!S.pttLatched && S.st && S.st.ptt) pttUp(false); });
@@ -1517,7 +1640,7 @@ const RC28 = (() => {
     if (lit !== leds) { leds = lit; write([0x01, ~lit & 0x0f]); }
   }
   function releaseTx() {
-    if (txLatched || (S.st && S.st.ptt && S.st.tx_source === "web")) send({ cmd: "ptt", on: false });
+    if (txLatched || (S.st && S.st.ptt && S.st.tx_source === "web")) pttRelease();
     txLatched = false;
   }
   function onReport(e) {
@@ -1607,8 +1730,6 @@ function siHtml(si) {
 
 const DATV = (() => {
   let W = 320, H = 240;
-  // TS payload bits per short PLFRAME (Kbch - 80), per QPSK rate.
-  const PAYLOAD = { "1/4": 2992, "1/3": 5152, "1/2": 6952, "2/3": 10552, "3/4": 11632 };
   let on = false, starting = false, stream = null, venc = null, aenc = null, capNode = null, capSrc = null, timer = 0;
   let cfg = null, forceKey = false, frames = 0, sent = 0, aSamples = 0, aT0 = 0, micIn = 0, micOut = 0, micErr = "";
   // The test pattern (no camera: a clock, the callsign, a tone keyed with
@@ -1665,19 +1786,16 @@ const DATV = (() => {
                "T2-2.0-QPSK-1/2": [16e6 / 7, 289152], "T2-1.35-QPSK-1/2": [1.35e6 * 8 / 7, 224896, 354560],
                "T2-1.7-16QAM-1/2": [131e6 / 71, 578304], "T2-1.7-16QAM-3/4": [131e6 / 71, 869904],
                "T2-2.0-16QAM-1/2": [16e6 / 7, 578304] };
-  const tsRate = (sr, fec, pilots) => T2[fec] ? T2[fec][0] * T2[fec][1] / (T2[fec][2] || 458240)
-    : LONG[fec] ? sr * LONG[fec][0] / LONG[fec][1] : sr * PAYLOAD[fec] / (pilots ? 8370 : 8190);
+  const tsRate = (sr, fec) => T2[fec] ? T2[fec][0] * T2[fec][1] / (T2[fec][2] || 458240) : sr * LONG[fec][0] / LONG[fec][1];
   const occupied = (sr, fec) => T2[fec] ? T2[fec][0] * 1705 / 2048 : sr * 1.35;
-  // Long frames always carry pilots (the FPGA transmitter sends them, the
-  // receiver expects them).
-  const settings = () => ({ sr: +$("datv-sr").value, rate: $("datv-fec").value, pilots: true });
+  const settings = () => ({ sr: +$("datv-sr").value, rate: $("datv-fec").value });
   function info() {
-    const { sr, rate, pilots } = settings(), f = S.st ? curFreq() : 0;
-    $("datv-info").textContent = `TS ${(tsRate(sr, rate, pilots) / 1000).toFixed(1)} kbit/s · ${(occupied(sr, rate) / 1000).toFixed(0)} kHz wide` +
+    const { sr, rate } = settings(), f = S.st ? curFreq() : 0;
+    $("datv-info").textContent = `TS ${(tsRate(sr, rate) / 1000).toFixed(1)} kbit/s · ${(occupied(sr, rate) / 1000).toFixed(0)} kHz wide` +
       (f ? ` · centred on ${(f / 1e6).toFixed(3)} MHz` : "");
     $("datv-note").textContent = T2[rate]
       ? "DVB-T2: 2K FFT, guard 1/8, PP2 pilots, rotated constellation, 64K LDPC (the amateur Portsdown / Ryde profile); the symbol rate setting does not apply."
-      : LONG[rate] ? "DVB-S2, long frames with pilots, roll-off 0.35." : "DVB-S2, short frames, roll-off 0.35.";
+      : "DVB-S2, long frames with pilots, roll-off 0.35.";
   }
   function sendBin(b) { if (ws && ws.readyState === 1 && ws.bufferedAmount < 256e3) { ws.send(b); sent += b.length; return true; } return false; }
   function stamp(b, at, us) { new DataView(b.buffer).setBigInt64(at, BigInt(Math.round(us)), true); }

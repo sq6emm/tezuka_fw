@@ -26,7 +26,7 @@ allow_tx = true
 max_tx_seconds = 180
 decoders = []           # started at boot: q65 | pi4 (web UI toggles them; CW always runs)
 q65_submode = "D"
-cw_engine = "timing"    # live CW box: timing (instant, light) | rs (rain scatter: neural keying detector, the CW-RS mode) | neural (DeepCW: too heavy for the A9 live)
+cw_engine = "timing"    # live CW box: timing (instant, light) | rs (rain scatter: the CW-RS network, FPGA)
 t2_drive_db = 0.0       # DVB-T2 TX level against the default (+3: about 3 dB more on air, more peaks clipped)
 
 
@@ -51,3 +51,4 @@ mode = "auto"           # auto | pps | chrony | 10mhz | off
 https_port = 443
 http_port = 80          # redirects to HTTPS; 0 = off
 password = "testing"    # static for now; "" = generate one into /mnt/jffs2/trxd-web/password
+# rade_wasm = ""         # RADE module for the page: "" = the flash partition `model` (docs/RADE.md)

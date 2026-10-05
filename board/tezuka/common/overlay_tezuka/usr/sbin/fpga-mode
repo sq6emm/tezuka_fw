@@ -27,7 +27,7 @@ STATE=/run/fpga-mode
 MGR=/sys/class/fpga_manager/fpga0
 LOG=/var/log/fpga-mode.log
 
-cur=$(cat $STATE 2>/dev/null || cat /etc/fpga-boot-mode 2>/dev/null || echo all)
+cur=$(cat $STATE 2>/dev/null || cat /etc/fpga-boot-mode 2>/dev/null || echo trx)
 
 hex() { printf '%d' "$1"; }
 
@@ -63,7 +63,7 @@ quiesce() {
 	g=$(hex $(rd 0x790240BC))
 	devmem 0x790240BC 32 $((g & ~30))
 	case "$cur" in
-	datv|all)
+	datv|s2|t2)
 		# LDPC decoder ("LDP*"): its DDR engine runs only while busy
 		case "$(rd 0x43C4FF08)" in 0x3?50444C)
 			for i in $(seq 100); do
@@ -77,7 +77,7 @@ quiesce() {
 		fi;;
 	esac
 	case "$cur" in
-	trx|all)
+	trx)
 		# CW-RS network ("RSF*"): reads its weights only while busy
 		case "$(rd 0x43C5FF08)" in 0x3?465352)
 			for i in $(seq 100); do

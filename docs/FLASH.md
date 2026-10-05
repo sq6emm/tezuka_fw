@@ -13,7 +13,7 @@ never leave a remote board without a working system.
 | `0x0120000` | 896 KB | `qspi-nvmfs` | jffs2: `/mnt/jffs2` (trxd.toml, web certificate and password, keys). |
 | `0x0200000` | 12.25 MB | `linux-a` | Slot A: one FIT image (kernel lzma, device tree, bitstream gzip, rootfs xz). |
 | `0x0E40000` | 12.25 MB | `linux-b` | Slot B: same. |
-| `0x1A80000` | 5.5 MB | `model` | DeepCW model (bf16-rounded, xz), shared by both slots. |
+| `0x1A80000` | 5.5 MB | `model` | The web page's RADE V2 module (docs/RADE.md), shared by both slots; `fw-update` writes it when it changed. It held the DeepCW model until 2026-10-04. |
 
 Slot A sits where tezuka's single image used to start. A board whose U-Boot
 environment has no A/B scripts therefore still boots slot A.
@@ -57,7 +57,6 @@ On the board, `fw-update` does the following:
    device tree inside is for this board model.
 2. Writes `firmware.itb` into the slot that is **not** running, reads it back
    and compares byte for byte.
-3. Writes `model.bin` only if the model changed, also verified.
 4. In one write of the U-Boot environment: installs the A/B boot scripts
    shipped with the build (`uboot-ab.env`), sets `slot=<new>`,
    `upgrade_available=1`, `bootcount=0`.

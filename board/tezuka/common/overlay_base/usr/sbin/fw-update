@@ -12,7 +12,7 @@
 #          --bootloader (SD only: also replace BOOT.bin - not covered by rollback).
 #
 # QSPI layout (docs/FLASH.md): linux-a 0x200000 and linux-b 0xE40000, 12.25 MB
-# each, and `model` 0x1A80000 (the DeepCW model, shared). The running slot is
+# each, and `model` 0x1A80000 (the web page's RADE module, shared). The running slot is
 # never touched: the new image goes into the other one, is read back and
 # compared, and only then does the U-Boot environment point at it
 # (upgrade_available=1). U-Boot counts boots; S99fwconfirm clears the flag
@@ -231,16 +231,19 @@ install_qspi() {
 	write_mtd "$SLOT_DEV" 0 "$F/firmware.itb"
 	log "fw-update: slot $TARGET written and verified"
 
+	# The `model` partition holds the web page's RADE module (RAD1 blob,
+	# src/trxd/src/rade.rs), shared by both slots: written only when its
+	# header (length + SHA-256 of the content) differs.
 	if [ -f "$F/model.bin" ] && [ -n "$MODEL_DEV" ]; then
 		[ "$(wc -c < "$F/model.bin")" -le "$MODEL_SIZE" ] || die "model.bin is larger than its partition"
 		have=""
-		if mtd_debug read "$MODEL_DEV" "$MODEL_OFF" 44 "$WORK/mhead" >/dev/null 2>&1; then
+		if mtd_debug read "$MODEL_DEV" "$MODEL_OFF" 40 "$WORK/mhead" >/dev/null 2>&1; then
 			have=$(sha256sum < "$WORK/mhead" | cut -c1-64)
 		fi
-		want=$(head -c 44 "$F/model.bin" | sha256sum | cut -c1-64)
+		want=$(head -c 40 "$F/model.bin" | sha256sum | cut -c1-64)
 		if [ "$have" != "$want" ]; then
 			write_mtd "$MODEL_DEV" "$MODEL_OFF" "$F/model.bin"
-			log "fw-update: DeepCW model partition written and verified"
+			log "fw-update: model partition (RADE module) written and verified"
 		fi
 	fi
 

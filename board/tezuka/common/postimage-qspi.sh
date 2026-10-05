@@ -73,8 +73,9 @@ cp "$BR2_EXTERNAL/tools/jtag-recovery/boot_fsbl_uboot.bat" "$JTAGDIR"
 cp "$BR2_EXTERNAL/tools/jtag-recovery/tezuka.cfg" "$JTAGDIR"
 # ── A/B flash slots (docs/FLASH.md) ──────────────────────────────────────────
 # firmware.itb goes into QSPI partition linux-a or linux-b (12.25 MB each),
-# model.bin into the shared `model` partition (5.5 MB). /usr/sbin/fw-update
-# writes them; SHA256SUMS lets it verify before and after writing.
+# model.bin (the web page's RADE module, src/trxd/src/rade.rs) into the shared
+# `model` partition (5.5 MB). /usr/sbin/fw-update writes them; SHA256SUMS
+# lets it verify before and after writing.
 SLOT_MAX=$((0xC40000))
 MODEL_MAX=$((0x580000))
 FIT_BYTES=$(wc -c < "$QSPIDIR/firmware.itb")
@@ -84,10 +85,10 @@ if [ "$FIT_BYTES" -gt "$SLOT_MAX" ]; then
     exit 1
 fi
 echo "firmware.itb: $FIT_BYTES bytes, $(( (SLOT_MAX - FIT_BYTES) / 1024 )) KiB free in a slot"
-MODEL="$BR2_EXTERNAL/package/trxd/deepcw-model.bin"
-if [ -f "$MODEL" ]; then
-    [ "$(wc -c < "$MODEL")" -le "$MODEL_MAX" ] || { echo "ERROR: model.bin larger than its partition" >&2; exit 1; }
-    cp "$MODEL" "$QSPIDIR/model.bin"
+RADE="$BR2_EXTERNAL/package/trxd/rade.wasm.gz"
+if [ -f "$RADE" ]; then
+    "$COMMON_DIR/pack-rade.sh" "$RADE" "$QSPIDIR/model.bin"
+    [ "$(wc -c < "$QSPIDIR/model.bin")" -le "$MODEL_MAX" ] || { echo "ERROR: model.bin larger than its partition" >&2; exit 1; }
 fi
 "$COMMON_DIR/uboot-ab-env.sh" "$BIN_DIR/uboot-env.txt" > "$QSPIDIR/uboot-ab.env"
 [ "$(wc -l < "$QSPIDIR/uboot-ab.env")" -eq 12 ] || { echo "ERROR: uboot-ab.env incomplete" >&2; exit 1; }

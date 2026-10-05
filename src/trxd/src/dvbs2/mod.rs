@@ -45,7 +45,9 @@ const PILOT: usize = 36;
 /// BBHEADER, bytes.
 const BBHEADER: usize = 10;
 
-/// QPSK code rates offered (short frames).
+/// The DVB-S2 short-frame code rates: only the LDPC decoder's tests use
+/// them now (the boards send and receive long frames through the FPGA).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rate {
     R1_4,
@@ -55,6 +57,7 @@ pub enum Rate {
     R3_4,
 }
 
+#[cfg(test)]
 impl Rate {
     pub fn parse(s: &str) -> Option<Rate> {
         Some(match s.trim() {
@@ -123,25 +126,13 @@ pub struct FrameSpec {
     pub pilots: bool,
     /// BBFRAME bits.
     pub kbch: usize,
-    /// Short-frame rate (software LDPC), or the long-frame rate.
-    pub short_rate: Option<Rate>,
-    pub long_rate: Option<ldpc_fpga::LongRate>,
+    pub long_rate: ldpc_fpga::LongRate,
     pub rolloff: f32,
     /// Es/N0 (dB) below which a frame is not worth decoding.
     pub hopeless_db: f32,
 }
 
 impl FrameSpec {
-    pub fn short(p: Params) -> Self {
-        let hopeless_db = match p.rate {
-            Rate::R1_4 => -5.0,
-            Rate::R1_3 => -3.5,
-            Rate::R1_2 => -2.0,
-            Rate::R2_3 => 0.5,
-            Rate::R3_4 => 1.5,
-        };
-        FrameSpec { n: NLDPC, bps: 2, modcod: p.rate.modcod(), pilots: p.pilots, kbch: p.rate.kbch(), short_rate: Some(p.rate), long_rate: None, rolloff: p.rolloff, hopeless_db }
-    }
     pub fn long(mode: fpga_tx::LongMode) -> Self {
         use fpga_tx::LongMode::*;
         let (bps, rate, hopeless_db) = match mode {
@@ -149,10 +140,7 @@ impl FrameSpec {
             Qpsk34 => (2, ldpc_fpga::LongRate::R3_4, 1.0),
             Psk8_34 => (3, ldpc_fpga::LongRate::R3_4, 5.0),
         };
-        FrameSpec { n: 64_800, bps, modcod: mode.modcod(), pilots: true, kbch: mode.kbch(), short_rate: None, long_rate: Some(rate), rolloff: 0.35, hopeless_db }
-    }
-    pub fn is_short(&self) -> bool {
-        self.n == NLDPC
+        FrameSpec { n: 64_800, bps, modcod: mode.modcod(), pilots: true, kbch: mode.kbch(), long_rate: rate, rolloff: 0.35, hopeless_db }
     }
     /// 90-symbol slots of data.
     pub fn slots(&self) -> usize {
@@ -164,46 +152,14 @@ impl FrameSpec {
         SLOT + s * SLOT + if self.pilots { (s - 1) / 16 * PILOT } else { 0 }
     }
     pub fn header(&self) -> Vec<Complex32> {
-        plheader_typed(self.modcod, self.pilots, self.is_short())
+        plheader_typed(self.modcod, self.pilots, false)
     }
 }
 
 /// 8PSK (5.4.2, Figure 10): bits y0 y1 y2 as a number -> phase / (pi/4).
 pub const PSK8_PHASE: [u8; 8] = [1, 0, 4, 5, 2, 7, 3, 6];
 
-/// Transmission settings.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Params {
-    pub rate: Rate,
-    pub pilots: bool,
-    /// Roll-off: 0.35, 0.25 or 0.20.
-    pub rolloff: f32,
-}
 
-impl Params {
-    /// PLFRAME length, symbols.
-    pub fn frame_symbols(&self) -> usize {
-        let slots = NLDPC / 2 / SLOT;
-        SLOT + slots * SLOT + if self.pilots { (slots - 1) / 16 * PILOT } else { 0 }
-    }
-    /// TS payload bits carried per PLFRAME.
-    pub fn payload_bits(&self) -> usize {
-        self.rate.kbch() - BBHEADER * 8
-    }
-    /// TS bit rate at `symbol_rate`.
-    pub fn ts_rate(&self, symbol_rate: f64) -> f64 {
-        symbol_rate * self.payload_bits() as f64 / self.frame_symbols() as f64
-    }
-    pub(crate) fn rolloff_code(&self) -> u8 {
-        if self.rolloff > 0.3 {
-            0
-        } else if self.rolloff > 0.225 {
-            1
-        } else {
-            2
-        }
-    }
-}
 
 // ---------------------------------------------------------------- mode adaptation
 
@@ -232,11 +188,6 @@ pub(crate) struct Framer {
 impl Framer {
     pub(crate) fn new() -> Self {
         Framer { rest: Vec::new(), crc: 0 }
-    }
-
-    /// One BBFRAME of `p.rate.kbch() / 8` bytes.
-    fn frame(&mut self, p: &Params, next: &mut dyn FnMut() -> [u8; TS_LEN]) -> Vec<u8> {
-        self.frame_bytes(p.rate.kbch() / 8, p.rolloff_code(), next)
     }
 
     /// One BBFRAME of `len` bytes (Kbch / 8, any frame size and rate).
@@ -315,8 +266,10 @@ fn bch_generator() -> Vec<u8> {
 
 /// 168-bit shift register in three words (bit 167 = most significant).
 #[derive(Clone, Copy, Default)]
+#[cfg(test)]
 struct Reg168([u64; 3]);
 
+#[cfg(test)]
 impl Reg168 {
     fn msb(&self) -> bool {
         (self.0[2] >> (BCH_PARITY - 128 - 1)) & 1 == 1
@@ -336,6 +289,7 @@ impl Reg168 {
     }
 }
 
+#[cfg(test)]
 struct Fec {
     rate: Rate,
     scramble: Vec<u8>,
@@ -343,6 +297,7 @@ struct Fec {
     g: Reg168,
 }
 
+#[cfg(test)]
 impl Fec {
     fn new(rate: Rate) -> Self {
         let poly = bch_generator();
@@ -400,11 +355,6 @@ impl Fec {
 
 // ---------------------------------------------------------------- physical layer
 
-/// The 90 PLHEADER symbols (5.5.2): SOF and the PLS code, pi/2-BPSK.
-fn plheader(modcod: u8, pilots: bool) -> Vec<Complex32> {
-    plheader_typed(modcod, pilots, true)
-}
-
 /// PLHEADER for either frame size (TYPE bit 1: short).
 pub(crate) fn plheader_typed(modcod: u8, pilots: bool, short: bool) -> Vec<Complex32> {
     const SOF: u32 = 0x18D_2E82;
@@ -461,53 +411,7 @@ fn rotate(s: Complex32, r: u8) -> Complex32 {
     }
 }
 
-/// Everything from TS packets to unit-power PLFRAME symbols.
-pub struct Encoder {
-    p: Params,
-    framer: Framer,
-    fec: Fec,
-    header: Vec<Complex32>,
-    scramble: Vec<u8>,
-}
 
-impl Encoder {
-    pub fn new(p: Params) -> Self {
-        let n = p.frame_symbols() - SLOT;
-        Encoder {
-            p,
-            framer: Framer::new(),
-            fec: Fec::new(p.rate),
-            header: plheader(p.rate.modcod(), p.pilots),
-            scramble: pl_scrambling(n),
-        }
-    }
-
-    pub fn params(&self) -> Params {
-        self.p
-    }
-
-    /// One PLFRAME; `next` hands over TS packets as they are needed.
-    pub fn frame(&mut self, next: &mut dyn FnMut() -> [u8; TS_LEN], out: &mut Vec<Complex32>) {
-        let bb = self.framer.frame(&self.p, next);
-        let bits = self.fec.encode(&bb);
-        out.extend_from_slice(&self.header);
-        let a = std::f32::consts::FRAC_1_SQRT_2;
-        let pilot = Complex32::new(a, a);
-        let mut k = 0; // PL scrambling index: data and pilot symbols
-        for (n, pair) in bits.chunks_exact(2).enumerate() {
-            if self.p.pilots && n > 0 && n % (16 * SLOT) == 0 {
-                for _ in 0..PILOT {
-                    out.push(rotate(pilot, self.scramble[k]));
-                    k += 1;
-                }
-            }
-            // QPSK (5.4.1): first bit -> sign of I, second -> sign of Q.
-            let s = Complex32::new(if pair[0] == 0 { a } else { -a }, if pair[1] == 0 { a } else { -a });
-            out.push(rotate(s, self.scramble[k]));
-            k += 1;
-        }
-    }
-}
 
 // ---------------------------------------------------------------- pulse shaping
 
@@ -524,12 +428,6 @@ pub(crate) fn rrc_at(t: f64, b: f64) -> f64 {
     }
 }
 
-/// Root-raised-cosine taps, `sps` samples per symbol over `span` symbols,
-/// scaled so that unit-power symbols come out at unit power.
-fn rrc_taps(sps: usize, rolloff: f32, span: usize) -> Vec<f32> {
-    rrc_taps_frac(sps as f64, rolloff, span)
-}
-
 /// [`rrc_taps`] at a fractional `sps` (an odd number of taps, centred).
 pub(crate) fn rrc_taps_frac(sps: f64, rolloff: f32, span: usize) -> Vec<f32> {
     let n = 2 * (span as f64 * sps / 2.0).round() as usize + 1;
@@ -540,132 +438,9 @@ pub(crate) fn rrc_taps_frac(sps: f64, rolloff: f32, span: usize) -> Vec<f32> {
     h.into_iter().map(|x| x as f32).collect()
 }
 
-/// Continuous DVB-S2 baseband at `sps` samples per symbol: PLFRAMEs back to
-/// back (CCM), RRC-shaped, unit mean power.
-pub struct Modulator {
-    enc: Encoder,
-    /// Polyphase RRC: `phases[p][j]` weights symbol `k - j` for output `k*sps + p`.
-    phases: Vec<Vec<f32>>,
-    hist: Vec<Complex32>,
-    symbols: Vec<Complex32>,
-    pos: usize,
-    out: Vec<Complex32>,
-    out_pos: usize,
-}
 
-impl Modulator {
-    pub fn new(p: Params, sps: usize) -> Self {
-        let taps = rrc_taps(sps, p.rolloff, 12);
-        let per = taps.len().div_ceil(sps);
-        let phases = (0..sps).map(|ph| (0..per).map(|j| taps.get(j * sps + ph).copied().unwrap_or(0.0)).collect()).collect();
-        Modulator {
-            enc: Encoder::new(p),
-            phases,
-            hist: vec![Complex32::default(); per],
-            symbols: Vec::new(),
-            pos: 0,
-            out: Vec::new(),
-            out_pos: 0,
-        }
-    }
-
-    pub fn params(&self) -> Params {
-        self.enc.params()
-    }
-
-    /// Fill `out` with baseband; TS packets are pulled from `next` as frames
-    /// are built (one frame's worth at a time).
-    pub fn fill(&mut self, out: &mut [Complex32], next: &mut dyn FnMut() -> [u8; TS_LEN]) {
-        let mut i = 0;
-        while i < out.len() {
-            if self.out_pos == self.out.len() {
-                self.out.clear();
-                self.out_pos = 0;
-                if self.pos == self.symbols.len() {
-                    self.symbols.clear();
-                    self.pos = 0;
-                    self.enc.frame(next, &mut self.symbols);
-                }
-                // One symbol in, `sps` samples out.
-                self.hist.rotate_right(1);
-                self.hist[0] = self.symbols[self.pos];
-                self.pos += 1;
-                for ph in &self.phases {
-                    let mut acc = Complex32::default();
-                    for (h, s) in ph.iter().zip(&self.hist) {
-                        acc += s * *h;
-                    }
-                    self.out.push(acc);
-                }
-            }
-            let n = (self.out.len() - self.out_pos).min(out.len() - i);
-            out[i..i + n].copy_from_slice(&self.out[self.out_pos..self.out_pos + n]);
-            self.out_pos += n;
-            i += n;
-        }
-    }
-}
 
 // ---------------------------------------------------------------- CLI
-
-/// `trxd --dvbs2-mod IN.ts OUT.cf32 [RATE] [SPS] [pilots]`: modulate a TS
-/// file to complex float32 IQ (SPS 1 = the raw PLFRAME symbols, for comparing
-/// with leandvbtx -f 1). The file is played once, then the last frame is
-/// completed with null packets.
-pub fn mod_cli(input: &str, output: &str, rest: &[String]) -> Result<(), String> {
-    let rate = rest.first().map_or(Some(Rate::R1_2), |s| Rate::parse(s)).ok_or("rate: 1/4, 1/3, 1/2 or 2/3")?;
-    let sps: usize = rest.get(1).map_or(Ok(1), |s| s.parse()).map_err(|_| "sps: an integer")?;
-    let pilots = rest.iter().any(|s| s == "pilots");
-    let ts = std::fs::read(input).map_err(|e| format!("{input}: {e}"))?;
-    if ts.len() % TS_LEN != 0 || ts.chunks(TS_LEN).any(|p| p[0] != 0x47) {
-        return Err(format!("{input}: not a whole number of 188-byte TS packets"));
-    }
-    let p = Params { rate, pilots, rolloff: 0.35 };
-    let mut packets = ts.chunks(TS_LEN);
-    let left = std::cell::Cell::new(ts.len() / TS_LEN);
-    let mut next = || -> [u8; TS_LEN] {
-        let mut pkt = null_packet();
-        if let Some(c) = packets.next() {
-            pkt.copy_from_slice(c);
-            left.set(left.get() - 1);
-        }
-        pkt
-    };
-    let mut iq = Vec::new();
-    if sps == 1 {
-        let mut enc = Encoder::new(p);
-        let mut done = false;
-        while !done {
-            enc.frame(&mut next, &mut iq);
-            done = left.get() == 0;
-        }
-    } else {
-        let mut m = Modulator::new(p, sps);
-        let frame = p.frame_symbols() * sps;
-        let mut buf = vec![Complex32::default(); frame];
-        loop {
-            m.fill(&mut buf, &mut next);
-            iq.extend_from_slice(&buf);
-            if left.get() == 0 {
-                // Flush the filter and the frame in flight.
-                m.fill(&mut buf, &mut next);
-                iq.extend_from_slice(&buf);
-                break;
-            }
-        }
-    }
-    let bytes: Vec<u8> = iq.iter().flat_map(|z| [z.re.to_le_bytes(), z.im.to_le_bytes()]).flatten().collect();
-    std::fs::write(output, bytes).map_err(|e| format!("{output}: {e}"))?;
-    eprintln!(
-        "DVB-S2 QPSK {} short{}, {} symbols ({} per frame, TS {:.0} bit/s at 64 kS/s)",
-        rate.label(),
-        if pilots { " pilots" } else { "" },
-        iq.len() / sps,
-        p.frame_symbols(),
-        p.ts_rate(64_000.0)
-    );
-    Ok(())
-}
 
 /// An MPEG-TS null packet (PID 0x1FFF).
 pub fn null_packet() -> [u8; TS_LEN] {
@@ -762,59 +537,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn frames_have_the_expected_length_and_rate() {
-        let p = Params { rate: Rate::R1_2, pilots: false, rolloff: 0.35 };
-        assert_eq!(p.frame_symbols(), 8_190);
-        assert_eq!(Params { pilots: true, ..p }.frame_symbols(), 8_370);
-        // 64 kS/s, 1/2: 6952 payload bits per 8190 symbols.
-        assert!((p.ts_rate(64_000.0) - 54_325.0).abs() < 1.0, "{}", p.ts_rate(64_000.0));
-        let mut enc = Encoder::new(p);
-        let mut out = Vec::new();
-        let mut next = null_packet;
-        enc.frame(&mut next, &mut out);
-        assert_eq!(out.len(), 8_190);
-        assert!(out.iter().all(|s| (s.norm() - 1.0).abs() < 1e-5));
-    }
-
-    #[test]
-    fn packets_straddle_frames_and_come_back_whole() {
-        // Mode adaptation alone: undo the CRC-for-sync swap and re-join.
-        let p = Params { rate: Rate::R1_4, pilots: false, rolloff: 0.35 };
-        let mut f = Framer::new();
-        let mut n = 0u8;
-        let mut next = || {
-            let mut pkt = [n; TS_LEN];
-            pkt[0] = 0x47;
-            n = n.wrapping_add(1);
-            pkt
-        };
-        let mut stream = Vec::new();
-        for _ in 0..5 {
-            let bb = f.frame(&p, &mut next);
-            assert_eq!(crc8(&bb[..9]), bb[9]);
-            let syncd = u16::from_be_bytes([bb[7], bb[8]]) as usize / 8;
-            if stream.is_empty() {
-                assert_eq!(syncd, 0);
-            }
-            stream.extend_from_slice(&bb[BBHEADER..]);
-        }
-        for (i, up) in stream.chunks_exact(TS_LEN).enumerate() {
-            assert!(up[1..].iter().all(|&b| b == i as u8), "packet {i}");
-            if i > 0 {
-                assert_eq!(up[0], crc8(&[i as u8 - 1; TS_LEN - 1]));
-            }
-        }
-    }
-
-    #[test]
-    fn modulator_output_has_unit_power() {
-        let p = Params { rate: Rate::R1_2, pilots: true, rolloff: 0.35 };
-        let mut m = Modulator::new(p, 6);
-        let mut buf = vec![Complex32::default(); 8_370 * 6];
-        let mut next = null_packet;
-        m.fill(&mut buf, &mut next);
-        let pw: f32 = buf[600..].iter().map(|z| z.norm_sqr()).sum::<f32>() / (buf.len() - 600) as f32;
-        assert!((pw - 1.0).abs() < 0.05, "{pw}");
-    }
 }

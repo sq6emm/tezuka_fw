@@ -24,9 +24,9 @@ mod dvbt2;
 mod keyer;
 mod maia;
 mod morse;
-mod model;
 mod pace;
 mod pi4;
+mod rade;
 mod power;
 mod radio;
 mod refclock;
@@ -46,7 +46,7 @@ use tracing::{error, info};
 use config::{Backend, Config, Role};
 
 fn usage() -> ! {
-    eprintln!("usage: trxd [--config FILE] [--sim] [--check] | --pack-model IN.onnx OUT.bin | --bench-deepcw MODEL [N] | --dvbs2-mod IN.ts OUT.cf32 [RATE] [SPS] [pilots] | --datv-mux MEDIA OUT.ts SR [RATE] [pilots] | [--config FILE] --capture-iq OUT.cf32 FREQ_HZ SECONDS [BW_HZ] (stop trxd first)");
+    eprintln!("usage: trxd [--config FILE] [--sim] [--check] | --datv-mux MEDIA OUT.ts SR [MODE] | [--config FILE] --capture-iq OUT.cf32 FREQ_HZ SECONDS [BW_HZ] (stop trxd first)");
     std::process::exit(2);
 }
 
@@ -98,16 +98,6 @@ fn main() -> ExitCode {
             "--config" | "-c" => path = args.next().map(PathBuf::from).unwrap_or_else(|| usage()),
             "--sim" => sim = true,
             "--check" => check = true,
-            "--pack-model" => {
-                let (Some(i), Some(o)) = (args.next(), args.next()) else { usage() };
-                return match model::pack_cli(&i, &o) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        error!("{e}");
-                        ExitCode::FAILURE
-                    }
-                };
-            }
             "--fit-data" => {
                 let (Some(f), Some(p)) = (args.next(), args.next()) else { usage() };
                 let prop = args.next().unwrap_or_else(|| "data".into());
@@ -135,59 +125,6 @@ fn main() -> ExitCode {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => {
                         eprintln!("trxd --bit2bin: {e}");
-                        ExitCode::FAILURE
-                    }
-                };
-            }
-            "--bench-deepcw" => {
-                let Some(m) = args.next() else { usage() };
-                let n = args.next().and_then(|v| v.parse().ok()).unwrap_or(5);
-                return match model::bench_cli(&m, n) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        error!("{e}");
-                        ExitCode::FAILURE
-                    }
-                };
-            }
-            "--dvbs2-mod" => {
-                let (Some(i), Some(o)) = (args.next(), args.next()) else { usage() };
-                let rest: Vec<String> = args.by_ref().collect();
-                return match dvbs2::mod_cli(&i, &o, &rest) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        error!("{e}");
-                        ExitCode::FAILURE
-                    }
-                };
-            }
-            "--dvbs2-demod" => {
-                let (Some(i), Some(o)) = (args.next(), args.next()) else { usage() };
-                let rest: Vec<String> = args.by_ref().collect();
-                return match dvbs2::rx::demod_cli(&i, &o, &rest) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        error!("{e}");
-                        ExitCode::FAILURE
-                    }
-                };
-            }
-            "--ldpc-file" => {
-                let rest: Vec<String> = args.by_ref().collect();
-                return match dvbs2::ldpc::file_cli(&rest) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        error!("{e}");
-                        ExitCode::FAILURE
-                    }
-                };
-            }
-            "--ldpc-helper" => {
-                let rest: Vec<String> = args.by_ref().collect();
-                return match dvbs2::ldpc::helper_cli(&rest) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        error!("{e}");
                         ExitCode::FAILURE
                     }
                 };
@@ -269,11 +206,6 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // The DeepCW model (15 MB from the flash, 5 s) only when the neural CW
-    // engine is the configured one; selecting it later loads it then.
-    if cfg.role != Role::BeaconTx && cfg.trx.cw_engine == "neural" {
-        model::install_background(cfg.cw_model.clone());
-    }
     let rate = radio.control.stream_rate();
     let rx = stream::spawn_rx(radio.rx, rate, cfg.radio.buffer_samples);
     let tx = stream::spawn_tx(radio.tx, cfg.radio.buffer_samples);

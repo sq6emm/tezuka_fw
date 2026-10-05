@@ -162,8 +162,9 @@ access unit); ffprobe, ffmpeg and VLC read it.
 - LDPC tables for those rates checked equal between leansdr and GNU Radio
   gr-dtv (leansdr's short 2/5 and 3/4 tables have rows with a wrong entry
   count; not used here).
-- Short 3/4 (2026-09-30): our table equals gr-dtv's ldpc_tab_3_4S, and a
-  frame from `--dvbs2-mod` checks against it independently
+- Short 3/4 (2026-09-30, before short frames went): our table equalled
+  gr-dtv's ldpc_tab_3_4S, and a frame from the then `--dvbs2-mod` checked
+  against it independently
   (datv-ref/harness/check_short34.py: PL descrambling, demapping, parity
   recomputed from the information bits): 0 of 4320 parity bits wrong.
   leandvbtx's short 3/4 gets 2198 wrong, from its broken table, so it is
@@ -213,13 +214,14 @@ under the TUNE carrier to keep RRC peaks off the DAC ceiling):
   other's; the other signal has to fall inside the same 384 kS/s stream (about
   +-120 kHz of the TX signal), and the board's own transmitter leaks into its
   receiver.
-- No BCH decoding on receive for short frames (LDPC convergence and the
-  BBHEADER CRC stand in); long frames have it (DATV-FPGA.md).
+- Short frames are gone (2026-10-04): the boards send and receive long
+  frames through the FPGA only, with BCH (DATV-FPGA.md).
 
 ## Test tools
 
-`trxd --dvbs2-mod`, `--datv-mux`, `--dvbs2-demod` and `--ldpc-helper` (leandvb's
-external LDPC decoder protocol) are command-line entry points for offline
-tests; `cargo test` covers the encoder, mux/demux round trip and an end-to-end
-modulate-impair-receive test. With `TRXD_SIM_TX_DUMP=<file>`, `--sim` writes
+`trxd --datv-mux` plays recorded browser media through the TS mux offline
+(`--dvbs2-mod`, `--dvbs2-demod` and the LDPC CLIs went with the software
+modem on 2026-10-04); `cargo test` covers the mux/demux round trip and the
+ring receiver end to end (the DDC, symbol timing and header detector
+models feeding it). With `TRXD_SIM_TX_DUMP=<file>`, `--sim` writes
 everything it transmits as complex f32 at the stream rate.

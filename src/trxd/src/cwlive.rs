@@ -16,16 +16,11 @@ use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
-use sdroxide_deepcw::{Tuner, Worker};
 use sdroxide_dsp::CwRx;
 use tracing::warn;
 
 /// Receive text kept for the web UI (a late browser gets the recent past).
 const TEXT_CAP: usize = 4000;
-/// DeepCW window. sdroxide reads up to 20 s every second, which two Cortex-A9
-/// cores cannot do (measured: 130 % CPU and still falling behind); 6 s keeps
-/// words in context at 10-30 WPM and the preview still updates every second.
-const WINDOW_S: f64 = 6.0;
 
 /// Finder FFT: 8192 points at 12 kHz = 1.5 Hz bins over 0.68 s.
 const FIND_N: usize = 8192;
@@ -146,9 +141,6 @@ pub struct CwLive {
     /// The operator's pitch (where the finder's moves are undone to on retune).
     pitch: f32,
     finder: Finder,
-    tuner: Tuner,
-    deep: Option<Worker>,
-    scratch: Vec<f32>,
     text: String,
     pending: String,
     /// Text committed since the last [`CwLive::take_committed`].
@@ -171,17 +163,13 @@ pub struct Readout {
 
 impl CwLive {
     /// `rate`: the audio rate; `pitch_hz`: where the CW tone sits in it.
-    /// `neural`: DeepCW reads the text; otherwise the classic timing decoder
-    /// (a character as soon as it is complete, a few % of a core).
-    pub fn new(rate: f64, pitch_hz: f32, neural: bool) -> Self {
-        let deep = if neural { start_deep() } else { None };
+    /// The classic timing decoder reads the text (a character as soon as it
+    /// is complete, a few % of a core); the rain-scatter engine when asked.
+    pub fn new(rate: f64, pitch_hz: f32) -> Self {
         CwLive {
             rx: CwRx::new(rate, pitch_hz),
             pitch: pitch_hz,
             finder: Finder::new(rate),
-            tuner: Tuner::new(rate, pitch_hz as f64),
-            deep,
-            scratch: Vec::new(),
             text: String::new(),
             pending: String::new(),
             fresh: String::new(),
@@ -198,7 +186,6 @@ impl CwLive {
             return;
         }
         if on {
-            self.set_neural(false);
             let mut r = crate::rscw::RsNnStream::new(self.rate as f32);
             r.set_band(self.band.0, self.band.1);
             self.rs = Some(r);
@@ -209,15 +196,9 @@ impl CwLive {
         self.dirty = true;
     }
 
-    /// "rs", "neural" or "timing".
+    /// "rs" or "timing".
     pub fn engine(&self) -> &'static str {
-        if self.rs.is_some() {
-            "rs"
-        } else if self.deep.is_some() {
-            "neural"
-        } else {
-            "timing"
-        }
+        if self.rs.is_some() { "rs" } else { "timing" }
     }
 
     /// The CW filter's audio passband: where the finder looks.
@@ -228,24 +209,6 @@ impl CwLive {
         if let Some(r) = self.rs.as_mut() {
             r.set_band(self.band.0, self.band.1);
         }
-    }
-
-    /// Switch between DeepCW and the timing decoder; the text so far stays.
-    pub fn set_neural(&mut self, on: bool) {
-        if on {
-            self.rs = None;
-        }
-        if on == self.deep.is_some() {
-            return;
-        }
-        self.deep = if on { start_deep() } else { None };
-        self.pending.clear();
-        self.tuner.reset();
-        self.dirty = true;
-    }
-
-    pub fn neural(&self) -> bool {
-        self.deep.is_some()
     }
 
     /// Feed demodulated audio (not while transmitting: we would copy ourselves).
@@ -265,41 +228,17 @@ impl CwLive {
             }
         }
         let classic = self.rx.process(audio);
-        let Some(deep) = self.deep.as_ref() else {
-            self.append(&classic);
-            return;
-        };
-        self.tuner.set_tone(self.rx.tone_hz() as f64);
-        self.scratch.clear();
-        self.tuner.push(audio, &mut self.scratch);
-        deep.push(&self.scratch);
+        self.append(&classic);
     }
 
-    /// Collect what the model finished; true when the display changed.
+    /// True when the display changed.
     pub fn poll(&mut self) -> bool {
-        let updates = self.deep.as_ref().map(Worker::poll).unwrap_or_default();
-        for u in updates {
-            match u {
-                Ok(u) => {
-                    self.append(&u.committed);
-                    if self.pending != u.pending {
-                        self.pending = u.pending;
-                        self.dirty = true;
-                    }
-                }
-                Err(e) => warn!("live CW: {e}"),
-            }
-        }
         std::mem::take(&mut self.dirty)
     }
 
     /// A new station (the operator retuned): settle nothing more of the old
     /// one, and start it on a new line.
     pub fn restart(&mut self) {
-        if let Some(d) = self.deep.as_ref() {
-            d.reset();
-        }
-        self.tuner.reset();
         // A new station starts on the pitch again.
         self.rx.set_pitch(self.pitch);
         self.finder.reset();
@@ -311,12 +250,9 @@ impl CwLive {
         self.dirty = true;
     }
 
-    /// Nothing more will come for now (keying down): settle the tail.
-    pub fn flush(&self) {
-        if let Some(d) = self.deep.as_ref() {
-            d.flush();
-        }
-    }
+    /// Nothing more will come for now (keying down): nothing to settle in
+    /// the timing decoder.
+    pub fn flush(&self) {}
 
     pub fn clear(&mut self) {
         self.text.clear();
@@ -349,7 +285,7 @@ impl CwLive {
             return;
         }
         // DeepCW commits whole words with the edges trimmed: put the separator back.
-        let sep = !self.text.is_empty() && !self.text.ends_with([' ', '\n']) && !s.starts_with(' ') && self.deep.is_some();
+        let sep = false;   // (the timing decoder spaces its own words; DeepCW did not)
         if sep {
             self.text.push(' ');
             self.fresh.push(' ');
@@ -365,23 +301,11 @@ impl CwLive {
     }
 }
 
-fn start_deep() -> Option<Worker> {
-    crate::model::wait_installed();
-    match Worker::with_window(WINDOW_S) {
-        Ok(w) => Some(w),
-        Err(e) => {
-            warn!("live CW: DeepCW unavailable, using the timing decoder: {e}");
-            None
-        }
-    }
-}
-
 enum Msg {
     Audio(Vec<f32>),
     Restart,
     Flush,
     Clear,
-    Neural(bool),
     Rs(bool),
     Band(f32, f32),
 }
@@ -394,7 +318,6 @@ struct Shared {
     pending: String,
     committed: String,
     readout: Option<Readout>,
-    neural: bool,
     engine: &'static str,
 }
 
@@ -416,9 +339,8 @@ pub struct CwLiveThread {
 }
 
 impl CwLiveThread {
-    /// `engine`: "timing", "neural" (DeepCW) or "rs" (rain scatter).
+    /// `engine`: "timing" or "rs" (rain scatter).
     pub fn start(rate: f64, pitch_hz: f32, engine: &str) -> Self {
-        let neural = engine == "neural";
         // 5 s of 10 ms blocks: a busy moment on the CPU must not cost audio.
         let (tx, rx) = bounded::<Msg>(512);
         let (ctl, ctl_rx) = crossbeam_channel::unbounded::<Msg>();
@@ -432,7 +354,7 @@ impl CwLiveThread {
                 unsafe {
                     libc::setpriority(libc::PRIO_PROCESS, libc::syscall(libc::SYS_gettid) as libc::id_t, -5);
                 }
-                run(CwLive::new(rate, pitch_hz, neural), rx, ctl_rx, sh)
+                run(CwLive::new(rate, pitch_hz), rx, ctl_rx, sh)
             })
             .expect("spawn cw-live");
         if engine == "rs" {
@@ -471,20 +393,9 @@ impl CwLiveThread {
     pub fn clear(&self) {
         let _ = self.ctl.send(Msg::Clear);
     }
-    pub fn set_neural(&self, on: bool) {
-        let _ = self.ctl.send(Msg::Neural(on));
-    }
-    /// "rs" (rain scatter), "neural" (DeepCW) or anything else (timing).
+    /// "rs" (rain scatter) or anything else (timing).
     pub fn set_engine(&self, engine: &str) {
-        match engine {
-            "rs" => {
-                let _ = self.ctl.send(Msg::Rs(true));
-            }
-            e => {
-                let _ = self.ctl.send(Msg::Rs(false));
-                let _ = self.ctl.send(Msg::Neural(e == "neural"));
-            }
-        }
+        let _ = self.ctl.send(Msg::Rs(engine == "rs"));
     }
     pub fn engine(&self) -> &'static str {
         let e = self.shared.lock().unwrap().engine;
@@ -496,10 +407,6 @@ impl CwLiveThread {
         if self.band != Some(b) && self.ctl.send(Msg::Band(b.0, b.1)).is_ok() {
             self.band = Some(b);
         }
-    }
-    /// Whether DeepCW is the engine in force (false also when it failed to start).
-    pub fn neural(&self) -> bool {
-        self.shared.lock().unwrap().neural
     }
 
     /// `(text, pending, newly committed)` when the display changed since the
@@ -529,7 +436,6 @@ fn handle(c: &mut CwLive, m: Msg) {
         Msg::Restart => c.restart(),
         Msg::Flush => c.flush(),
         Msg::Clear => c.clear(),
-        Msg::Neural(on) => c.set_neural(on),
         Msg::Rs(on) => c.set_rs(on),
         Msg::Band(lo, hi) => c.set_band(lo, hi),
     }
@@ -558,7 +464,6 @@ fn run(mut c: CwLive, rx: Receiver<Msg>, ctl: Receiver<Msg>, shared: Arc<Mutex<S
         n = n.wrapping_add(1);
         let changed = c.poll();
         let mut s = shared.lock().unwrap();
-        s.neural = c.neural();
         s.engine = c.engine();
         if n % 8 == 0 {
             s.readout = Some(c.readout());
@@ -615,7 +520,7 @@ mod tests {
 
     /// The timing decoder alone (tests carry no DeepCW model).
     fn timing(rate: f64, pitch: f32) -> CwLive {
-        CwLive::new(rate, pitch, false)
+        CwLive::new(rate, pitch)
     }
 
     /// Keyed audio at `tone` Hz, with a little noise, as the demodulator hands it over.

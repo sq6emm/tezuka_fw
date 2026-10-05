@@ -5,8 +5,7 @@
 //! S80trxd loop runs `fpga-mode <mode>` (the PL reloaded, the drivers bound
 //! again) and starts trxd, which takes up the saved state.
 //!
-//! Modes: "all" (everything; also what a board without mode bitstreams
-//! has), "trx" (radio, wide scope, CW-RS network front end), "s2" (radio,
+//! Modes: "trx" (radio, wide scope, CW-RS network front end), "s2" (radio,
 //! wide scope, DVB-S2 receive and transmit, LDPC), "t2" (the same for
 //! DVB-T2), and "datv" (both: the single DATV bitstream before the split).
 
@@ -32,12 +31,12 @@ pub enum Part {
 }
 
 /// The mode of the bitstream loaded now ("boot": the boot one's, from
-/// /etc/fpga-boot-mode; "all" when the firmware has no modes).
+/// /etc/fpga-boot-mode; "trx" when the firmware says nothing).
 pub fn loaded() -> String {
     let read = |p: &str| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     match read(LOADED) {
         Some(m) if m != "boot" => m,
-        _ => read(BOOT).unwrap_or_else(|| "all".into()),
+        _ => read(BOOT).unwrap_or_else(|| "trx".into()),
     }
 }
 
@@ -47,8 +46,7 @@ fn has(mode: &str, part: Part) -> bool {
         "datv" => part == Part::S2 || part == Part::T2,
         "s2" => part == Part::S2,
         "t2" => part == Part::T2,
-        // "all" and anything unknown: never switch away
-        _ => true,
+        _ => false,
     }
 }
 
@@ -59,9 +57,9 @@ pub fn switch_for(part: Part) -> Option<&'static str> {
         return None;
     }
     let order: &[&'static str] = match part {
-        Part::S2 => &["s2", "datv", "all"],
-        Part::T2 => &["t2", "datv", "all"],
-        Part::Rsnn => &["trx", "all"],
+        Part::S2 => &["s2", "datv"],
+        Part::T2 => &["t2", "datv"],
+        Part::Rsnn => &["trx"],
     };
     // the boot mode's comes out of the running slot's FIT (fpga-mode)
     let boot = std::fs::read_to_string(BOOT).ok().map(|s| s.trim().to_string());
@@ -261,7 +259,7 @@ mod tests {
         assert!(has("t2", Part::T2) && !has("t2", Part::S2));
         assert!(has("datv", Part::S2) && has("datv", Part::T2) && !has("datv", Part::Rsnn));
         assert!(has("trx", Part::Rsnn) && !has("trx", Part::S2) && !has("trx", Part::T2));
-        assert!(has("all", Part::T2) && has("all", Part::Rsnn));
+        assert!(!has("boot", Part::T2) && !has("", Part::Rsnn));
         assert_eq!(datv_part(Some("T2-1.7-QPSK-1/2")), Part::T2);
         assert_eq!(datv_part(Some("L-8PSK-3/4")), Part::S2);
         assert_eq!(datv_part(None), Part::S2);

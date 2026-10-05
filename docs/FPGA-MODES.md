@@ -6,7 +6,6 @@ its own bitstream, and trxd loads the one a feature needs while Linux runs.
 
 | Mode | What is in it | LUTs | BRAM tiles | DSPs |
 |---|---|---|---|---|
-| `all` | everything (the single bitstream as before) | 75 % | 139.5 | 195 |
 | `trx` | radio, wide scope, the radio's channel DDC (Maia's DDC into the DDR ring, platform 0xD7; docs/PERFORMANCE.md), CW-RS network (front end and temporal layers, weights in DDR over HP0) | 35 % | 86 | 101 |
 | `datv` | radio, wide scope, DVB-S2/T2 receive and transmit, LDPC | 71 % | 124.5 | 191 |
 | `s2` | radio, wide scope, DVB-S2 receive (DDC, symsync, hdrdet) and transmit, LDPC | 52 % | 108.5 | 115 |
@@ -89,7 +88,7 @@ it switches back (`trxd --fit-data /dev/mtdN /images/fpga@1 | zcat | trxd
 --bit2bin`: the flash has no room for it twice)
 (package/board-fpga; `board/tezuka/common/bit2bin.py`), and the boot mode's
 name into `/etc/fpga-boot-mode`. Without a boot-mode file a board builds as
-before (`simple.xsa`, no modes). The flash is full (two 12.25 MB slots and
+before (the single `simple.xsa`, gone on 2026-10-04: every image has modes). The flash is full (two 12.25 MB slots and
 the DeepCW model), so the mode bitstreams must fit in the slot: `trx`
 compresses to 0.6 MB (the `all` one took 1.3 MB).
 
@@ -100,7 +99,6 @@ compresses to 0.6 MB (the `all` one took 1.3 MB).
 /data/claude/fwbuild/fpga-build.sh libre datv   # -> bitstream/simple-datv.xsa
 /data/claude/fwbuild/fpga-build.sh libre s2     # -> bitstream/simple-s2.xsa
 /data/claude/fwbuild/fpga-build.sh libre t2     # -> bitstream/simple-t2.xsa
-/data/claude/fwbuild/fpga-build.sh libre        # all -> bitstream/simple.xsa
 ```
 
 maia-hdl: `FPGA_MODE` (projects/simple system_project.tcl) picks the parts

@@ -95,8 +95,9 @@ boots roll back. Host side: `tools/fw-push.sh <ip> build/<board>.zip`.
 2. Minimal FPGA project (`simple`), bitstreams for both boards. **Done**: timing met;
    PlutoSky R2 LUTs 43% -> 13%.
 3. trxd core: IIO, DSP, rigctld, TCI, simulated radio (MQTT removed 2026-10-01). **Done** (host-tested).
-4. Decoders: FT8, Q65-60A..E, PI4, DeepCW skimmer. **Done** (round-trip tests; the
-   skimmer needed VHF+ CW segments in sdroxide, see CLAUDE.md).
+4. Decoders: FT8, Q65-60A..E, PI4, DeepCW skimmer. **Done**, then the skimmer
+   and DeepCW itself removed (2026-10-04: too heavy for the A9; the live CW
+   box reads with the timing decoder or the CW-RS network in the FPGA).
 5. Beacon TX / RX roles. **Done** (TX->RX loopback tests for Q65, PI4, CW, carrier).
 6. Reference disciplining: FPGA `refmeter` (1PPS / chrony), `xo_correction`. **Done**.
 7. Buildroot package, init scripts, A/B network updates. **Done**; image build in progress.

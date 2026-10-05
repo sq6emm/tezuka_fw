@@ -88,6 +88,22 @@ started without agreeing on it first.
 - **DeepCW in software**: decode every 2 s instead of 1 s, and only while
   there is keying at the pitch (the timing front end already knows).
 
+## 2026-10-04: three removals
+
+- The software DVB-S2 modem is gone: short frames, the software modulator
+  and receiver (NCO, RRC, Gardner, float LLRs, the software LDPC for S2),
+  the `--dvbs2-mod` / `--dvbs2-demod` / LDPC CLIs. The boards send and
+  receive long frames through the FPGA only; the ring receiver, the
+  FPGA-side models and the TS mux keep their tests (the DDC-chain and
+  capture-replay tests run through the ring receiver now). The generic
+  LDPC decoder stays for the DVB-T2 L1 signalling.
+- DeepCW is gone: the neural CW engine, the model loader and packer, the
+  sdroxide-deepcw crate (and rten with it), the model in the flash image.
+  The `model` partition stays in the layout, unused. The beacon receiver's
+  CW decoder is the timing decoder on the slot recording.
+- The `all` FPGA mode (the single bitstream) is gone: every image names a
+  boot mode and carries mode bitstreams.
+
 ## 2026-10-03: where the time goes now, what moved, what is left
 
 Measured on Libre 1 (v0.3.21-56, the S2/T2 offload in): trxd's engine

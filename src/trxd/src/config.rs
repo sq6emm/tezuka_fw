@@ -24,9 +24,6 @@ pub struct Config {
     pub callsign: String,
     /// Maidenhead locator, 4 or 6 characters.
     pub locator: String,
-    /// DeepCW model: "auto" = the `model` flash partition, or a path to a
-    /// packed blob / plain .onnx file (for running on a PC).
-    pub cw_model: String,
     pub radio: RadioConfig,
     pub trx: TrxConfig,
     pub beacon: BeaconConfig,
@@ -44,7 +41,6 @@ impl Default for Config {
             role: Role::Trx,
             callsign: "N0CALL".into(),
             locator: "JO81".into(),
-            cw_model: "auto".into(),
             radio: RadioConfig::default(),
             trx: TrxConfig::default(),
             beacon: BeaconConfig::default(),

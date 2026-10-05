@@ -1,5 +1,5 @@
 //! Period decoders: each takes one T/R slot of 12 kHz audio (Q65, PI4)
-//! or 3.2 kHz audio (DeepCW) and returns [`Decode`] records (logged and shown in the web UI).
+//! or 3.2 kHz audio (CW, the timing decoder) and returns [`Decode`] records (logged and shown in the web UI).
 //!
 //! All run on a worker thread ([`DecodeWorker`]) so a decode that takes a
 //! second or two on the Cortex-A9 never stalls the receive chain.
@@ -112,29 +112,14 @@ pub fn pi4(audio: &[f32], boundary: usize, slot_utc: i64, dial_hz: f64) -> Vec<D
         .collect()
 }
 
-/// DeepCW over a long window of 3.2 kHz audio (signal inside 400..1200 Hz).
-/// Fed through DeepCW's own rolling [`sdroxide_deepcw::Stream`], which cuts
-/// its windows at word gaps, so no character is split between two windows.
-pub fn cw_window(stream: &mut sdroxide_deepcw::Stream, audio_3k2: &[f32]) -> String {
+/// The timing decoder over a window of 3.2 kHz audio (the beacon receiver's
+/// slot recording) with the keyed tone at `audio_hz`: what it read.
+pub fn cw_window(audio_3k2: &[f32], audio_hz: f32) -> String {
+    let mut rx = sdroxide_dsp::CwRx::new(3_200.0, audio_hz);
     let mut text = String::new();
-    let mut take = |r: Option<Result<sdroxide_deepcw::Update, sdroxide_deepcw::Error>>| match r {
-        Some(Ok(u)) if !u.committed.trim().is_empty() => {
-            if !text.is_empty() {
-                text.push(' ');
-            }
-            text.push_str(u.committed.trim());
-        }
-        Some(Err(e)) => warn!("DeepCW: {e}"),
-        _ => {}
-    };
-    stream.reset();
-    for piece in audio_3k2.chunks(sdroxide_deepcw::SAMPLE_RATE as usize) {
-        stream.push(piece);
-        while let Some(r) = stream.poll() {
-            take(Some(r));
-        }
+    for piece in audio_3k2.chunks(320) {
+        text.push_str(&rx.process(piece));
     }
-    take(stream.flush());
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -162,7 +147,6 @@ impl DecodeWorker {
         let handle = std::thread::Builder::new()
             .name("decode".into())
             .spawn(move || {
-                let mut deepcw: Option<sdroxide_deepcw::Stream> = None;
                 for job in jobs {
                     let started = std::time::Instant::now();
                     let out = match job {
@@ -171,32 +155,20 @@ impl DecodeWorker {
                         }
                         Job::Pi4 { audio, boundary, slot_utc, dial_hz } => pi4(&audio, boundary, slot_utc, dial_hz),
                         Job::Cw { audio_3k2, slot_utc, carrier_hz, audio_hz, snr_db } => {
-                            if deepcw.is_none() {
-                                crate::model::wait_installed();
-                                match sdroxide_deepcw::Stream::new() {
-                                    Ok(d) => deepcw = Some(d),
-                                    Err(e) => warn!("DeepCW model: {e}"),
-                                }
-                            }
-                            match deepcw.as_mut() {
-                                Some(d) => {
-                                    let text = cw_window(d, &audio_3k2);
-                                    if text.is_empty() {
-                                        Vec::new()
-                                    } else {
-                                        vec![Decode {
-                                            mode: "CW".into(),
-                                            utc: slot_utc,
-                                            freq_hz: carrier_hz,
-                                            audio_hz,
-                                            dt: 0.0,
-                                            snr_db: snr_db.round(),
-                                            message: text,
-                                            call: None,
-                                        }]
-                                    }
-                                }
-                                None => Vec::new(),
+                            let text = cw_window(&audio_3k2, audio_hz);
+                            if text.is_empty() {
+                                Vec::new()
+                            } else {
+                                vec![Decode {
+                                    mode: "CW".into(),
+                                    utc: slot_utc,
+                                    freq_hz: carrier_hz,
+                                    audio_hz,
+                                    dt: 0.0,
+                                    snr_db: snr_db.round(),
+                                    message: text,
+                                    call: None,
+                                }]
                             }
                         }
                     };

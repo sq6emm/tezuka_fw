@@ -39,6 +39,7 @@ use tungstenite::protocol::Role;
 use tungstenite::{Message, WebSocket};
 
 static INDEX_HTML: &[u8] = include_bytes!("../web/index.html");
+static RADE_WORKER: &[u8] = include_bytes!("../web/rade-worker.js");
 
 const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 const SESSIONS_FILE: &str = "/run/trxd-sessions";
@@ -87,6 +88,9 @@ pub struct WebConfig {
     pub password: String,
     /// Certificate, key and generated password live here.
     pub state_dir: String,
+    /// RADE module for the page (src/trxd/src/rade.rs): a `RAD1` blob or
+    /// `rade.wasm.gz`. Empty: the flash partition labelled `model`.
+    pub rade_wasm: String,
 }
 
 impl Default for WebConfig {
@@ -98,6 +102,7 @@ impl Default for WebConfig {
             http_port: 80,
             password: String::new(),
             state_dir: "/mnt/jffs2/trxd-web".into(),
+            rade_wasm: String::new(),
         }
     }
 }
@@ -131,6 +136,8 @@ struct Shared {
     mic_owner: Mutex<Option<u64>>,
     /// DATV video/audio messages from that client, as received.
     media: Mutex<VecDeque<Vec<u8>>>,
+    /// The RADE module, once read from flash (None: there is none).
+    rade: std::sync::OnceLock<Option<crate::rade::Wasm>>,
 }
 
 /// A command from a browser, tagged with the connection it came from.
@@ -563,11 +570,47 @@ fn handle_https(
             &[
                 ("Content-Type", "text/html; charset=utf-8".into()),
                 ("Cache-Control", "no-cache".into()),
-                ("Content-Security-Policy", "default-src 'self' 'unsafe-inline' blob:; connect-src 'self' wss:".into()),
+                ("Content-Security-Policy", "default-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob:; connect-src 'self' wss:".into()),
             ],
             INDEX_HTML,
         ),
         ("GET", "/favicon.ico") => respond(reader.get_mut(), "204 No Content", &[], b""),
+        ("GET", "/rade-info" | "/rade-worker.js" | "/rade.wasm") if !authed => {
+            respond(reader.get_mut(), "403 Forbidden", &[], b"log in first")
+        }
+        ("GET", "/rade-info") => {
+            let info = match shared.rade.get() {
+                Some(Some(w)) => serde_json::json!({ "tag": w.tag, "bytes": w.gz.len() }),
+                Some(None) => serde_json::json!({ "tag": null }),
+                None => serde_json::json!({ "tag": null, "loading": true }),
+            };
+            respond(
+                reader.get_mut(),
+                "200 OK",
+                &[("Content-Type", "application/json".into()), ("Cache-Control", "no-store".into())],
+                info.to_string().as_bytes(),
+            )
+        }
+        ("GET", "/rade-worker.js") => respond(
+            reader.get_mut(),
+            "200 OK",
+            &[("Content-Type", "text/javascript".into()), ("Cache-Control", "no-cache".into())],
+            RADE_WORKER,
+        ),
+        ("GET", "/rade.wasm") => match shared.rade.get() {
+            Some(Some(w)) => respond(
+                reader.get_mut(),
+                "200 OK",
+                &[
+                    ("Content-Type", "application/wasm".into()),
+                    ("Content-Encoding", "gzip".into()),
+                    // The page asks for /rade.wasm?v=<tag>.
+                    ("Cache-Control", "private, max-age=31536000, immutable".into()),
+                ],
+                &w.gz,
+            ),
+            _ => respond(reader.get_mut(), "404 Not Found", &[], b"no RADE module on this board"),
+        },
         ("GET", "/session") => respond(
             reader.get_mut(),
             "200 OK",
@@ -793,7 +836,18 @@ pub fn start(cfg: &WebConfig) -> Option<WebHandle> {
         mic: Mutex::new(VecDeque::new()),
         mic_owner: Mutex::new(None),
         media: Mutex::new(VecDeque::new()),
+        rade: std::sync::OnceLock::new(),
     });
+    {
+        // 3.3 MB from QSPI: off the start-up path.
+        let (sh, path) = (shared.clone(), cfg.rade_wasm.clone());
+        std::thread::Builder::new()
+            .name("rade-load".into())
+            .spawn(move || {
+                let _ = sh.rade.set(crate::rade::load(&path));
+            })
+            .ok();
+    }
     let (cmd_tx, cmd_rx) = unbounded();
     let (joined_tx, joined_rx) = unbounded();
     let sh = shared.clone();

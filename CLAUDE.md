@@ -8,10 +8,12 @@
 **tezuka_fw_simple** is a stripped fork of tezuka_fw (a Buildroot
 `BR2_EXTERNAL` tree for Zynq-7000/AD936x SDRs), turning a PlutoSky R2 or
 LibreSDR into a headless remote transceiver (TCI + rigctld, SSB/CW/data, Q65/PI4,
-neural CW skimmer) or an IARU-R1 MGM beacon transmitter/receiver. See `docs/PLAN.md` for architecture, `docs/REFERENCE.md` for the
+CW decoders) or an IARU-R1 MGM beacon transmitter/receiver. See `docs/PLAN.md` for architecture, `docs/REFERENCE.md` for the
 frequency-reference design and `docs/DATV.md` for DVB-S2 video (trxd
 `src/dvbs2/`: TX, RX, TS mux/demux; web UI DATV panel) and `docs/DATV-FPGA.md`
 for its FPGA front end (Maia DDC + ring DMA, maia-sdr branch `datv-ddc`); `docs/DATV-OTA.md` has every DATV mode over the air on every band.
+`docs/RADE.md`: RADE V2 digital voice, run in the browser (rade_c built to
+WASM in `src/rade-web/`, the module in the `model` flash partition).
 
 Boards: `plutoskyr2`, `libre` (both xc7z020). `boards.json` is the single
 source of truth for `build.sh` and CI.
@@ -22,10 +24,11 @@ source of truth for `build.sh` and CI.
 |---|---|
 | `configs/<board>_defconfig` | Buildroot defconfigs |
 | `board/tezuka/common/` | Shared kernel/u-boot config, overlays (`overlay_base`, `overlay_tezuka`), image scripts |
-| `board/tezuka/<board>/` | DTS, u-boot DTS, `bitstream/simple.xsa`, board overlay |
-| `package/board-fpga` | Extracts `system_top.bit` from `bitstream/simple.xsa` |
+| `board/tezuka/<board>/` | DTS, u-boot DTS, `bitstream/simple-<mode>.xsa` + `boot-mode`, board overlay |
+| `package/board-fpga` | Extracts `system_top.bit` from the boot mode's `bitstream/simple-<mode>.xsa`; the other modes go to `/lib/firmware` |
 | `package/trxd` | Buildroot package + init script + default config for trxd |
 | `src/trxd` | The daemon (Rust) |
+| `src/rade-web` | RADE V2 for the page: WASM wrapper, Docker build, Node round-trip test |
 | `docs/` | Design notes |
 
 ## Build
@@ -60,20 +63,17 @@ reachable at https://127.0.0.1:<web.https_port>/ when running the sim - set
 Headless-Chrome check of the UI: drive Chrome over CDP (`--remote-debugging-port`,
 `--ignore-certificate-errors`, `--use-fake-device-for-media-stream`).
 
-The DeepCW model is not in the binary: `trxd --pack-model model.onnx
-package/trxd/deepcw-model.bin` (tools/pack-deepcw-model.sh) produces the blob
-for the `model` flash partition; `cw_model = "<file>"` loads one on a PC. Cross build as
+Cross build as
 in `package/trxd/trxd.mk` (target `armv7-unknown-linux-gnueabihf`, linker =
 the board output's `host/bin/arm-linux-gcc`).
 
 ### sdroxide dependency
 
-trxd reuses sdroxide crates (DSP, TCI server, rigctld server, DeepCW skimmer)
+trxd reuses sdroxide crates (DSP, TCI server, rigctld server)
 pinned by git rev in `src/trxd/Cargo.toml`. A `[patch]` section currently
 points all of them at the local worktree `../sdroxide-vhf` (branch
 `vhf-cw-segments`, uncommitted): VHF+ CW segments (the skimmer never spotted
-above 30 MHz without them) and sdroxide-deepcw's `embedded-model` feature +
-`set_weights()` (model in flash). Remove it once that branch is pushed and bump
+above 30 MHz without them). Remove it once that branch is pushed and bump
 the rev.
 
 ## FPGA
@@ -89,7 +89,7 @@ on Libre `vctcxo_lock` + `iq_xo_corrector`.
 ```bash
 cd /home/dawszy/git/my/maia-sdr/maia-hdl/projects/simple
 source /home/dawszy/git/my/maia-sdr/sourceme.local
-PROJECT_NAME=plutoskyr2 make all   # installs board/tezuka/plutoskyr2/bitstream/simple.xsa here
+FPGA_MODE=trx PROJECT_NAME=plutoskyr2 make all   # installs board/tezuka/plutoskyr2/bitstream/simple-trx.xsa here (docs/FPGA-MODES.md)
 ```
 
 Pass `PROJECT_NAME` in the environment, not as a make argument (ADI's

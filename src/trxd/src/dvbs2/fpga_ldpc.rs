@@ -40,7 +40,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 
 use super::FrameSpec;
-use super::ldpc::Decoder;
 use super::ldpc_fpga::{FpgaDecoder, LongRate, N, quantize_llr};
 
 const PHYS: u64 = 0x43C4_0000;
@@ -462,7 +461,6 @@ pub struct BbOut {
 }
 
 pub enum Ldpc {
-    Short(Decoder),
     Model(FpgaDecoder),
     /// `need`: decisions read back (the BCH codeword's Kbch + 192 bits).
     /// `perm` (four-lane decoder): for each parity byte of the RAM in
@@ -473,10 +471,7 @@ pub enum Ldpc {
 
 impl Ldpc {
     pub fn for_spec(spec: &FrameSpec) -> Ldpc {
-        if let Some(rate) = spec.short_rate {
-            return Ldpc::Short(Decoder::new(rate));
-        }
-        let rate = spec.long_rate.expect("a long-frame rate");
+        let rate = spec.long_rate;
         match Window::open() {
             Ok(win) => {
                 tracing::info!(?rate, lanes = win.lanes, dma = win.dma.is_some(), "LDPC: the FPGA decoder");
@@ -535,7 +530,6 @@ impl Ldpc {
     /// At most `n` iterations (fewer when frames queue up behind this one).
     pub fn set_max_iter(&mut self, n: usize) {
         match self {
-            Ldpc::Short(d) => d.max_iter = n,
             Ldpc::Model(d) => d.max_iter = n,
             Ldpc::Fpga { max_iter, .. } => *max_iter = (n as u32).clamp(1, 63),
         }
@@ -614,10 +608,6 @@ impl Ldpc {
 
     pub fn decode_q(&mut self, llr: &[i8], bits: &mut [u8]) -> Option<usize> {
         match self {
-            Ldpc::Short(_) => {
-                let f: Vec<f32> = llr.iter().map(|&v| v as f32 / LLR_SCALE).collect();
-                self.decode(&f, bits)
-            }
             Ldpc::Model(d) => d.decode(llr, bits),
             Ldpc::Fpga { win, rate, q, max_iter, need, perm, model, bb } => {
                 let t_q = std::time::Instant::now();
@@ -634,7 +624,6 @@ impl Ldpc {
     /// check is satisfied.
     pub fn decode(&mut self, llr: &[f32], bits: &mut [u8]) -> Option<usize> {
         match self {
-            Ldpc::Short(d) => d.decode(llr, bits),
             Ldpc::Model(d) => {
                 let q: Vec<i8> = llr.iter().map(|&l| quantize_llr(l, LLR_SCALE)).collect();
                 d.decode(&q, bits)

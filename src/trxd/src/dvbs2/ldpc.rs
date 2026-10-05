@@ -10,6 +10,7 @@
 //! corrected frame back on stdout), so the decoder can be tested behind an
 //! independent demodulator.
 
+#[cfg(test)]
 use super::{NLDPC, Rate};
 
 /// Only a guard against infinities. A tight clamp here (30 was tried) breaks
@@ -92,6 +93,7 @@ pub struct Decoder {
 const ALPHA: f32 = 0.75;
 
 impl Decoder {
+    #[cfg(test)]
     pub fn new(rate: Rate) -> Self {
         Self::from_table(rate.table(), NLDPC, rate.kldpc())
     }
@@ -255,119 +257,6 @@ impl Decoder {
             })
             .count()
     }
-}
-
-/// `trxd --ldpc-file LLRS RATE`: decode a dump of LLR frames (f32 LE, 16200
-/// a frame) with each algorithm; a debugging aid.
-pub fn file_cli(args: &[String]) -> Result<(), String> {
-    let path = args.first().ok_or("LLRS")?;
-    let rate = args.get(1).and_then(|s| Rate::parse(s)).ok_or("RATE")?;
-    let raw = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-    let llr: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-    for (ms, ph, name) in [(false, false, "box-plus"), (false, true, "phi"), (true, false, "min-sum")] {
-        let mut dec = Decoder::new(rate);
-        dec.min_sum = ms;
-        dec.phi = ph;
-        let mut bits = vec![0u8; NLDPC];
-        let (mut ok, mut fails) = (0, Vec::new());
-        for (i, f) in llr.chunks_exact(NLDPC).enumerate() {
-            if dec.decode(f, &mut bits).is_some() {
-                ok += 1;
-            } else {
-                fails.push(i);
-            }
-        }
-        let big = llr.iter().fold(0f32, |m, v| m.max(v.abs()));
-        eprintln!("{name:>8}: {ok} decoded, failed {:?} (max |LLR| {big:.1})", &fails[..fails.len().min(12)]);
-    }
-    // The phi decoder under iteration caps, and what each frame needed.
-    let mut dec = Decoder::new(rate);
-    let mut bits = vec![0u8; NLDPC];
-    let mut need = Vec::new();
-    for f in llr.chunks_exact(NLDPC) {
-        need.push(dec.decode(f, &mut bits));
-    }
-    let n = need.len();
-    let mut line = String::from("     cap:");
-    for cap in [50usize, 30, 20, 12, 8] {
-        line += &format!("  {cap}: {}/{n}", need.iter().filter(|x| x.is_some_and(|i| i <= cap)).count());
-    }
-    eprintln!("{line}");
-    let mut its: Vec<usize> = need.iter().flatten().copied().collect();
-    its.sort();
-    if !its.is_empty() {
-        eprintln!("     iterations when decoded: median {}, 90 % {}, max {}", its[its.len() / 2], its[its.len() * 9 / 10], its[its.len() - 1]);
-    }
-    Ok(())
-}
-
-/// `trxd --ldpc-helper --modcod N [--shortframes]` for leandvb.
-pub fn helper_cli(args: &[String]) -> Result<(), String> {
-    use std::io::{Read, Write};
-    let modcod: u32 = args
-        .iter()
-        .position(|a| a == "--modcod")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse().ok())
-        .ok_or("--modcod N")?;
-    if !args.iter().any(|a| a == "--shortframes") {
-        return Err("only short frames".into());
-    }
-    let rate = match modcod {
-        1 => Rate::R1_4,
-        2 => Rate::R1_3,
-        4 => Rate::R1_2,
-        6 => Rate::R2_3,
-        7 => Rate::R3_4,
-        m => return Err(format!("modcod {m} not supported")),
-    };
-    let mut dec = Decoder::new(rate);
-    let (mut inp, mut out) = (std::io::stdin().lock(), std::io::stdout().lock());
-    let mut buf = vec![0u8; NLDPC];
-    let mut llr = vec![0f32; NLDPC];
-    let mut bits = vec![0u8; NLDPC];
-    let (mut frames, mut failed, mut iters) = (0u64, 0u64, 0usize);
-    let (mut sat, mut mag, mut total) = (0u64, 0f64, 0u64);
-    while inp.read_exact(&mut buf).is_ok() {
-        // leandvb's soft bits are received amplitudes on a fixed scale, not
-        // LLRs. Read them as +-mu plus Gaussian noise (variance s2) and scale
-        // each frame to LLR = 2 mu v / s2, from the frame's own statistics.
-        let (mut m1, mut m2) = (0f64, 0f64);
-        for &b in &buf {
-            let v = (b as i8) as f64;
-            m1 += v.abs();
-            m2 += v * v;
-            sat += (v.abs() >= 127.0) as u64;
-        }
-        let mu = m1 / NLDPC as f64;
-        let s2 = (m2 / NLDPC as f64 - mu * mu).max(mu * mu * 1e-3).max(1e-6);
-        let k = (2.0 * mu / s2) as f32;
-        for (l, &b) in llr.iter_mut().zip(&buf) {
-            *l = (b as i8) as f32 * k;
-            mag += l.abs() as f64;
-        }
-        total += NLDPC as u64;
-        match dec.decode(&llr, &mut bits) {
-            Some(i) => iters += i,
-            None => failed += 1,
-        }
-        frames += 1;
-        for (o, &b) in buf.iter_mut().zip(&bits) {
-            *o = if b == 1 { (-127i8) as u8 } else { 127 };
-        }
-        // leandvb may exit with frames in flight: stop quietly, say what we did.
-        if out.write_all(&buf).and_then(|_| out.flush()).is_err() {
-            break;
-        }
-    }
-    eprintln!(
-        "ldpc-helper {}: {frames} frames, {failed} not converged, mean {:.1} iterations; input |LLR| mean {:.1}, saturated {:.1} %",
-        rate.label(),
-        iters as f64 / (frames - failed).max(1) as f64,
-        mag / total.max(1) as f64,
-        100.0 * sat as f64 / total.max(1) as f64
-    );
-    Ok(())
 }
 
 #[cfg(test)]

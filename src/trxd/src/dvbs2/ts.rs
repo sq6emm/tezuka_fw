@@ -1203,13 +1203,12 @@ impl Demux {
     }
 }
 
-/// `trxd --datv-mux MEDIA OUT.ts SYMBOL_RATE [RATE] [pilots]`: play a file of
+/// `trxd --datv-mux MEDIA OUT.ts SYMBOL_RATE [MODE]`: play a file of
 /// browser messages (`[u32 LE length][message]`...) into the mux in real time
 /// on the mux's own clock and write the constant-rate TS, 2 s past the end.
 pub fn mux_cli(input: &str, output: &str, rest: &[String]) -> Result<(), String> {
     let sr: f64 = rest.first().ok_or("symbol rate")?.parse().map_err(|_| "symbol rate: a number")?;
-    let rate = rest.get(1).map_or(Some(super::Rate::R1_2), |s| super::Rate::parse(s)).ok_or("rate: 1/4, 1/3, 1/2, 2/3 or 3/4")?;
-    let p = super::Params { rate, pilots: rest.iter().any(|s| s == "pilots"), rolloff: 0.35 };
+    let mode = rest.get(1).map_or(Some(super::fpga_tx::LongMode::Qpsk12), |s| super::fpga_tx::LongMode::parse(s)).ok_or("mode: L-QPSK-1/2, L-QPSK-3/4 or L-8PSK-3/4")?;
     let raw = std::fs::read(input).map_err(|e| format!("{input}: {e}"))?;
     let mut msgs = Vec::new();
     let mut i = 0;
@@ -1222,7 +1221,7 @@ pub fn mux_cli(input: &str, output: &str, rest: &[String]) -> Result<(), String>
     msgs.sort_by_key(|m| m.ts_us());
     let t0 = msgs.first().map_or(0, |m| m.ts_us());
     let end = msgs.last().map_or(0, |m| m.ts_us()) - t0 + 2_000_000;
-    let ts_rate = p.ts_rate(sr);
+    let ts_rate = mode.ts_rate(sr);
     let mut mux = Mux::new(ts_rate, "SQ6EMM");
     let mut out = Vec::new();
     let mut it = msgs.into_iter().peekable();
@@ -1244,7 +1243,7 @@ pub fn mux_cli(input: &str, output: &str, rest: &[String]) -> Result<(), String>
         "TS {:.0} bit/s ({} {}), {} packets, video frames dropped {}, {:?}, video budget {:.0} bit/s",
         ts_rate,
         sr,
-        rate.label(),
+        mode.label(),
         n,
         mux.dropped_frames,
         mux.profile,
