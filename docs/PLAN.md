@@ -42,12 +42,14 @@ mass-storage `config.txt` style path is `/etc/trxd.toml`):
 
 * `role = "trx"` — remote transceiver
   * IIO: AD9361 LO / gains / rate via sysfs, RX/TX streaming via libiio local backend.
-  * DSP: 192 kS/s IQ -> NCO + decimate -> 48 kS/s -> SSB/CW/DIG demod, AGC;
+  * DSP: 384 kS/s IQ (or the FPGA channel DDC) -> 48 kS/s -> SSB/CW/DIG/AM/FM
+    demod, AGC; wide FM from a 192 kS/s channel (src/wfm.rs, mono, RDS);
     TX: 48 kS/s audio -> SSB (Weaver/phasing) or CW keyer -> interpolate to 192 kS/s.
   * **TCI server** (WebSocket, port 40001): CAT + RX audio + TX audio + IQ.
   * **rigctld server** (TCP 4532, Hamlib `rigctl -m 2` compatible).
   * **Decoders** (on-board, results to the web UI and TCI `spot:`):
-    FT8 (mfsk-core), Q65-60A..E (mfsk-core), CW skimmer (DeepCW Conformer-CTC, rten).
+    Q65-60A..E and PI4 (slot decoders), the live CW box (timing decoder, CW-RS).
+    FT8 is left to WSJT-X on the PC; DeepCW was removed (docs/PERFORMANCE.md).
 * `role = "beacon-tx"` — GPS/NTP-timed MGM beacon:
   even minute digital mode (PI4 / Q65-60x) + carrier, odd minute CW + carrier
   (same cycle as MGMBeacon.ino / BeaconModes).

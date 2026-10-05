@@ -37,6 +37,7 @@ mod speech;
 mod stream;
 mod trx;
 mod web;
+mod wfm;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

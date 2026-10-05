@@ -6,7 +6,7 @@
 //!   - text frames, both ways: JSON (state and decodes out, commands in);
 //!   - binary frames out: `[1][f64 center][f64 span][u16 n][n x u8]` a
 //!     spectrum row (u8 = (dBFS + 160) * 1.5, 0 = no data),
-//!     `[2][u8...]` 12 kHz mu-law RX audio;
+//!     `[2][u8...]` 12 kHz mu-law RX audio (`[9][u8...]` 24 kHz in WFM);
 //!   - binary frames in: `[3][u8...]` 12 kHz mu-law microphone audio;
 //!     `[4][flags][i64 us][H.264]` and `[5][i64 us][Opus]` DATV video and
 //!     audio (see [`crate::dvbs2::ts::Media::from_ws`]), from the client
@@ -213,6 +213,18 @@ impl WebHandle {
         }
         let mut b = Vec::with_capacity(1 + audio.len());
         b.push(2u8);
+        b.extend(audio.iter().map(|&s| mulaw_encode(s)));
+        self.broadcast(|| Out::Bin(b.clone()));
+    }
+
+    /// 24 kHz mu-law receive audio (frame type 9): wide FM, whose audio
+    /// reaches 15 kHz and would sound like a telephone at 12 kHz.
+    pub fn send_audio24(&self, audio: &[f32]) {
+        if audio.is_empty() {
+            return;
+        }
+        let mut b = Vec::with_capacity(1 + audio.len());
+        b.push(9u8);
         b.extend(audio.iter().map(|&s| mulaw_encode(s)));
         self.broadcast(|| Out::Bin(b.clone()));
     }

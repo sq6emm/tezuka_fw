@@ -85,7 +85,11 @@ header a { color: var(--dim); }
 .meter .label b { color: var(--text); font-weight: 600; font-family: ui-monospace, Menlo, monospace; }
 
 /* ---------- band bar ---------- */
-#bandbar { display: flex; gap: 5px; align-items: center; }
+#bandbar { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 5px; align-items: center; }
+#rxbands { grid-column: 1 / -1; display: flex; gap: 5px; align-items: center; overflow-x: auto; scrollbar-width: none; }
+#rxbands .note { flex: 0 0 auto; font-size: 11px; }
+#rxbands .k { flex: 1 0 auto; padding: 4px 8px; border-style: dashed; }
+#rxbands .k.on { box-shadow: 0 0 10px rgba(29, 134, 194, .6); }
 #bands { display: flex; gap: 5px; flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: none; }
 #bands .k { flex: 1 0 auto; padding: 5px 8px; }
 #bands .k.on { box-shadow: 0 0 10px rgba(29, 134, 194, .6); }
@@ -242,6 +246,13 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
     <h3>TRANSVERTERS <span class="note">RF range on the air and the IF that RF from lands on; tick LO above for a mirrored band</span></h3>
     <table id="xv-table" class="xv"><thead><tr><th>Name</th><th>RF from MHz</th><th>RF to MHz</th><th>IF at RF from, MHz</th><th>LO above</th><th>TX</th><th></th></tr></thead><tbody id="xv-body"></tbody></table>
     <div class="row"><button class="k" id="xv-add">ADD</button><button class="k" id="xv-save">SAVE</button></div>
+    <h3>WATERFALL <span class="note">in this browser only</span></h3>
+    <div class="row">
+      <span class="note">Time marks (UTC)</span>
+      <select id="set-wfmarks"><option value="0">off</option><option value="5">every 5 s</option><option value="10">every 10 s</option>
+        <option value="15">every 15 s</option><option value="30">every 30 s</option><option value="60">every 60 s</option></select>
+      <span class="note">at slow speeds marks closer than a label's height are skipped</span>
+    </div>
     <h3>ANTENNA SOCKETS <span class="note">which pair each band (or transverter) is wired to; taken on entering the band. Manual: keep the pair picked by hand</span></h3>
     <div class="row" id="ports-body"></div>
     <div class="row"><button class="k" id="set-close">CLOSE</button></div>
@@ -263,6 +274,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
         <span class="tag hidden" id="t-lock">LOCK</span>
       </div>
       <div id="freq" title="Scroll or drag a digit to tune it; click a digit to set the tuning step"></div>
+      <div class="sub-line hidden" id="rds-line" title="RDS from the station (wide FM)"><span>RDS <b id="rds-ps">—</b></span><span id="rds-rt"></span><span id="rds-pi"></span></div>
       <div class="sub-line">
         <span>SUB <b id="freq-b">—</b></span>
         <span>TX <b id="freq-tx">—</b></span>
@@ -283,6 +295,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
     <div id="bands"></div>
     <input type="text" id="fentry" placeholder="MHz / kHz / Hz" title="Type a frequency and press Enter: 144.3 (MHz), 144300 (kHz), 144300000 (Hz), or 144300k" autocomplete="off" inputmode="decimal">
     <button class="k" id="fgo">GO</button>
+    <div id="rxbands" title="Receive-only bands: tuning there takes the band's mode and channel step; PTT is off outside the amateur bands"></div>
   </section>
 
   <section id="scopewrap">
@@ -303,6 +316,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <button class="k" id="ref-dn" title="Reference level down">REF−</button>
       <button class="k" id="ref-up" title="Reference level up">REF+</button>
       <button class="k" id="pal" title="Waterfall palette">PAL</button>
+      <button class="k" id="wfspd" title="Waterfall speed: 1x is 15 lines a second; slower draws each line as the average of 2-16 lines, so weak signals build up">WF 1x</button>
       <button class="k" id="scope-ctr" title="Scope: keep the VFO centred (CTR) or a fixed view that follows only when the VFO leaves it (FIX)">FIX</button>
     </div>
     <div id="cursor" class="hidden"></div>
@@ -313,8 +327,8 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <h3>MODE · FILTER · DSP</h3>
       <div class="row" id="modes">
         <button class="k" data-mode="USB">USB</button>
-        <button class="k" data-mode="CW">CW</button><button class="k" data-mode="CWRS" title="CW through rain scatter (10 GHz and up): the rain-scatter decoder, the filter open to 200-3000 Hz so the whole Doppler spread gets in, AGC slow">CW-RS</button><button class="k" data-mode="PKTUSB">DATA</button><button class="k" data-mode="RADE" title="FreeDV RADE V2 digital voice (pre-release waveform, not for regular on-air use yet): decoded and encoded in this browser; DATA mode with a 250-2750 Hz filter">RADE</button>
-        <button class="k" data-mode="AM">AM</button><button class="k" data-mode="FM">FM</button>
+        <button class="k" data-mode="CW">CW</button><button class="k" data-mode="CWRS" title="CW through rain scatter (10 GHz and up): the rain-scatter decoder, the filter open to 200-3000 Hz so the whole Doppler spread gets in, AGC slow">CW-RS</button><button class="k" data-mode="PKTUSB" title="USB data: the USB passband without the compressor (CESSB), for digital modes; rigctld and TCI call it PKTUSB / digu">USB-D</button><button class="k" data-mode="RADE" title="FreeDV RADE V2 digital voice (pre-release waveform, not for regular on-air use yet): decoded and encoded in this browser; USB-D with a 250-2750 Hz filter">RADE</button>
+        <button class="k" data-mode="AM">AM</button><button class="k" data-mode="FM">FM</button><button class="k" data-mode="WFM" title="Wide FM (broadcast, 87.5-108 MHz): mono, 24 kHz audio to this browser, RDS station name and text">WFM</button>
         <button class="k" data-mode="DATV" title="Digital TV: DVB-S2 from this browser's camera, and received pictures">DATV</button>
       </div>
       <div class="row voice-only" id="fils">
@@ -362,7 +376,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <div class="row" id="steps">
         <button class="k" data-step="10">10</button><button class="k" data-step="100">100</button>
         <button class="k" data-step="1000">1k</button><button class="k" data-step="5000">5k</button>
-        <button class="k" data-step="12500">12.5k</button><button class="k" data-step="25000">25k</button>
+        <button class="k" data-step="12500">12.5k</button><button class="k" data-step="25000">25k</button><button class="k" data-step="100000">100k</button>
       </div>
       <div class="slider">AF<input type="range" id="af" min="0" max="100" value="60"><b id="af-v">60</b></div>
       <div class="slider">RF gain<input type="range" id="rfg" min="0" max="73" value="40"><b id="rfg-v">AUTO</b></div>
@@ -475,11 +489,18 @@ const BANDS = [
   ["23cm", 1_296_200_000, "USB", 1240e6, 1300e6], ["13cm", 2_320_200_000, "USB", 2300e6, 2450e6],
   ["9cm", 3_400_100_000, "USB", 3400e6, 3475e6], ["6cm", 5_760_100_000, "USB", 5650e6, 5850e6],
 ];
-// The band button for a frequency: a transverter's range first, then the bands.
+// Receive-only bands: [name, first tune, mode, from, to, channel step].
+const RX_BANDS = [
+  ["AIR", 124_000_000, "AM", 118e6, 137e6, 25000], ["MARINE", 156_800_000, "FM", 156e6, 162.025e6, 25000],
+  ["PMR", 446_006_250, "FM", 446.0e6, 446.2e6, 12500], ["LPD", 433_075_000, "FM", 433.05e6, 434.79e6, 25000],
+  ["FM", 100_000_000, "WFM", 87.5e6, 108e6, 100000],
+];
+// The band button for a frequency: a transverter's range first, then the
+// receive-only bands (LPD lies inside 70cm), then the amateur bands.
 function bandOf(f, xvtrs) {
   const xv = (xvtrs || []).find((t) => f >= t.rf_min && f <= t.rf_max);
   if (xv) return xv.name;
-  const b = BANDS.find(([, , , lo, hi]) => f >= lo && f <= hi);
+  const b = RX_BANDS.find(([, , , lo, hi]) => f >= lo && f <= hi) || BANDS.find(([, , , lo, hi]) => f >= lo && f <= hi);
   return b ? b[0] : null;
 }
 // Filter presets per mode: [lo, hi] Hz, FIL1 widest.
@@ -491,6 +512,7 @@ const FILTERS = {
   CWRS: [[200, 3000], [200, 3000], [200, 3000]],
   AM: [[-5000, 5000], [-3000, 3000], [-2000, 2000]],
   FM: [[-8000, 8000], [-5000, 5000], [-3000, 3000]],
+  WFM: [[-96000, 96000], [-96000, 96000], [-96000, 96000]],
 };
 
 // ============================================================ login / connect
@@ -539,6 +561,8 @@ function onBinary(buf) {
     S.row = u8.subarray(19, 19 + n);
     autoLevel(S.row);
     pushWaterfall(S.row);
+  } else if (u8[0] === 9) {
+    if (!DATV.receiving) audioIn(u8.subarray(1), 24000);
   } else if (u8[0] === 2) {
     if (!DATV.receiving) audioIn(u8.subarray(1));
   } else if (u8[0] === 6) {
@@ -553,6 +577,7 @@ function onBinary(buf) {
 function onJson(m) {
   if (m.type === "state") { S.st = m; renderState(); }
   else if (m.type === "meter") renderMeter(m);
+  else if (m.type === "rds") { S.rds = m; renderRds(); }
   else if (m.type === "calib") renderCalib(m);
   else if (m.type === "calib_ack") { if (!m.ok) alert("Calibration: " + (m.error || "refused")); }
   else if (m.type === "decode") addDecode(m);
@@ -668,7 +693,7 @@ function filPreset(mode, i) {
   const all = store.get("fil." + mode, null);
   return (all && all[i]) || (FILTERS[mode] || FILTERS.USB)[i];
 }
-const FIL_MAX = { CW: 3000, USB: 4000, LSB: 4000, PKTUSB: 4000, AM: 12000, FM: 20000 };
+const FIL_MAX = { CW: 3000, USB: 4000, LSB: 4000, PKTUSB: 4000, AM: 12000, FM: 20000, WFM: 192000 };
 function renderFilter(st) {
   if (!S.filIdx) S.filIdx = store.get("filidx", {});
   const i = S.filIdx[st.mode] ?? 1, def = (FILTERS[st.mode] || FILTERS.USB)[i];
@@ -683,6 +708,10 @@ function renderFilter(st) {
   $("fil-show").textContent = `${Math.round(st.filter[0])} .. ${Math.round(st.filter[1])} Hz`;
 }
 function buildBands(xvtrs) {
+  if (!$("rxbands").childElementCount) {
+    $("rxbands").innerHTML = `<span class="note">RX</span>` + RX_BANDS.map(([n, f, m, lo, hi, step]) =>
+      `<button class="k" data-f="${f}" data-m="${m}" data-step="${step}" title="${n}: ${lo / 1e6}-${hi / 1e6} MHz, ${m}, ${fmtHz(step)} channels">${n}</button>`).join("");
+  }
   const key = JSON.stringify(xvtrs);
   if (S.bandsKey === key) return; S.bandsKey = key;
   $("bands").innerHTML = BANDS.map(([n, f, m]) => `<button class="k" data-f="${f}" data-m="${m}">${n}</button>`).join("") +
@@ -691,6 +720,8 @@ function buildBands(xvtrs) {
 function setupSettings() {
   $("setbtn").onclick = () => { const m = $("setmenu"); m.classList.toggle("hidden"); if (!m.classList.contains("hidden")) openSettings(); };
   $("set-close").onclick = () => $("setmenu").classList.add("hidden");
+  $("set-wfmarks").value = String(WF.marks);
+  $("set-wfmarks").onchange = () => { WF.marks = +$("set-wfmarks").value; WF.slot = null; store.set("wfMarks", WF.marks); };
   $("cal-body").onclick = (e) => {
     const p = e.target.dataset.calClear;
     if (p && confirm(`Remove the level calibration of RX${p}? The readout falls back to nominal figures.`)) send({ cmd: "calib_clear", port: +p });
@@ -770,8 +801,9 @@ function renderState() {
   document.body.classList.toggle("cw-mode", !st.datv_mode && st.mode === "CW");
   document.body.classList.toggle("data-mode", !st.datv_mode && st.mode === "PKTUSB");
   document.body.classList.toggle("ssb-mode", !st.datv_mode && (st.mode === "USB" || st.mode === "LSB"));
-  $("t-mode").textContent = st.datv_mode ? "DATV" : st.rade ? "RADE" : st.mode === "PKTUSB" ? "DATA" : st.mode;
+  $("t-mode").textContent = st.datv_mode ? "DATV" : st.rade ? "RADE" : st.mode === "PKTUSB" ? "USB-D" : st.mode;
   $("t-mode").className = "tag on";
+  renderRds();
   if (!S.filIdx) S.filIdx = store.get("filidx", {});
   $("t-fil").textContent = "FIL" + ((S.filIdx[st.mode] ?? 1) + 1) + " " + fmtHz(Math.round(st.filter[1] - st.filter[0]));
   $("t-agc").textContent = "AGC-" + ({ fast: "F", med: "M", slow: "S", off: "OFF" }[st.agc] || "?");
@@ -791,7 +823,7 @@ function renderState() {
   renderFilter(st);
   buildBands(st.xvtrs || []);
   const bnow = bandOf(curFreq(), st.xvtrs);
-  document.querySelectorAll("#bands .k").forEach((b) => b.classList.toggle("on", b.textContent === bnow));
+  document.querySelectorAll("#bands .k, #rxbands .k").forEach((b) => b.classList.toggle("on", b.textContent === bnow));
   for (const k of ["nb", "nr", "notch"]) $(k).classList.toggle("on", !!st[k]);
   $("rit").classList.toggle("on", !!(st.rit && st.rit[0])); $("xit").classList.toggle("on", !!(st.xit && st.xit[0]));
   const ro = st.rit ? (st.rit[0] || !st.xit[0] ? st.rit[1] : st.xit[1]) : 0;
@@ -810,7 +842,10 @@ function renderState() {
   document.querySelectorAll("#decoders [data-dec]").forEach((b) => b.classList.toggle("on", decs.includes(b.dataset.dec)));
   $("ptt").classList.toggle("on", !!st.ptt && st.tx_source !== "tune");
   $("tune").classList.toggle("on", !!st.tune);
-  $("ptt").disabled = !st.allow_tx; $("tune").disabled = !st.allow_tx;
+  // (tx_ok: allowed here at all - trx.allow_tx, the TX ranges, a transverter's TX)
+  const txOk = st.allow_tx && st.tx_ok !== false;
+  $("ptt").disabled = !txOk; $("tune").disabled = !txOk;
+  $("ptt").title = txOk ? "Hold, or Space; Shift-click latches. In CW it is a straight key: carrier at the pitch while held." : "No transmitting on this frequency (receive-only band, outside trx.tx_ranges, or a receive-only transverter)";
   $("d-time").className = "dot " + (st.time_synced ? "ok" : "warn");
   const tc = (n, c) => c == null ? "" : `<span class="${c >= 85 ? "hot" : c >= 70 ? "warm" : ""}">${n} <b>${c}°C</b></span>`;
   $("temps").innerHTML = [tc("FPGA", st.temp_fpga), tc("AD9361", st.temp_ad936x)].filter(Boolean).join(" · ");
@@ -838,8 +873,29 @@ function setSlider(id, v) {
   $(id + "-v").textContent = v;
 }
 
+// RDS (wide FM only): the station name, RadioText and PI code.
+function renderRds() {
+  const r = S.rds, on = !!(S.st && S.st.mode === "WFM" && r && (r.ps || r.rt));
+  $("rds-line").classList.toggle("hidden", !on);
+  if (!on) return;
+  $("rds-ps").textContent = r.ps || "—";
+  $("rds-rt").textContent = r.rt || "";
+  $("rds-pi").textContent = r.pi ? "PI " + r.pi : "";
+}
+
 // ============================================================ meter
 const S_SCALE = ["1", "3", "5", "7", "9", "+20", "+40", "+60"];
+// The bar: S0..S9 the first 60 %, S9..S9+60 dB the rest (IARU: 6 dB per S unit).
+function sFrac(dbm, s9) {
+  const s = 9 + (dbm - s9) / 6;
+  return s <= 9 ? clamp(s / 9, 0, 1) * 0.6 : 0.6 + clamp((dbm - s9) / 60, 0, 1) * 0.4;
+}
+function sText(dbm, s9) {
+  const over = dbm - s9;
+  return over > 0.5 ? "S9+" + Math.round(over) : "S" + Math.max(0, Math.floor(9 + over / 6));
+}
+// Peak hold: a new peak holds for PEAK_HOLD_MS, then falls at PEAK_FALL_DB per second.
+const PEAK_HOLD_MS = 2000, PEAK_FALL_DB = 10;
 function renderMeter(m) {
   DATV.meter(m.datv, m.datv_rx);
   // S-meter: dBm at the antenna socket from the board's level meter
@@ -858,14 +914,18 @@ function renderMeter(m) {
     // Calibrated level from the board (IARU: S9 = -73 dBm below 30 MHz, -93 above).
     const dbm = m.dbm;
     const s9 = curFreq() < 30e6 ? -73 : -93;
-    const s = 9 + (dbm - s9) / 6;
-    frac = s <= 9 ? clamp(s / 9, 0, 1) * 0.6 : 0.6 + clamp((dbm - s9) / 60, 0, 1) * 0.4;
+    frac = sFrac(dbm, s9);
+    const now = performance.now();
+    if (S.pkDbm == null || dbm >= S.pkDbm) { S.pkDbm = dbm; S.pkAt = now; }
+    else if (now - S.pkAt > PEAK_HOLD_MS) S.pkDbm = Math.max(dbm, S.pkDbm - PEAK_FALL_DB * (now - (S.pkLast || now)) / 1000);
+    S.pkLast = now;
+    S.meterPeak = sFrac(S.pkDbm, s9); S.meterPeakAt = now;
     // dBm marked by how far it can be trusted: * extrapolated, ~ old points or nominal.
     const mark = { calibrated: "", extrapolated: "*", legacy: "~", none: "~" }[m.cal] ?? "~";
-    val = `${m.s || ("S" + Math.max(0, s).toFixed(0))}  ${dbm.toFixed(0)} dBm${mark}` + (m.clip ? " CLIP" : "");
+    val = `${m.s || sText(dbm, s9)}  ${dbm.toFixed(0)} dBm${mark}  pk ${sText(S.pkDbm, s9)}` + (m.clip ? " CLIP" : "");
     const why = { calibrated: "calibrated", extrapolated: "extrapolated (outside the measured frequencies)",
       legacy: "old S-meter points (no calibration table)", none: "not calibrated (nominal)" }[m.cal] || "";
-    $("m-val").title = `${dbm.toFixed(1)} dBm in the passband, ${why}` +
+    $("m-val").title = `${dbm.toFixed(1)} dBm in the passband, ${why}; peak (held 2 s, then falling 10 dB/s) ${S.pkDbm.toFixed(1)} dBm` +
       (m.dbm_hz != null ? `; noise ${m.dbm_hz.toFixed(1)} dBm/Hz` : "") + (m.noise ? "; mostly noise" : "") +
       (m.clip ? "; converter near full scale: reading too low, reduce gain" : "");
     S.lastMeter = m;
@@ -889,8 +949,12 @@ function renderMeter(m) {
     r.classList.toggle("lock", !!m.cw.locked);
   }
   $("m-bar").style.width = (frac * 100).toFixed(1) + "%";
-  const now = performance.now();
-  if (frac >= S.meterPeak || now - S.meterPeakAt > 1500) { S.meterPeak = frac; S.meterPeakAt = now; }
+  if (tx) {
+    // Po: the old short hold; the RX peak starts afresh after the over.
+    const now = performance.now();
+    S.pkDbm = null;
+    if (frac >= S.meterPeak || now - S.meterPeakAt > 1500) { S.meterPeak = frac; S.meterPeakAt = now; }
+  }
   $("m-peak").style.left = (S.meterPeak * 100).toFixed(1) + "%";
 }
 
@@ -943,13 +1007,26 @@ function level(v) { // 0..1 on the display scale
   if (v === 0) return -1;
   return clamp((u8db(v) - (S.refDb - S.rangeDb)) / S.rangeDb, 0, 1);
 }
+// Waterfall speed (lines averaged into one) and UTC time marks, both per browser.
+const WF_SPEEDS = [1, 2, 4, 8, 16];
+const WF = { slow: store.get("wfSlow", 1), marks: store.get("wfMarks", 5), acc: null, zero: null, n: 0, slot: null, since: 1e9 };
 function pushWaterfall(row) {
   const w = wf.width, h = wf.height;
   if (!w || !h) return;
+  S.dirtySpec = true;
+  // Average WF.slow rows into one (a 0 is "no data" and stays 0).
+  const n = row.length;
+  if (!WF.acc || WF.acc.length !== n) { WF.acc = new Float32Array(n); WF.zero = new Uint8Array(n); WF.n = 0; }
+  for (let i = 0; i < n; i++) { if (row[i]) WF.acc[i] += row[i]; else WF.zero[i] = 1; }
+  if (++WF.n < WF.slow) return;
+  const avg = new Uint8Array(n);
+  for (let i = 0; i < n; i++) avg[i] = WF.zero[i] ? 0 : Math.round(WF.acc[i] / WF.n);
+  WF.acc.fill(0); WF.zero.fill(0); WF.n = 0;
+  row = avg;
   if (!wfImage || wfImage.width !== w) wfImage = wctx.createImageData(w, 1);
   // Scroll down one pixel, paint the new line on top.
   wctx.drawImage(wf, 0, 0, w, h - 1, 0, 1, w, h - 1);
-  const d = wfImage.data, n = row.length;
+  const d = wfImage.data;
   for (let x = 0; x < w; x++) {
     const v = row[Math.min(n - 1, (x * n / w) | 0)];
     const l = level(v);
@@ -957,7 +1034,27 @@ function pushWaterfall(row) {
     d[x * 4] = l < 0 ? 25 : lut[i * 3]; d[x * 4 + 1] = l < 0 ? 25 : lut[i * 3 + 1]; d[x * 4 + 2] = l < 0 ? 30 : lut[i * 3 + 2]; d[x * 4 + 3] = 255;
   }
   wctx.putImageData(wfImage, 0, 0);
-  S.dirtySpec = true;
+  wfMark(w);
+}
+// A time mark when this line starts a new interval: a faint line across, the
+// UTC time below it (drawn into the canvas, so it scrolls with the lines).
+function wfMark(w) {
+  WF.since++;
+  if (!WF.marks) { WF.slot = null; return; }
+  const slot = Math.floor(Date.now() / 1000 / WF.marks);
+  const due = WF.slot !== null && slot !== WF.slot;
+  WF.slot = slot;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2), px = Math.round(10 * dpr);
+  if (!due || WF.since < px + 4 * dpr) return;
+  WF.since = 0;
+  const t = new Date(slot * WF.marks * 1000).toISOString().slice(11, 19);
+  wctx.save();
+  wctx.fillStyle = "rgba(255,255,255,.45)"; wctx.fillRect(0, 0, w, Math.max(1, Math.round(dpr / 2)));
+  wctx.font = `600 ${px}px ui-monospace, Menlo, monospace`; wctx.textBaseline = "top";
+  const tw = wctx.measureText(t).width;
+  wctx.fillStyle = "rgba(0,0,0,.6)"; wctx.fillRect(2 * dpr, dpr, tw + 4 * dpr, px + 2 * dpr);
+  wctx.fillStyle = "rgba(255,255,255,.85)"; wctx.fillText(t, 4 * dpr, 2 * dpr);
+  wctx.restore();
 }
 function freqAtX(x, width) { return S.rowCenter + (x / width - 0.5) * S.rowSpan; }
 function xAtFreq(f, width) { return ((f - S.rowCenter) / S.rowSpan + 0.5) * width; }
@@ -1058,6 +1155,9 @@ function setupScope() {
     $("ref-auto").classList.toggle("on", S.refAuto); renderState();
   };
   $("pal").onclick = () => { S.palette = (S.palette + 1) % PALETTES.length; store.set("pal", S.palette); buildLut(); };
+  const wfSpd = () => { $("wfspd").textContent = "WF " + WF.slow + "x"; $("wfspd").classList.toggle("on", WF.slow > 1); };
+  $("wfspd").onclick = () => { WF.slow = WF_SPEEDS[(WF_SPEEDS.indexOf(WF.slow) + 1) % WF_SPEEDS.length]; store.set("wfSlow", WF.slow); wfSpd(); };
+  wfSpd();
   new ResizeObserver(resizeScope).observe(wrap);
 }
 
@@ -1066,16 +1166,21 @@ let actx = null, rxNode = null, micNode = null, micStream = null, gain = null;
 const WORKLET = `
 class RxPlayer extends AudioWorkletProcessor {
   constructor() {
-    super(); this.q = new Float32Array(48000); this.r = 0; this.w = 0; this.n = 0; this.pos = 0; this.started = false;
-    this.port.onmessage = (e) => { const a = e.data; for (let i = 0; i < a.length; i++) {
-      if (this.n >= this.q.length) { this.r = (this.r + 1) % this.q.length; this.n--; }
-      this.q[this.w] = a[i]; this.w = (this.w + 1) % this.q.length; this.n++; } };
+    super(); this.q = new Float32Array(48000); this.r = 0; this.w = 0; this.n = 0; this.pos = 0; this.started = false; this.rate = 12000;
+    // A Float32Array is 12 kHz audio; { a, rate } another rate (24 kHz wide FM).
+    this.port.onmessage = (e) => {
+      let a = e.data, rate = 12000;
+      if (!(a instanceof Float32Array)) { rate = a.rate; a = a.a; }
+      if (rate !== this.rate) { this.rate = rate; this.r = this.w = this.n = 0; this.pos = 0; this.started = false; }
+      for (let i = 0; i < a.length; i++) {
+        if (this.n >= this.q.length) { this.r = (this.r + 1) % this.q.length; this.n--; }
+        this.q[this.w] = a[i]; this.w = (this.w + 1) % this.q.length; this.n++; } };
   }
   process(_i, outputs) {
-    const out = outputs[0][0]; const step = 12000 / sampleRate;
+    const out = outputs[0][0], rate = this.rate; const step = rate / sampleRate;
     // Jitter buffer: start at 120 ms, drop to 150 ms if it grows past 400 ms.
-    if (!this.started) { if (this.n < 1440) { out.fill(0); return true; } this.started = true; }
-    if (this.n > 4800) { const drop = this.n - 1800; this.r = (this.r + drop) % this.q.length; this.n -= drop; }
+    if (!this.started) { if (this.n < 0.12 * rate) { out.fill(0); return true; } this.started = true; }
+    if (this.n > 0.4 * rate) { const drop = this.n - 0.15 * rate; this.r = (this.r + drop) % this.q.length; this.n -= drop; }
     for (let i = 0; i < out.length; i++) {
       if (this.n < 2) { out[i] = 0; this.started = false; continue; }
       const a = this.q[this.r], b = this.q[(this.r + 1) % this.q.length];
@@ -1215,12 +1320,12 @@ function audioGesture() {
 }
 document.addEventListener("pointerdown", audioGesture, true);
 document.addEventListener("keydown", audioGesture, true);
-function audioIn(u8) {
+function audioIn(u8, rate = 12000) {
   if (!rxNode || actx.state !== "running") return;
   const f = new Float32Array(u8.length);
   for (let i = 0; i < u8.length; i++) f[i] = MU[u8[i]];
-  if (RADE.rx(f)) return;
-  rxNode.port.postMessage(f, [f.buffer]);
+  if (rate === 12000 && RADE.rx(f)) return;
+  rxNode.port.postMessage(rate === 12000 ? f : { a: f, rate }, [f.buffer]);
 }
 const MIC_VOICE = { echoCancellation: false, noiseSuppression: false, autoGainControl: true, channelCount: 1 };
 let micSrc = null;
@@ -1394,11 +1499,21 @@ function buildStatic() {
   buildLut();
   $("m-scale").innerHTML = S_SCALE.map((x, i) => `<span class="${i > 4 ? "hi" : ""}">${x}</span>`).join("");
   buildBands([]);
-  $("bands").onclick = (e) => {
+  $("bands").onclick = $("rxbands").onclick = (e) => {
     const b = e.target.closest("[data-f]"); if (!b) return;
     const last = store.get("band." + b.textContent, null);
+    // A receive-only band brings its channel step; back on an amateur band,
+    // the step from before comes back.
+    if (b.dataset.step) {
+      if (S.stepBeforeRx == null) S.stepBeforeRx = S.step;
+      setStep(+b.dataset.step);
+    } else if (S.stepBeforeRx != null) {
+      setStep(S.stepBeforeRx); S.stepBeforeRx = null;
+    }
     tuneTo(last ? last.f : +b.dataset.f);
-    send({ cmd: "mode", mode: last ? last.mode : (b.dataset.m || "USB") });
+    const m = last ? last.mode : (b.dataset.m || "USB");
+    send({ cmd: "mode", mode: m });
+    const [lo, hi] = filPreset(m, (S.filIdx || {})[m] ?? 1); send({ cmd: "filter", lo, hi });
   };
   // Remember where each band was left.
   setInterval(() => {

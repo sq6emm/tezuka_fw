@@ -11,7 +11,9 @@ boards into:
 * a **headless remote transceiver** (SQTRX): SSB, CW and data modes over
   **TCI** and **Hamlib rigctld** (FT8 is left to WSJT-X on the PC), with
   on-board Q65/PI4 decoders and a live CW decoder (web UI and TCI), and
-  low-rate **DATV** (DVB-S2 from and to the browser's camera; docs/DATV.md); or
+  low-rate **DATV** (DVB-S2 from and to the browser's camera; docs/DATV.md),
+  FreeDV **RADE V2** voice in the browser (docs/RADE.md), and receive-only
+  bands (airband AM, marine and PMR/LPD FM, broadcast wide FM with RDS); or
 * an **IARU-R1 MGM beacon transmitter**: PI4 or Q65-60x plus CW
   identification plus carrier, GPS/NTP-timed; or
 * a **beacon receiver**: PI4, Q65 and CW decodes, plus a carrier

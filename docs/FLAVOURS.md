@@ -15,7 +15,8 @@ Images: `build/<board>-<flavour>.zip`, e.g. `build/libre-plus.zip`.
 
 SQTRX as a narrowband transceiver, nothing else:
 
-* SSB, CW, data modes (PKTUSB), AM, FM; TCI and Hamlib rigctld for
+* SSB, CW, USB-D for data modes (PKTUSB), AM, FM, wide FM (broadcast,
+  receive only); TCI and Hamlib rigctld for
   WSJT-X, JTDX, MSHV and others; the web UI with microphone and speaker
   in the browser.
 * Decoders on the board: Q65 and PI4 slot decoders, the live CW box

@@ -88,6 +88,24 @@ started without agreeing on it first.
 - **DeepCW in software**: decode every 2 s instead of 1 s, and only while
   there is keying at the pitch (the timing front end already knows).
 
+## 2026-10-05: wide FM (broadcast)
+
+The receive-only FM band needs wide FM, which the 48 kHz channel cannot
+carry. In WFM the FPGA channel DDC is reprogrammed for 192 kS/s (3.072 MS/s
+/ 16, passband +/-85 kHz; `rebuild_channel` in trx.rs, back to 48 kHz on
+leaving the mode); the software DDC from the stream is the fallback.
+
+| Libre 2, one page open, WFM | % of one core |
+|---|---|
+| sdroxide `WfmDemod` (PC demodulator: 63-tap channel FIR, two 383-tap 15 kHz filters, stereo pilot PLL, RDS) | rx_dsp 90 |
+| `src/wfm.rs` `WfmLite` (polynomial atan2 discriminator, one 47-tap /4 audio filter, de-emphasis, RDS) | rx_dsp 22.5 |
+| for comparison: USB | rx_dsp 13 |
+| the FPGA DDC at 192 kS/s | ddc 0.9 |
+
+Mono only: the page gets 24 kHz mu-law (frame type 9), so the stereo
+decoder and the 15 kHz filters had nothing to give. The 12 kHz audio still
+feeds the S-meter, TCI and the decoders.
+
 ## 2026-10-04: three removals
 
 - The software DVB-S2 modem is gone: short frames, the software modulator

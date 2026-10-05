@@ -25,7 +25,7 @@ about 140 % of one core to receive and 40 % to transmit (measured
 | RX (decoder + FARGAN) | 12 % of a core | 4-7 % |
 | TX (features + encoder) | 2 % | 2 % |
 
-Board CPU with a page open (Libre 2): 21 % in DATA mode, 22 % in RADE.
+Board CPU with a page open (Libre 2): 21 % in USB-D, 22 % in RADE.
 
 Signal path:
 
@@ -44,7 +44,7 @@ Signal path:
   until the microphone queue is empty (at most 1.5 s, `MIC_DRAIN_MAX`), then
   unkeys. Without `drain` it would clear the queue and lose the EOO.
 
-The RADE button sets DATA mode (PKTUSB: no compressor or CESSB on TX), a
+The RADE button sets USB-D (PKTUSB: no compressor or CESSB on TX), a
 250-2750 Hz filter (wide enough for the frequency search below), slow AGC,
 and `{"cmd":"rade","on":true}`. trxd keeps
 the `rade` flag in the state, so every open page shows RADE and decodes;

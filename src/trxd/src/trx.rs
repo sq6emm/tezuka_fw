@@ -53,6 +53,14 @@ const CHAN_PASS_HZ: f64 = 12_000.0;
 /// passband FIR is the engine's biggest cost at 48 kHz (measured ~45 % of a
 /// Cortex-A9 core); here it is a quarter of that.
 const NARROW_RATE: f64 = 12_000.0;
+/// Wide FM's channel: +/-96 kHz holds a broadcast station's +/-75 kHz
+/// deviation and its 57 kHz RDS; the FPGA DDC makes it (3.072 MS/s / 16)
+/// with this passband (its last stage halves the rate, so under 96 kHz).
+const WFM_RATE: f64 = 192_000.0;
+const WFM_PASS_HZ: f64 = 85_000.0;
+/// How far the WFM channel reaches either side of the dial (retune keeps it
+/// inside the stream).
+const WFM_HALF_HZ: f64 = 100_000.0;
 
 /// Whether a mode demodulates at [`NARROW_RATE`].
 fn narrow_mode(m: Mode) -> bool {
@@ -256,6 +264,8 @@ pub struct Trx {
     /// FPGA and AD936x temperatures (web header).
     temps: std::sync::Arc<std::sync::Mutex<crate::temps::Temps>>,
     chan: Vec<Complex32>,
+    /// The channel's rate: CH_RATE, WFM_RATE in wide FM.
+    chan_rate: f64,
     /// DATV mode, DDC skipped: the fraction of a channel sample carried over.
     chan_frac: f64,
     /// The mode demodulates at 12 kHz (see [`NARROW_RATE`]).
@@ -351,6 +361,12 @@ pub struct Trx {
     /// Scope keeps the VFO in the middle (CTR) instead of a fixed view.
     scope_center: bool,
     web_audio: Vec<f32>,
+    /// WFM: the 48 kHz audio halved for the web (24 kHz, frame type 9).
+    dec24: RealFirDecim,
+    web_audio24: Vec<f32>,
+    /// The last RDS sent to the web (only changes go out).
+    rds_sent: Option<String>,
+    rds_freq: f64,
     web_state: Option<String>,
     web_state_at: Instant,
     web_meter_at: Instant,
@@ -518,6 +534,7 @@ impl Trx {
             agc_mode: AgcMode::Med,
             chan: Vec::new(),
             chan_frac: 0.0,
+            chan_rate: CH_RATE,
             narrow: false,
             dec4: Decimator::new(4),
             chan12: Vec::new(),
@@ -574,6 +591,10 @@ impl Trx {
             web_span: 96_000.0,
             web_center: 0.0,
             web_audio: Vec::new(),
+            dec24: RealFirDecim::new(63, 11_000.0, CH_RATE, 2),
+            web_audio24: Vec::new(),
+            rds_sent: None,
+            rds_freq: 0.0,
             web_state: None,
             web_state_at: Instant::now(),
             web_meter_at: Instant::now(),
@@ -717,7 +738,13 @@ impl Trx {
             let off = f - c;
             off.abs() < half - EDGE_MARGIN_HZ && off.abs() > EDGE_MARGIN_HZ
         };
-        let fits_all = |c: f64| fits(rx, c) && (self.tx_on.is_none() || fits(tx, c));
+        // Wide FM's channel reaches WFM_HALF_HZ either side of the dial.
+        let rx_half = if self.mode == Mode::Wfm { WFM_HALF_HZ } else { 0.0 };
+        let fits_rx = |c: f64| {
+            let off = rx - c;
+            off.abs() < half - EDGE_MARGIN_HZ - rx_half && off.abs() > EDGE_MARGIN_HZ
+        };
+        let fits_all = |c: f64| fits_rx(c) && (self.tx_on.is_none() || fits(tx, c));
         let datv = self.datv_lo_offset();
         if datv.is_none() && !force && self.lo_split.is_none() && fits_all(self.center) && clear(self.center) {
             self.apply_offsets();
@@ -935,10 +962,77 @@ impl Trx {
         self.tx_nco.set_freq(tx_off, self.rate);
     }
 
+    /// RDS from the wide-FM demodulator: the station name and RadioText to
+    /// the web when they change.
+    fn rds_poll(&mut self) {
+        // Another station: its RDS starts afresh.
+        let vfo = self.rx_vfo();
+        if (vfo - self.rds_freq).abs() > 1_000.0 {
+            self.rds_freq = vfo;
+            self.demod.reset_rds();
+            if self.rds_sent.take().is_some() {
+                if let Some(w) = &self.web {
+                    w.send_json(&serde_json::json!({ "type": "rds", "pi": null, "ps": null, "rt": null }));
+                }
+            }
+            return;
+        }
+        let Some(r) = self.demod.take_rds() else { return };
+        let msg = serde_json::json!({
+            "type": "rds",
+            "pi": r.pi.map(|p| format!("{p:04X}")),
+            "ps": r.ps.as_deref().map(str::trim_end),
+            "rt": r.radiotext.as_deref().map(str::trim_end),
+        });
+        let text = msg.to_string();
+        if self.rds_sent.as_deref() != Some(text.as_str()) {
+            if let Some(w) = &self.web {
+                w.send_json(&msg);
+            }
+            self.rds_sent = Some(text);
+        }
+    }
+
+    /// The channel for the mode: 48 kHz, or 192 kHz for wide FM (the FPGA
+    /// DDC reprogrammed, else the software DDC from the stream).
+    fn rebuild_channel(&mut self) {
+        let r = if self.mode == Mode::Wfm { WFM_RATE } else { CH_RATE };
+        if r == self.chan_rate {
+            return;
+        }
+        self.chan_rate = r;
+        self.ddc = Ddc::new(self.rate, r);
+        self.chan_meter = crate::power::PowerMeter::new(r, 0);
+        self.scope_narrow = Scope::new(2048, r, 15.0, 23.0);
+        if self.chan_fpga.is_some() {
+            let inverted = self.xvtr.as_ref().is_some_and(|t| t.inverted);
+            let off = self.rx_eff() - self.center;
+            // (the old one stops the recorder when dropped)
+            self.chan_fpga = None;
+            let pass = if r == WFM_RATE { WFM_PASS_HZ } else { CHAN_PASS_HZ };
+            match crate::dvbs2::fpga::FrontEnd::start_channel(r, pass, if inverted { -off } else { off }) {
+                Ok(fe) => self.chan_fpga = Some(fe),
+                Err(e) => info!("the {r} S/s channel on the ARM: {e}"),
+            }
+        }
+        self.rds_sent = None;
+        // The LO where the new channel fits (wide FM needs room either side).
+        self.retune(false);
+        self.apply_offsets();
+    }
+
     fn rebuild_demod(&mut self) {
+        self.rebuild_channel();
         let narrow = narrow_mode(self.mode);
+        // (wide FM: a 192 kHz channel, 48 kHz audio like the other wide modes)
         let rate = if narrow { NARROW_RATE } else { CH_RATE };
-        self.demod = make_demod(self.mode, rate).unwrap_or_else(|| make_demod(Mode::Usb, rate).unwrap());
+        let demod_rate = if narrow { NARROW_RATE } else { self.chan_rate };
+        self.demod = if self.mode == Mode::Wfm {
+            // (src/wfm.rs: sdroxide's PC demodulator took 90 % of an A9 core)
+            Box::new(crate::wfm::WfmLite::new(demod_rate))
+        } else {
+            make_demod(self.mode, demod_rate).unwrap_or_else(|| make_demod(Mode::Usb, rate).unwrap())
+        };
         self.demod.set_filter(self.filter.0, self.filter.1);
         if narrow != self.narrow {
             self.narrow = narrow;
@@ -1073,7 +1167,9 @@ impl Trx {
     /// while a browser is watching. `None`: anywhere will do.
     fn dc_keepout(&self) -> Option<(f64, f64)> {
         let watching = self.web.as_ref().is_some_and(|w| w.clients() > 0);
-        if !watching || self.web_span > DC_AVOID_SPAN_MAX || self.datv_lo_offset().is_some() {
+        // (Wide FM fills more than the narrow views; its channel has to stay
+        // near the LO, so the spike stays where it falls.)
+        if !watching || self.web_span > DC_AVOID_SPAN_MAX || self.datv_lo_offset().is_some() || self.mode == Mode::Wfm {
             return None;
         }
         let c = if self.web_center == 0.0 { self.rx_vfo() } else { self.web_center };
@@ -1424,7 +1520,7 @@ impl Trx {
         let margin = self.web_span * 0.05;
         let c = self.web_center;
         let covered = if self.web_span <= NARROW_SPAN_MAX {
-            (c - vfo).abs() + half <= CH_RATE * 0.45
+            (c - vfo).abs() + half <= self.chan_rate * 0.45
         } else if self.web_span <= STREAM_SPAN_MAX || self.maia.is_none() {
             (c - self.center).abs() + half <= self.rate / 2.0
         } else {
@@ -2000,6 +2096,9 @@ impl Trx {
             self.demod.process(&self.chan, &mut self.audio);
         }
         self.s_dbfs = self.demod.power_dbfs();
+        if self.mode == Mode::Wfm {
+            self.rds_poll();
+        }
         // Gain-compensated level for the S-meter, smoothed over ~0.3 s.
         // The AD936x AGC moves the gain on its own (read off the sample path).
         self.hw_gain_db = match &self.hw_gain {
@@ -2053,7 +2152,21 @@ impl Trx {
         // only as on the IC-705: its speed fit costs a third of a Cortex-A9
         // core and has nothing to read in the other modes.)
         if web_clients > 0 {
-            if self.squelch_open {
+            if self.mode == Mode::Wfm && !self.datv_mode {
+                // Wide FM: 24 kHz to the page (the 12 kHz audio still feeds
+                // the meter, TCI and the decoders).
+                let n = self.web_audio24.len();
+                self.dec24.process(&self.audio, &mut self.web_audio24);
+                if !self.squelch_open {
+                    self.web_audio24[n..].fill(0.0);
+                }
+                if self.web_audio24.len() >= 960 {
+                    if let Some(w) = &self.web {
+                        w.send_audio24(&self.web_audio24);
+                    }
+                    self.web_audio24.clear();
+                }
+            } else if self.squelch_open {
                 self.web_audio.extend_from_slice(&self.audio12);
             } else {
                 self.web_audio.resize(self.web_audio.len() + self.audio12.len(), 0.0);
@@ -2078,7 +2191,7 @@ impl Trx {
             let row = if span <= NARROW_SPAN_MAX {
                 self.scope_narrow
                     .process(&self.chan)
-                    .map(|r| scope::render(&r, vfo, CH_RATE, view, span))
+                    .map(|r| scope::render(&r, vfo, self.chan_rate, view, span))
             } else if let (true, Some(m)) = (span > STREAM_SPAN_MAX, &self.maia) {
                 let adc = self.cfg.radio.adc_rate as f64;
                 let got = m.try_iter().last();
@@ -2464,6 +2577,7 @@ impl Trx {
             "allow_tx": self.cfg.trx.allow_tx,
             "cw_engine": self.cwlive.engine(),
             "rade": self.rade,
+            "tx_ok": self.tx_check(self.tx_eff(), self.tx_half_bw()).is_ok(),
             "decoders": self.slots.iter().map(|(k, _)| match k {
                 DecoderKind::Q65 => "q65",
                 DecoderKind::Pi4 => "pi4",
@@ -3174,6 +3288,37 @@ mod tests {
         let l = log.lock().unwrap();
         let i = l.iter().position(|s| s == "rf on").expect("keyed");
         l[i + 1..].to_vec()
+    }
+
+    #[test]
+    fn wide_fm_takes_a_192k_channel_beside_the_lo() {
+        let (mut t, _log) = trx(100_000_000.0);
+        t.set_mode(Mode::Wfm);
+        assert_eq!(t.chan_rate, WFM_RATE);
+        // The whole channel inside the stream.
+        let off = (t.rx_eff() - t.center).abs();
+        assert!(off + WFM_HALF_HZ < t.rate / 2.0, "offset {off}");
+        // Broadcast FM is receive only.
+        assert!(t.tx_check(t.tx_eff(), t.tx_half_bw()).is_err());
+        // A 1 kHz tone at +/-75 kHz deviation comes out as 48 kHz audio at 1 kHz.
+        let n = 192_000;
+        let mut ph = 0.0f64;
+        let iq: Vec<Complex32> = (0..n)
+            .map(|i| {
+                ph += std::f64::consts::TAU * 75_000.0 * (std::f64::consts::TAU * 1_000.0 * i as f64 / WFM_RATE).sin() / WFM_RATE;
+                Complex32::new(ph.cos() as f32, ph.sin() as f32)
+            })
+            .collect();
+        let mut audio = Vec::new();
+        t.demod.process(&iq, &mut audio);
+        // (less the start-up of the 383-tap decimating filters)
+        assert!((audio.len() as i64 - (n / 4) as i64).abs() < 256, "{} samples", audio.len());
+        let tail = &audio[audio.len() / 2..];
+        let crossings = tail.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count() as f64;
+        let hz = crossings * CH_RATE / tail.len() as f64;
+        assert!((hz - 1_000.0).abs() < 20.0, "{hz} Hz");
+        t.set_mode(Mode::Usb);
+        assert_eq!(t.chan_rate, CH_RATE);
     }
 
     #[test]
