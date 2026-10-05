@@ -7,11 +7,8 @@
 //! `--sim` swaps the AD936x for the simulated radio (run it on a PC);
 //! `--check` parses the config, prints it, and exits.
 
-mod rscw;
-mod rsnn;
 mod fpgamode;
 #[cfg(target_os = "linux")]
-mod rsnn_fpga;
 mod beacon;
 mod config;
 mod calib;
@@ -106,17 +103,6 @@ fn main() -> ExitCode {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => {
                         eprintln!("trxd --fit-data: {e}");
-                        ExitCode::FAILURE
-                    }
-                };
-            }
-            "--pack-rsnn" => {
-                let (Some(i), Some(o)) = (args.next(), args.next()) else { usage() };
-                let r = std::fs::read(&i).map_err(|e| e.to_string()).and_then(|b| rsnn::pack_rsq3(&b)).and_then(|q| std::fs::write(&o, q).map_err(|e| e.to_string()));
-                return match r {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        eprintln!("trxd --pack-rsnn: {e}");
                         ExitCode::FAILURE
                     }
                 };

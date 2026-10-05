@@ -20,8 +20,7 @@ SQTRX as a narrowband transceiver, nothing else:
   WSJT-X, JTDX, MSHV and others; the web UI with microphone and speaker
   in the browser.
 * Decoders on the board: Q65 and PI4 slot decoders, the live CW box
-  (timing decoder; CW-RS rain-scatter decoder; DeepCW where the model is
-  installed).
+  (timing decoder).
 * Receive level in dBm, the same in every mode and filter, with the
   per-board calibration (docs/DBM.md).
 * Transverters, antenna socket mapping, GPS / reference disciplining
@@ -36,7 +35,7 @@ Everything in BASIC, plus amateur television (docs/DATV.md):
 * DVB-S2 transmit and receive (long frames with pilots: QPSK 1/2,
   QPSK 3/4, 8PSK 3/4 at 33 to 500 kS/s, automatic receive), and DVB-T2
   (1.7 MHz standard profile; 2.0 and 1.35 MHz non-standard), from and to
-  the browser's camera and microphone (H.264 video, Opus audio).
+  the browser's camera and microphone (H.264 video, AAC-LC audio).
 * The receiver runs in the FPGA (DDC, timing, frame handling, LDPC):
   the ARM stays free for the rest.
 * A second FPGA bitstream for DATV: the board switches to it when DATV

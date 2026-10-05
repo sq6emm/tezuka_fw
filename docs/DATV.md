@@ -9,17 +9,20 @@ unchanged. Target: reliable, narrow links (terrestrial, 23 cm), not picture qual
 
 ```text
 TX  browser: camera -> OffscreenCanvas (4:3 crop) -> VideoEncoder H.264 (Constrained Baseline, Annex B)
-             mic -> mono -> AudioEncoder Opus (20 ms)
+             mic -> mono -> AudioEncoder Opus (20 ms, 32 kbit/s: the uplink only)
              -> WebSocket [4][key][i64 us][H.264] / [5][i64 us][Opus]
-    trxd:    dvbs2::ts::Mux (MPEG-TS, constant rate, pulled by the modulator)
+    trxd:    dvbs2::aac::Transcoder (Opus -> PCM -> 8-24 kHz -> AAC-LC, static
+             libavcodec, package/ffmpeg-aac)
+             -> dvbs2::ts::Mux (MPEG-TS, constant rate, pulled by the modulator)
              -> dvbs2::Modulator (BBFRAME, BB scrambling, BCH, LDPC, QPSK, PLFRAME,
                 pilots, PL scrambling, RRC 0.35) -> TX NCO -> DAC
 
 RX  trxd:    stream IQ -> dvbs2::rx::RxThread (own thread): NCO + RRC matched filter
              (2-3 samples/symbol) -> Gardner timing -> PLHEADER sync -> carrier (averaged
              acquisition, pilot tracking) -> LLRs -> LDPC (layered BP) -> BBFRAME -> TS
-             -> dvbs2::ts::Demux (PAT/PMT/PES) -> WebSocket [6][key][i64 us][H.264] / [7][i64 us][Opus]
-    browser: VideoDecoder -> canvas, AudioDecoder -> AudioContext (short jitter buffer)
+             -> dvbs2::ts::Demux (PAT/PMT/PES) -> WebSocket [6][key][i64 us][H.264] /
+             [12][i64 us][ADTS AAC] (or [7][i64 us][Opus] from older streams)
+    browser: VideoDecoder -> canvas, AudioDecoder (mp4a.40.2) -> AudioContext (short jitter buffer)
 ```
 
 A/V in the browser: the sound plays back to back from a short adaptive lead
@@ -55,15 +58,18 @@ QPSK, short FECFRAMEs, CCM, roll-off 0.35, pilots on (the receiver needs them).
 Symbol rates are those with whole samples per symbol at 384 kS/s: 32, 48, 64,
 96 and 128 kS/s. Occupied bandwidth is 1.35 x the symbol rate.
 
-| Symbol rate, code rate | TS kbit/s | Profile (board picks it from the TS rate) |
-|---|---|---|
-| 64 kS/s, 1/4 | 22.9 | 160x120, 2 fps, video ~6 k, Opus 6 k in 800 ms PES, PSI every 1 s |
-| 32 kS/s, 1/2 | 26.6 | same |
-| 64 kS/s, 1/2 | 53.2 | 320x240, 5 fps, video ~24.5 k, Opus 12 k in 200 ms PES |
-| 128 kS/s, 2/3 | 161.4 | 320x240, 10 fps, video ~104 k, Opus 16 k |
+| TS kbit/s | Profile (the board picks it from the TS rate; audio AAC-LC since 2026-10-05) |
+|---|---|
+| below 33 (33 kS/s QPSK 1/4 and 1/2) | 160x120, 2 fps, video ~2.5-6.5 k, AAC 8 k at 8 kHz in 768 ms PES, PSI every 1 s |
+| 33-45 | same, AAC 12 k at 12 kHz in 768 ms PES |
+| 45-80 | 320x240, 5 fps, video ~5-30 k, AAC 12 k at 12 kHz in 427 ms PES |
+| 80-200 | 320x240, 10 fps, video ~46-118 k, AAC 16 k at 16 kHz |
+| 200 and up | 640x480, 10 fps, video ~139 k and up, AAC 24 k at 24 kHz |
 
-At these rates the 188-byte TS packet is the unit of cost: one 20 ms Opus frame
-per PES would cost 50 packets a second. The mux packs audio into long PES and
+At these rates the 188-byte TS packet is the unit of cost: one AAC frame per
+PES would cost 8-23 packets a second. AAC-LC needs more bits than Opus at the
+lowest rates (Opus managed 6 k), so the picture there has less (the user's
+choice: AAC everywhere, 8-12 k below 80 kbit/s). The mux packs audio into long PES and
 stamps PCRs exactly when the modulator pulls a packet.
 
 Repetition follows ISO/IEC 13818-1 and ETSI TR 101 290 (since 2026-09-30):
@@ -149,11 +155,19 @@ The receiver (`rx.rs`, `ts::Demux`):
   packet is ignored as 13818-1 allows; PTS are unwrapped over the 33-bit
   wrap.
 
-Opus is not a
-DVB broadcast codec (TS 101 154): TVs and set-top boxes show the picture
-without sound; players and DATV receivers decode it.
-Opus in TS follows ffmpeg (registration descriptor "Opus", control header per
-access unit); ffprobe, ffmpeg and VLC read it.
+Audio is AAC-LC in ADTS (stream type 0x0F, stream id 0xC0), mono, as DVB
+receivers, TVs and set-top boxes decode it (TS 101 154); ffprobe reads it as
+`aac, LC`. The browser still sends Opus (WebCodecs has no AAC encoder on
+Linux or in Firefox; Opus keeps a remote uplink small), and the board
+transcodes: ffmpeg's Opus decoder and AAC encoder, static, about 0.6 MB in
+trxd; under 3.5 % of an A9 core (the whole transmit stage at 33 kS/s). The
+receiver still plays Opus streams from older transmitters (stream type 0x06
+with the "Opus" registration descriptor).
+
+Over the air 2026-10-05 (Libre 2 -> Libre 1, 2330 MHz): 33 kS/s QPSK 1/2
+52/52 frames, 250 kS/s QPSK 1/2 392/394, 500 kS/s 8PSK 3/4 1223/1225, DVB-T2
+1.7 MHz QPSK 1/2 4833/4851; every AAC frame decoded and played, A/V sync
+-1 to +5 ms.
 
 ## Verified (2026-09-26, on power)
 

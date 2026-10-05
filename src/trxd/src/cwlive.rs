@@ -146,9 +146,6 @@ pub struct CwLive {
     /// Text committed since the last [`CwLive::take_committed`].
     fresh: String,
     dirty: bool,
-    /// The rain-scatter decoder, when that is the engine ([`crate::rscw`]).
-    rs: Option<crate::rscw::RsNnStream>,
-    rate: f64,
     band: (f32, f32),
 }
 
@@ -164,7 +161,7 @@ pub struct Readout {
 impl CwLive {
     /// `rate`: the audio rate; `pitch_hz`: where the CW tone sits in it.
     /// The classic timing decoder reads the text (a character as soon as it
-    /// is complete, a few % of a core); the rain-scatter engine when asked.
+    /// is complete, a few % of a core).
     pub fn new(rate: f64, pitch_hz: f32) -> Self {
         CwLive {
             rx: CwRx::new(rate, pitch_hz),
@@ -174,31 +171,8 @@ impl CwLive {
             pending: String::new(),
             fresh: String::new(),
             dirty: false,
-            rs: None,
-            rate,
             band: (300.0, 2700.0),
         }
-    }
-
-    /// The rain-scatter decoder on or off (the timing decoder again when off).
-    pub fn set_rs(&mut self, on: bool) {
-        if on == self.rs.is_some() {
-            return;
-        }
-        if on {
-            let mut r = crate::rscw::RsNnStream::new(self.rate as f32);
-            r.set_band(self.band.0, self.band.1);
-            self.rs = Some(r);
-        } else {
-            self.rs = None;
-        }
-        self.pending.clear();
-        self.dirty = true;
-    }
-
-    /// "rs" or "timing".
-    pub fn engine(&self) -> &'static str {
-        if self.rs.is_some() { "rs" } else { "timing" }
     }
 
     /// The CW filter's audio passband: where the finder looks.
@@ -206,21 +180,10 @@ impl CwLive {
         let (lo, hi) = if lo.is_finite() && hi.is_finite() { (lo, hi) } else { (300.0, 2700.0) };
         self.finder.band = (lo.min(hi), lo.max(hi));
         self.band = self.finder.band;
-        if let Some(r) = self.rs.as_mut() {
-            r.set_band(self.band.0, self.band.1);
-        }
     }
 
     /// Feed demodulated audio (not while transmitting: we would copy ourselves).
     pub fn process(&mut self, audio: &[f32]) {
-        if let Some(r) = self.rs.as_mut() {
-            r.process(audio);
-            let t = r.take();
-            if !t.is_empty() {
-                self.append(&t);
-            }
-            return;
-        }
         if let Some(tone) = self.finder.push(audio) {
             if !self.rx.locked() && (tone - self.rx.tone_hz()).abs() > FIND_AFC_HZ {
                 self.rx.set_pitch(tone);
@@ -274,9 +237,6 @@ impl CwLive {
     }
 
     pub fn readout(&self) -> Readout {
-        if let Some(r) = &self.rs {
-            return Readout { tone_hz: (self.band.0 + self.band.1) / 2.0, wpm: r.wpm(), snr_db: 0.0, locked: !r.text.is_empty() };
-        }
         Readout { tone_hz: self.rx.tone_hz(), wpm: self.rx.wpm(), snr_db: self.rx.snr_db(), locked: self.rx.locked() }
     }
 
@@ -306,7 +266,6 @@ enum Msg {
     Restart,
     Flush,
     Clear,
-    Rs(bool),
     Band(f32, f32),
 }
 
@@ -318,7 +277,6 @@ struct Shared {
     pending: String,
     committed: String,
     readout: Option<Readout>,
-    engine: &'static str,
 }
 
 /// [`CwLive`] on its own thread, off the sample path: the engine hands over
@@ -339,8 +297,7 @@ pub struct CwLiveThread {
 }
 
 impl CwLiveThread {
-    /// `engine`: "timing" or "rs" (rain scatter).
-    pub fn start(rate: f64, pitch_hz: f32, engine: &str) -> Self {
+    pub fn start(rate: f64, pitch_hz: f32) -> Self {
         // 5 s of 10 ms blocks: a busy moment on the CPU must not cost audio.
         let (tx, rx) = bounded::<Msg>(512);
         let (ctl, ctl_rx) = crossbeam_channel::unbounded::<Msg>();
@@ -357,9 +314,6 @@ impl CwLiveThread {
                 run(CwLive::new(rate, pitch_hz), rx, ctl_rx, sh)
             })
             .expect("spawn cw-live");
-        if engine == "rs" {
-            let _ = ctl.send(Msg::Rs(true));
-        }
         CwLiveThread { tx, ctl, gone: false, shared, seen: 0, warned: false, band: None }
     }
 
@@ -392,14 +346,6 @@ impl CwLiveThread {
     }
     pub fn clear(&self) {
         let _ = self.ctl.send(Msg::Clear);
-    }
-    /// "rs" (rain scatter) or anything else (timing).
-    pub fn set_engine(&self, engine: &str) {
-        let _ = self.ctl.send(Msg::Rs(engine == "rs"));
-    }
-    pub fn engine(&self) -> &'static str {
-        let e = self.shared.lock().unwrap().engine;
-        if e.is_empty() { "timing" } else { e }
     }
     /// The CW filter passband (audio Hz); sent on only when it changed.
     pub fn set_band(&mut self, lo: f32, hi: f32) {
@@ -436,7 +382,6 @@ fn handle(c: &mut CwLive, m: Msg) {
         Msg::Restart => c.restart(),
         Msg::Flush => c.flush(),
         Msg::Clear => c.clear(),
-        Msg::Rs(on) => c.set_rs(on),
         Msg::Band(lo, hi) => c.set_band(lo, hi),
     }
 }
@@ -464,7 +409,6 @@ fn run(mut c: CwLive, rx: Receiver<Msg>, ctl: Receiver<Msg>, shared: Arc<Mutex<S
         n = n.wrapping_add(1);
         let changed = c.poll();
         let mut s = shared.lock().unwrap();
-        s.engine = c.engine();
         if n % 8 == 0 {
             s.readout = Some(c.readout());
         }
@@ -506,16 +450,22 @@ mod tests {
 
     #[test]
     fn control_is_not_dropped_when_audio_is_full() {
-        let mut t = CwLiveThread::start(12_000.0, 600.0, "timing");
+        let mut t = CwLiveThread::start(12_000.0, 600.0);
         for _ in 0..2000 {
             t.audio(&[0.0; 4800]);
         }
-        t.set_engine("rs");
+        // A clear while the audio queue is full still gets through.
+        {
+            let mut s = t.shared.lock().unwrap();
+            s.text = "XYZ".into();
+            s.version += 1;
+        }
+        t.clear();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while t.engine() != "rs" && std::time::Instant::now() < deadline {
+        while t.shared.lock().unwrap().text == "XYZ" && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert_eq!(t.engine(), "rs");
+        assert_ne!(t.shared.lock().unwrap().text, "XYZ");
     }
 
     /// The timing decoder alone (tests carry no DeepCW model).

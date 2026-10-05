@@ -137,8 +137,9 @@ profile and `top`.
 The DATV modems are off the A9 (docs/DATV-FPGA.md, docs/DVBT2.md): the
 demodulators, LDPC, BCH and descrambling, the T2 cell router and reports
 run in the fabric; the ARM keeps the carrier fit from per-block sums,
-the TS demux and the page. The CW-RS network's front end and temporal
-layers are in the trx bitstream (docs/RSCW.md). What the engine still
+the TS demux and the page. (The CW-RS network's front end and temporal
+layers were in the trx bitstream until they were removed on 2026-10-05.)
+What the engine still
 spends with a page open is the radio itself: the channel DDC, the SSB
 chain at 12 kHz, the scope FFTs, and a transmit stage that kept making
 zero blocks while idle.

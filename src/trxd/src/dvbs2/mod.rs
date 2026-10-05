@@ -16,6 +16,7 @@
 pub mod ddc;
 pub mod fpga;
 pub mod fpga_tx;
+pub mod aac;
 pub mod bch;
 pub mod fpga_ldpc;
 pub mod hdrdet;

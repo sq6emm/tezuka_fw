@@ -392,7 +392,7 @@ pub fn measure_carrier(audio: &[f32], expect_hz: f64, search_hz: f64) -> Option<
 /// The CW mark band's envelope in frames of this length (3.2 kHz audio).
 const KEY_FRAME: usize = 32;
 const KEY_FRAME_S: f32 = KEY_FRAME as f32 / 3_200.0;
-/// A Morse rhythm fit ([`crate::rscw::morse_fit`]) at least this good over
+/// A Morse rhythm fit ([`crate::morse::morse_fit`]) at least this good over
 /// a 4 s window lets the window through to DeepCW.
 const CW_MORSE_MIN: f32 = 0.65;
 /// ...in this many windows in a row (1 s apart: 7 s of Morse).
@@ -427,7 +427,7 @@ fn keying(p: &[f32]) -> Option<Vec<bool>> {
 /// The mark-band audio of the minute's Morse-keyed stretches only (the rest
 /// silenced), or None if there is none: the digital minutes' tones and the
 /// carrier reach the CW decoder no more. A 4 s window is Morse when its
-/// keying fits Morse timing ([`crate::rscw::morse_fit`], 9-43 WPM), and it
+/// keying fits Morse timing ([`crate::morse::morse_fit`], 9-43 WPM), and it
 /// counts only within [`CW_MORSE_RUN`] such windows in a row: PI4's
 /// 166 ms tones in the mark band fit now and then, never for long.
 pub fn cw_audio(audio_3k2: &[f32]) -> Option<Vec<f32>> {
@@ -436,7 +436,7 @@ pub fn cw_audio(audio_3k2: &[f32]) -> Option<Vec<f32>> {
     let hop = win / 4;
     let starts: Vec<usize> = (0..).map(|i| i * hop).take_while(|s| s + win <= keyed.len()).collect();
     let pass: Vec<bool> =
-        starts.iter().map(|&s| crate::rscw::morse_fit(&keyed[s..s + win], KEY_FRAME_S) >= CW_MORSE_MIN).collect();
+        starts.iter().map(|&s| crate::morse::morse_fit(&keyed[s..s + win], KEY_FRAME_S) >= CW_MORSE_MIN).collect();
     let mut keep = vec![false; keyed.len()];
     let mut i = 0;
     while i < pass.len() {

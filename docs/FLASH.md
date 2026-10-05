@@ -24,7 +24,7 @@ environment has no A/B scripts therefore still boots slot A.
 |---|---|
 | Kernel, `Image.lzma` | ~4.6 MB |
 | Bitstream (LibreSDR: the `trx` mode's), gzip | ~0.7 MB |
-| Rootfs, xz with the ARM filter (trxd ~2.6 MB with the web UI and the CW-RS network; the `datv` bitstream 1.1 MB) | ~6.5 MB |
+| Rootfs, xz with the ARM filter (trxd ~2.5 MB with the web UI; the mode bitstreams) | ~6.5 MB |
 | **FIT total** | **must be ≤ 12.25 MB**; the build fails if not. LibreSDR 2026-09-29: 11.85 MB (990 KB free) |
 
 This fits because of three cuts:
@@ -33,7 +33,8 @@ This fits because of three cuts:
 - **Rootfs:** trimmed of Wi-Fi drivers and firmware, DRM, the Fortran/OpenMP/C++ runtimes, CA certificates, libiio/iiod and the gpsd client tools.
 
 2026-09-29, 730 KB more without dropping anything (FPGA mode bitstreams and
-the larger CW-RS network had left 265 KB):
+the larger CW-RS network had left 265 KB; the network was removed on
+2026-10-05):
 - the rootfs compressed again with xz's ARM branch filter
   (`postimage-qspi.sh`; the kernel's XZ decoder has it): 250 KB;
 - trxd with fat LTO and one codegen unit: 110 KB (and a little faster);

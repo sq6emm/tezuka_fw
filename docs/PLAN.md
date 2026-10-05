@@ -48,7 +48,7 @@ mass-storage `config.txt` style path is `/etc/trxd.toml`):
   * **TCI server** (WebSocket, port 40001): CAT + RX audio + TX audio + IQ.
   * **rigctld server** (TCP 4532, Hamlib `rigctl -m 2` compatible).
   * **Decoders** (on-board, results to the web UI and TCI `spot:`):
-    Q65-60A..E and PI4 (slot decoders), the live CW box (timing decoder, CW-RS).
+    Q65-60A..E and PI4 (slot decoders), the live CW box (timing decoder).
     FT8 is left to WSJT-X on the PC; DeepCW was removed (docs/PERFORMANCE.md).
 * `role = "beacon-tx"` — GPS/NTP-timed MGM beacon:
   even minute digital mode (PI4 / Q65-60x) + carrier, odd minute CW + carrier
@@ -99,7 +99,8 @@ boots roll back. Host side: `tools/fw-push.sh <ip> build/<board>.zip`.
 3. trxd core: IIO, DSP, rigctld, TCI, simulated radio (MQTT removed 2026-10-01). **Done** (host-tested).
 4. Decoders: FT8, Q65-60A..E, PI4, DeepCW skimmer. **Done**, then the skimmer
    and DeepCW itself removed (2026-10-04: too heavy for the A9; the live CW
-   box reads with the timing decoder or the CW-RS network in the FPGA).
+   box reads with the timing decoder; the CW-RS rain-scatter network was
+   removed 2026-10-05, a separate CW decoder project carries it on).
 5. Beacon TX / RX roles. **Done** (TX->RX loopback tests for Q65, PI4, CW, carrier).
 6. Reference disciplining: FPGA `refmeter` (1PPS / chrony), `xo_correction`. **Done**.
 7. Buildroot package, init scripts, A/B network updates. **Done**; image build in progress.

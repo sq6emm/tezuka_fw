@@ -1,2 +1,3 @@
 source "$BR2_EXTERNAL_PLUTOSDR_PATH/package/board-fpga/Config.in"
 source "$BR2_EXTERNAL_PLUTOSDR_PATH/package/trxd/Config.in"
+source "$BR2_EXTERNAL_PLUTOSDR_PATH/package/ffmpeg-aac/Config.in"

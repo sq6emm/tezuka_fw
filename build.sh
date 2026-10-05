@@ -162,6 +162,14 @@ build_board() {
             rm -f "${fpga_build}"/.stamp_built "${fpga_build}"/.stamp_installed "${fpga_build}"/.stamp_target_installed "${fpga_build}"/.stamp_staging_installed "${fpga_build}"/.stamp_extracted "${fpga_build}"/.stamp_rsynced
         fi
     done
+    # And for the kernel's device trees (custom DTS files from the tree):
+    # a newer .dts/.dtsi than the kernel's last build rebuilds it (only the
+    # device trees change; make does the rest incrementally).
+    local linux_build="${output_dir}/build/linux-custom"
+    if [ -f "${linux_build}/.stamp_built" ] && [ -n "$(find "${SCRIPT_DIR}/board/tezuka/${HW[$board]:-$board}/dts" -name '*.dts*' -newer "${linux_build}/.stamp_built" -print -quit 2>/dev/null)" ]; then
+        echo "    a device tree changed since the kernel's last build: rebuilding linux"
+        rm -f "${linux_build}"/.stamp_built "${linux_build}"/.stamp_installed "${linux_build}"/.stamp_target_installed "${linux_build}"/.stamp_images_installed
+    fi
     # shellcheck disable=SC2086
     make -C "${BUILDROOT_DIR}" O="${output_dir}" ${JOBS}
 

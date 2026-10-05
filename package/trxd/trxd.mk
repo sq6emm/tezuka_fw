@@ -23,7 +23,11 @@ TRXD_CARGO_ENV = \
 	CC_armv7_unknown_linux_gnueabihf="$(TARGET_CC)" \
 	CXX_armv7_unknown_linux_gnueabihf="$(TARGET_CXX)" \
 	AR_armv7_unknown_linux_gnueabihf="$(TARGET_AR)" \
-	RUSTFLAGS="-C target-cpu=cortex-a9 -C target-feature=+neon"
+	RUSTFLAGS="-C target-cpu=cortex-a9 -C target-feature=+neon" \
+	FFMPEG_AAC_DIR="$(STAGING_DIR)/usr"
+
+# DATV audio: the browser's Opus to AAC-LC (src/dvbs2/aacx.c, static ffmpeg).
+TRXD_DEPENDENCIES = ffmpeg-aac
 
 # Built from the tree itself (src/trxd), not Buildroot's rsynced copy, so
 # that relative paths in Cargo.toml (the temporary sdroxide [patch]) and the

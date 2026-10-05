@@ -26,7 +26,7 @@ allow_tx = true
 max_tx_seconds = 180
 decoders = []           # started at boot: q65 | pi4 (web UI toggles them; CW always runs)
 q65_submode = "D"
-cw_engine = "timing"    # live CW box: timing (instant, light) | rs (rain scatter: the CW-RS network, FPGA)
+cw_engine = "timing"    # ignored: the live CW box has the timing decoder only
 t2_drive_db = 0.0       # DVB-T2 TX level against the default (+3: about 3 dB more on air, more peaks clipped)
 
 

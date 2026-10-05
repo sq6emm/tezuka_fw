@@ -37,6 +37,9 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 getrandom = "0.3"
 
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 tempfile = "3"
 

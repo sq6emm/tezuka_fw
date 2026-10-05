@@ -1,0 +1,8 @@
+config BR2_PACKAGE_FFMPEG_AAC
+	bool "ffmpeg-aac"
+	help
+	  A minimal static libavcodec + libavutil for trxd's DATV audio:
+	  the Opus decoder and the AAC-LC encoder only (the browser sends
+	  Opus, the transport stream carries AAC-LC in ADTS, as DVB
+	  receivers expect). No programs, no shared libraries: only the
+	  code trxd calls ends up in the image. LGPL-2.1+.

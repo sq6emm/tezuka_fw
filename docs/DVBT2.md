@@ -20,7 +20,7 @@ browser capture and TS mux as DVB-S2 feed it.
 ## How it is built
 
 ```text
-browser H.264/Opus -> dvbs2::ts::Mux (TS at the T2 rate)
+browser H.264/Opus -> AAC-LC on the board -> dvbs2::ts::Mux (TS at the T2 rate)
   -> dvbt2-tx thread: Modulator (src/dvbt2): BBFRAME (dvbs2::Framer), BB
      scrambling, BCH, LDPC (the DVB-S2 normal codes), QPSK cells, cell and
      time interleaving, frame builder with L1-pre/post, frequency

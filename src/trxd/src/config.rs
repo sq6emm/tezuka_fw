@@ -195,9 +195,9 @@ pub struct TrxConfig {
     pub cw_slots: u8,
     /// Ignored, as `cw_slots`.
     pub cw_squelch_db: i16,
-    /// Live CW box engine: "timing" (classic, a character as soon as it is
-    /// keyed, a few % CPU) or "neural" (DeepCW: copies weaker signals, but two
-    /// Cortex-A9 cores cannot run it in real time). The web UI switches it.
+    /// Ignored: the live CW box has one engine, the timing decoder (DeepCW
+    /// and the rain-scatter network were removed); kept so that old
+    /// trxd.toml files still load.
     pub cw_engine: String,
     /// CW keyer speed for `KY`/`send_morse` from rigctl.
     pub cw_wpm: u8,

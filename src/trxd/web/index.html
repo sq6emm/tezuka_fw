@@ -327,7 +327,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <h3>MODE · FILTER · DSP</h3>
       <div class="row" id="modes">
         <button class="k" data-mode="USB">USB</button>
-        <button class="k" data-mode="CW">CW</button><button class="k" data-mode="CWRS" title="CW through rain scatter (10 GHz and up): the rain-scatter decoder, the filter open to 200-3000 Hz so the whole Doppler spread gets in, AGC slow">CW-RS</button><button class="k" data-mode="PKTUSB" title="USB data: the USB passband without the compressor (CESSB), for digital modes; rigctld and TCI call it PKTUSB / digu">USB-D</button><button class="k" data-mode="RADE" title="FreeDV RADE V2 digital voice (pre-release waveform, not for regular on-air use yet): decoded and encoded in this browser; USB-D with a 250-2750 Hz filter">RADE</button>
+        <button class="k" data-mode="CW">CW</button><button class="k" data-mode="PKTUSB" title="USB data: the USB passband without the compressor (CESSB), for digital modes; rigctld and TCI call it PKTUSB / digu">USB-D</button><button class="k" data-mode="RADE" title="FreeDV RADE V2 digital voice (pre-release waveform, not for regular on-air use yet): decoded and encoded in this browser; USB-D with a 250-2750 Hz filter">RADE</button>
         <button class="k" data-mode="AM">AM</button><button class="k" data-mode="FM">FM</button><button class="k" data-mode="WFM" title="Wide FM (broadcast, 87.5-108 MHz): mono, 24 kHz audio to this browser, RDS station name and text">WFM</button>
         <button class="k" data-mode="DATV" title="Digital TV: DVB-S2 from this browser's camera, and received pictures">DATV</button>
       </div>
@@ -408,7 +408,6 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <div class="slider voice-only cw-only">BK-IN<input type="range" id="hang" min="50" max="2000" step="50" value="400"><b id="hang-v">400 ms</b></div>
       <h3 class="voice-only cw-only">CW <span class="note">live copy in CW mode: click the signal to put it on the pitch</span>
         <span id="cw-read"></span> <button class="k" id="cw-clear" style="float:right;padding:0 8px;font-size:11px;min-width:0">CLEAR</button>
-        <button class="k" id="cw-rs" title="Rain-scatter decoder: collects a Doppler-spread CW signal anywhere in the CW filter (open the filter to 2-3 kHz). Off: the classic decoder on the pitch." style="float:right;padding:0 8px;font-size:11px;min-width:0;margin-right:4px">RS</button>
 </h3>
       <div id="cwbox" class="voice-only cw-only"><span id="cw-text"></span><span class="pend" id="cw-pend"></span></div>
       <h3 class="voice-only data-only">DECODES <span class="note">switch on what you need: each costs CPU on the board</span></h3>
@@ -509,7 +508,6 @@ const FILTERS = {
   LSB: [[-3000, -100], [-2850, -150], [-2400, -300]],
   PKTUSB: [[100, 3100], [200, 2900], [500, 2500]],
   CW: [[200, 1200], [450, 950], [600, 800]],
-  CWRS: [[200, 3000], [200, 3000], [200, 3000]],
   AM: [[-5000, 5000], [-3000, 3000], [-2000, 2000]],
   FM: [[-8000, 8000], [-5000, 5000], [-3000, 3000]],
   WFM: [[-96000, 96000], [-96000, 96000], [-96000, 96000]],
@@ -568,7 +566,9 @@ function onBinary(buf) {
   } else if (u8[0] === 6) {
     DATV.rxVideo(u8);
   } else if (u8[0] === 7) {
-    DATV.rxAudio(u8);
+    DATV.rxAudio(u8, "opus");
+  } else if (u8[0] === 12) {
+    DATV.rxAudio(u8, "aac");
   } else if (u8[0] === 8) {
     DATV.rxConst(u8);
   }
@@ -591,7 +591,7 @@ function onJson(m) {
 // The FPGA bitstream switch: trxd loads the image a feature needs and
 // restarts (the page reconnects on its own); say so meanwhile.
 const FPGA = (() => {
-  const names = { datv: "DATV (DVB-S2/T2)", trx: "voice, CW and the CW-RS network", all: "everything" };
+  const names = { datv: "DATV (DVB-S2/T2)", trx: "voice and CW", all: "everything" };
   let at = 0, epoch = -1, timer = null;
   const b = () => $("fpgabanner");
   function text() {
@@ -815,11 +815,10 @@ function renderState() {
   $("freq-b").textContent = fmtFreq(st.active === "B" ? st.vfo_a : st.vfo_b);
   const txf = (st.split ? (st.active === "B" ? st.vfo_a : st.vfo_b) : curFreq()) + (st.xit && st.xit[0] ? st.xit[1] : 0);
   $("freq-tx").textContent = fmtFreq(txf);
-  const shown = st.datv_mode ? "DATV" : st.rade ? "RADE" : st.mode === "CW" && st.cw_engine === "rs" ? "CWRS" : st.mode;
+  const shown = st.datv_mode ? "DATV" : st.rade ? "RADE" : st.mode;
   document.querySelectorAll("#modes .k").forEach((b) => b.classList.toggle("on", b.dataset.mode === shown));
   document.querySelectorAll("#agcs .k").forEach((b) => b.classList.toggle("on", b.dataset.agc === st.agc));
   $("split").classList.toggle("on", st.split);
-  $("cw-rs").classList.toggle("on", st.cw_engine === "rs");
   renderFilter(st);
   buildBands(st.xvtrs || []);
   const bnow = bandOf(curFreq(), st.xvtrs);
@@ -1527,16 +1526,7 @@ function buildStatic() {
     const b = e.target.closest("[data-mode]"); if (!b) return;
     const m = b.dataset.mode;
     if (m === "DATV") { if (!audioUserOff) audioStart().catch(() => {}); DATV.enter(); return; }
-    // CW-RS: CW with the rain-scatter decoder, a wide filter and slow AGC
-    // (its filter kept apart from CW's, as FIL "CWRS").
-    if (m === "CWRS") {
-      send({ cmd: "mode", mode: "CW" });
-      send({ cmd: "cw_engine", engine: "rs" });
-      send({ cmd: "agc", mode: "slow" });
-      const [lo, hi] = filPreset("CWRS", 0); send({ cmd: "filter", lo, hi });
-      return;
-    }
-    // RADE: DATA mode (no compressor on TX), the browsers' decoder on
+    // RADE: USB-D (no compressor on TX), the browsers' decoder on
     // (src/rade.rs), and a filter wide enough for its 1060-1940 Hz signal up
     // to 600 Hz off frequency with flat noise beside it: the worker's coarse
     // frequency search must not take the filter's edge for the signal's.
@@ -1548,7 +1538,6 @@ function buildStatic() {
       send({ cmd: "rade", on: true });
       return;
     }
-    if (m === "CW" && S.st && S.st.cw_engine === "rs") send({ cmd: "cw_engine", engine: "timing" });
     if (m === "PKTUSB" && S.st && S.st.rade) send({ cmd: "rade", on: false });
     send({ cmd: "mode", mode: m });   // (also leaves DATV mode)
     if (!S.filIdx) S.filIdx = store.get("filidx", {});
@@ -1674,7 +1663,6 @@ $("datv-sound").onclick = () => { audioUserOff = false; audioStart().then(() => 
   $("cwtext").addEventListener("keydown", (e) => { if (e.key === "Enter") sendCw(); });
   $("cwstop").onclick = () => send({ cmd: "cw_stop" });
   $("cw-clear").onclick = () => send({ cmd: "cw_clear" });
-  $("cw-rs").onclick = () => send({ cmd: "cw_engine", engine: S.st && S.st.cw_engine === "rs" ? "timing" : "rs" });
   const call = () => (S.st && S.st.call) || "";
   const MACROS = [["CQ", () => `CQ CQ DE ${call()} ${call()} K`], ["QRZ", () => "QRZ?"], ["TU", () => `TU 73 DE ${call()} SK`],
     ["599", () => "5NN 5NN"], ["AGN", () => "AGN?"]];
@@ -2018,7 +2006,9 @@ const DATV = (() => {
     aenc = new AudioEncoder({
       output: (chunk) => { const b = new Uint8Array(9 + chunk.byteLength); b[0] = 5; stamp(b, 1, chunk.timestamp); chunk.copyTo(b.subarray(9)); sendBin(b); micOut++; },
       error: (e) => { console.error(e); micErr = String(e.message || e); } });   // pictures go on without sound
-    aenc.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1, bitrate: cfg.audio_bps, opus: { frameDuration: 20000 } });
+    // (to the board only, which transcodes to AAC-LC at cfg.audio_bps: Opus
+    // at 32 kbit/s leaves nothing for the second encoder to undo)
+    aenc.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1, bitrate: 32000, opus: { frameDuration: 20000 } });
     // The context (and its worklets) usually exists from entering DATV mode.
     // Never wait on resume(): a browser may hold that promise until a click
     // it trusts, and the sender would hang at STARTING.
@@ -2127,16 +2117,25 @@ const DATV = (() => {
     try { vdec.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: ts, data: u8.subarray(10) })); needKey = false; }
     catch (e) { console.warn(e); vdec = null; needKey = true; }
   }
-  function rxAudio(u8) {
+  // Audio from the stream: AAC-LC in ADTS (type 12; WebCodecs takes ADTS
+  // when given no description) or Opus from older transmissions (type 7).
+  let adecKey = "";
+  function rxAudio(u8, codec) {
     if (!rxOn) return;
     // Sound arriving while the browser holds the output: say so (dropped
     // meanwhile, rather than a burst of stale audio when it resumes).
     const live = actx && actx.state === "running";
     $("datv-sound").hidden = live || audioUserOff;
     if (!live) return;
+    // AAC: the sample rate from the ADTS header (8-24 kHz by profile).
+    const AAC_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+    const rate = codec === "aac" ? AAC_RATES[(u8[11] >> 2) & 15] || 16000 : 48000;
+    const key = codec + rate;
+    if (adec && adec.state !== "closed" && adecKey !== key) { try { adec.close(); } catch { /* gone */ } adec = null; }
     if (!adec || adec.state === "closed") {
       adec = new AudioDecoder({ output: play, error: (e) => { console.warn("DATV audio", e); adec = null; } });
-      adec.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1 });
+      adec.configure({ codec: codec === "aac" ? "mp4a.40.2" : "opus", sampleRate: rate, numberOfChannels: 1 });
+      adecKey = key;
       aPts = [];   // (a decoder that failed took its queued frames with it)
     }
     const ts = Number(new DataView(u8.buffer, u8.byteOffset).getBigInt64(1, true));
@@ -2147,7 +2146,7 @@ const DATV = (() => {
     // ran dry: a new transmission) does the lead start small again. The
     // decoder is never thrown away: its queued frames would go with it.
     if (aNext !== null && Math.abs(ts - aNext) > 200e3 && actx && nextT < actx.currentTime) { nextT = 0; aLead = 0.15; }
-    aNext = ts + 20000;
+    aNext = ts + (codec === "aac" ? 1024 * 1e6 / rate : 20000);
     aPts.push(ts);
     if (aPts.length > 200) aPts.shift();
     try { adec.decode(new EncodedAudioChunk({ type: "key", timestamp: ts, data: u8.subarray(9) })); } catch (e) { console.warn(e); adec = null; }
@@ -2170,7 +2169,7 @@ const DATV = (() => {
     // A step forward in the stream's time (the transmitter moved its clock
     // on after a late keyframe): the gap is kept, as a receiver following
     // the PTS would, so the pictures stamped after it stay in time.
-    if (aPrev !== null && nextT > now) { const gap = pts - aPrev - 0.02; if (gap > 0.2 && gap < 4) nextT += gap; }
+    if (aPrev !== null && nextT > now) { const gap = pts - aPrev - buf.duration; if (gap > 0.2 && gap < 4) nextT += gap; }
     aPrev = pts;
     if (nextT < now + 0.02) {
       if (nextT > 0) aLead = Math.min(aLead + 0.25, 2.5);
@@ -2236,7 +2235,7 @@ const DATV = (() => {
       if (rxOn && r && r.auto && !r.rx) { $("datv-rxstat").innerHTML = `<b>AUTO</b> ${r.auto}`; }
       else if (rxOn && r) $("datv-rxstat").innerHTML = (r.auto ? `auto: ${r.auto}<br>` : "") + `<b>${r.locked ? "LOCK" : "searching"}</b><br>MER ${r.mer.toFixed(1)} dB · Es/N0 ${r.esn0.toFixed(1)} dB<br>carrier ${r.freq >= 0 ? "+" : ""}${r.freq} Hz<br>frames ${r.frames - r.bad}/${r.frames} · shown ${rxFrames}<br>dropped: IQ ${r.dropped}, frames ${r.busy}<br>CPU: demod ${r.demod_pct} %, FEC ${r.fec_pct} %${S.st && S.st.datv_rx && S.st.datv_rx.fpga ? " · front end: FPGA" : ""}` + avText() + siHtml(r.si);
       if (!on || !cfg) return;
-      $("datv-stat").textContent = `${cfg.width}x${cfg.height} ${cfg.fps} fps · video ${(cfg.video_bps / 1000).toFixed(0)}k · audio ${(cfg.audio_bps / 1000).toFixed(0)}k` +
+      $("datv-stat").textContent = `${cfg.width}x${cfg.height} ${cfg.fps} fps · video ${(cfg.video_bps / 1000).toFixed(0)}k · AAC ${(cfg.audio_bps / 1000).toFixed(0)}k` +
         (d ? ` · queue ${d.backlog.toFixed(1)} s · dropped ${d.dropped}` : "") + ` · sent ${(sent / 1024).toFixed(0)} KiB` +
         ` · ${testSrc ? "tone" : "mic"} ${micIn ? micOut + " frames" : actx ? "silent (" + actx.state + ")" : "off"}` + (micErr ? ` · audio error: ${micErr}` : "");
     },

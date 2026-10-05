@@ -552,7 +552,7 @@ impl Trx {
                 a
             },
             cw_audio: Vec::new(),
-            cwlive: CwLiveThread::start(12_000.0, CW_PITCH_HZ as f32, &cfg.trx.cw_engine),
+            cwlive: CwLiveThread::start(12_000.0, CW_PITCH_HZ as f32),
             s_dbfs: -120.0,
             tx_on: None,
             tx_since: None,
@@ -2575,7 +2575,6 @@ impl Trx {
             "span": self.web_span,
             "span_max": if self.maia.is_some() { self.cfg.radio.adc_rate as f64 } else { self.rate },
             "allow_tx": self.cfg.trx.allow_tx,
-            "cw_engine": self.cwlive.engine(),
             "rade": self.rade,
             "tx_ok": self.tx_check(self.tx_eff(), self.tx_half_bw()).is_ok(),
             "decoders": self.slots.iter().map(|(k, _)| match k {
@@ -2768,7 +2767,6 @@ impl Trx {
         // one that has it (trxd restarts and takes this command up again).
         let part = match cmd {
             "datv_mode" | "datv_rx" | "datv" if on => Some(crate::fpgamode::datv_part(m["rate"].as_str())),
-            "cw_engine" if m["engine"].as_str() == Some("rs") => Some(crate::fpgamode::Part::Rsnn),
             _ => None,
         };
         // No bitstream with DATV in this firmware (BASIC): refused, not run
@@ -3083,7 +3081,6 @@ impl Trx {
                     w.send_json_to(client, &self.calib_json());
                 }
             }
-            "cw_engine" => self.cwlive.set_engine(m["engine"].as_str().unwrap_or("timing")),
             // The page has set DATA mode and its filter first.
             "rade" => self.rade = on && self.mode == Mode::Digu,
             "decoder" => {

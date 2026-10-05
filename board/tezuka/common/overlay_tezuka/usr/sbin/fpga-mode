@@ -76,16 +76,6 @@ quiesce() {
 			devmem 0x43C60000 32 0; usleep 5000
 		fi;;
 	esac
-	case "$cur" in
-	trx)
-		# CW-RS network ("RSF*"): reads its weights only while busy
-		case "$(rd 0x43C5FF08)" in 0x3?465352)
-			for i in $(seq 100); do
-				[ $(( $(hex $(rd 0x43C5FF04)) & 1 )) = 0 ] && break
-				usleep 5000
-			done;;
-		esac;;
-	esac
 }
 
 # fpga-mode stop-dma: only bring the PL's bus masters to rest (S80trxd stop:

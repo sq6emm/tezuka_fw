@@ -1966,6 +1966,7 @@ dependencies = [
 name = "trxd"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "crossbeam-channel",
  "getrandom 0.3.4",
  "libc",

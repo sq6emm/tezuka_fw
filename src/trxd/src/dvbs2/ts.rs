@@ -1,6 +1,8 @@
-//! MPEG-TS for DATV at a few tens of kbit/s: one program, H.264 video and
-//! Opus audio from the browser (WebCodecs), multiplexed at the constant rate
-//! the DVB-S2 modulator pulls packets at.
+//! MPEG-TS for DATV at a few tens of kbit/s: one program, H.264 video from
+//! the browser (WebCodecs) and AAC-LC audio (ADTS, stream type 0x0F, as DVB
+//! receivers expect; transcoded on the board from the browser's Opus, see
+//! [`super::aac`]), multiplexed at the constant rate the DVB-S2 modulator
+//! pulls packets at.
 //!
 //! The modulator asks for one packet at a time ([`Mux::next`]), so every
 //! packet leaves at a known moment of the constant-rate stream: PCRs are
@@ -10,7 +12,7 @@
 //! first. Idle slots otherwise carry null packets.
 //!
 //! At these rates the 188-byte packet is the unit of cost: audio is packed
-//! ~200 ms to a PES (one 20 ms Opus frame per PES would take 50 packets a
+//! ~200 ms to a PES (one 64 ms AAC frame per PES would take 16 packets a
 //! second). Repetition as ISO/IEC 13818-1 and TR 101 290 ask: PCR at least
 //! within 100 ms (13818-1's limit; 90 ms below 200 kbit/s, where TR 101
 //! 290's recommended 40 ms would cost a third of the packets) and every
@@ -80,8 +82,11 @@ pub struct Profile {
     pub width: u32,
     pub height: u32,
     pub fps: f64,
+    /// AAC-LC bit rate and sample rate (12000, 16000 or 24000 Hz: frames of
+    /// 85, 64 or 43 ms).
     pub audio_bps: f64,
-    /// 20 ms Opus frames per audio PES.
+    pub audio_rate: u32,
+    /// AAC frames per audio PES.
     pub audio_per_pes: usize,
     /// PAT + PMT this often, seconds (the SDT within [`SDT_MAX_S`]).
     pub psi_every_s: f64,
@@ -106,17 +111,33 @@ impl Profile {
             // and so PTS up to 1.4 s after the data (13818-1's T-STD allows
             // 1 s): with 1 s the audio PES (4 packets at 15-30 a second)
             // and large pictures miss their PTS.
-            Profile { width: 160, height: 120, fps: 2.0, audio_bps: 6_000.0, audio_per_pes: 40, psi_every_s: 1.0, pcr_every_s: 0.5, key_every_s: 6.0, tstd_max_s: 1.4 }
+            // (below 33 kbit/s, 33 kS/s at QPSK 1/4 and 1/2: AAC-LC at 8 kHz,
+            // 8 kbit/s; 12 took half the packets and pictures were dropped)
+            let (audio_bps, audio_rate, audio_per_pes) = if ts_rate < 33_000.0 { (8_000.0, 8_000, 6) } else { (12_000.0, 12_000, 9) };
+            Profile { width: 160, height: 120, fps: 2.0, audio_bps, audio_rate, audio_per_pes, psi_every_s: 1.0, pcr_every_s: 0.5, key_every_s: 6.0, tstd_max_s: 1.4 }
         } else if ts_rate < 80_000.0 {
-            // (audio 8 kbit/s, 300 ms to a PES: 12 kbit/s in 200 ms PES took
-            // a third of the packets at 46 kbit/s and left no picture)
-            Profile { width: 320, height: 240, fps: 5.0, audio_bps: 8_000.0, audio_per_pes: 15, psi_every_s: 0.5, pcr_every_s: 0.09, key_every_s: 2.0, tstd_max_s: DELAY_MAX_S }
+            // (audio ~430 ms to a PES, 4 packets with room for the encoder's
+            // variation: 200 ms PES took a third of the packets
+            // at 46 kbit/s and left no picture. AAC-LC at 12 kbit/s and 12 kHz
+            // below 80 kbit/s: 16 left the 33 kS/s picture almost nothing;
+            // the user's choice, 2026-10-05)
+            Profile { width: 320, height: 240, fps: 5.0, audio_bps: 12_000.0, audio_rate: 12_000, audio_per_pes: 5, psi_every_s: 0.5, pcr_every_s: 0.09, key_every_s: 2.0, tstd_max_s: DELAY_MAX_S }
         } else if ts_rate < 200_000.0 {
-            Profile { width: 320, height: 240, fps: 10.0, audio_bps: 16_000.0, audio_per_pes: 10, psi_every_s: 0.5, pcr_every_s: 0.09, key_every_s: 2.0, tstd_max_s: DELAY_MAX_S }
+            Profile { width: 320, height: 240, fps: 10.0, audio_bps: 16_000.0, audio_rate: 16_000, audio_per_pes: 3, psi_every_s: 0.5, pcr_every_s: 0.09, key_every_s: 2.0, tstd_max_s: DELAY_MAX_S }
         } else {
             // 192 kS/s and up at 2/3-3/4 (FPGA front end): 240-360 kbit/s.
-            Profile { width: 640, height: 480, fps: 10.0, audio_bps: 24_000.0, audio_per_pes: 10, psi_every_s: 0.5, pcr_every_s: 0.04, key_every_s: 2.0, tstd_max_s: DELAY_MAX_S }
+            Profile { width: 640, height: 480, fps: 10.0, audio_bps: 24_000.0, audio_rate: 24_000, audio_per_pes: 5, psi_every_s: 0.5, pcr_every_s: 0.04, key_every_s: 2.0, tstd_max_s: DELAY_MAX_S }
         }
+    }
+
+    /// One AAC frame, seconds.
+    pub fn frame_s(&self) -> f64 {
+        super::aac::FRAME as f64 / self.audio_rate as f64
+    }
+
+    /// One AAC frame on the 90 kHz PTS clock (exact at 16 and 24 kHz).
+    fn frame90(&self) -> u64 {
+        super::aac::FRAME as u64 * 90_000 / self.audio_rate as u64
     }
 
     /// PSI bursts per SDT (the SDT rides along every this many bursts).
@@ -136,11 +157,11 @@ impl Profile {
         (psi, pcr_rate * if pps < 40.0 && self.pcr_every_s < 0.2 { 0.75 } else { 0.5 })
     }
 
-    /// Audio packets a second: an audio PES has 3 control bytes per frame
-    /// and 14 header bytes.
+    /// Audio packets a second: an audio PES has a 7-byte ADTS header per
+    /// frame and 14 header bytes.
     fn audio_pps(&self) -> f64 {
-        let pes_per_s = 50.0 / self.audio_per_pes as f64;
-        let audio_bytes = self.audio_bps / 8.0 / pes_per_s + (3 * self.audio_per_pes + 14) as f64;
+        let pes_per_s = 1.0 / (self.audio_per_pes as f64 * self.frame_s());
+        let audio_bytes = self.audio_bps / 8.0 / pes_per_s + (super::aac::ADTS_HEADER * self.audio_per_pes + 14) as f64;
         pes_per_s * (audio_bytes / 184.0).ceil()
     }
 
@@ -153,7 +174,10 @@ impl Profile {
         // Video packets carry 176 bytes (8 reserved for a PCR); a frame
         // also costs its PES header, AUD and half a packet of padding.
         let video_bytes_s = ((pps - psi - audio - pcr_only) * VIDEO_PAYLOAD - self.fps * (14.0 + 6.0 + VIDEO_PAYLOAD / 2.0)).max(0.0);
-        video_bytes_s * 8.0 * 0.85
+        // (more margin below 80 kbit/s: a 4-7 packet audio PES and the
+        // tables leave little slack there, a picture is a few hundred
+        // bytes, and pictures vary 50-150 %)
+        video_bytes_s * 8.0 * if ts_rate < 80_000.0 { 0.7 } else { 0.85 }
     }
 }
 /// Video backlog, seconds of the stream: above it non-key frames are dropped
@@ -187,8 +211,10 @@ struct Queued {
 pub enum Media {
     /// H.264 Annex B access unit; `ts_us` is the capture time (browser clock).
     Video { ts_us: i64, key: bool, data: Vec<u8> },
-    /// One Opus packet (20 ms).
+    /// One AAC-LC frame with its ADTS header (from [`super::aac::Transcoder`]).
     Audio { ts_us: i64, data: Vec<u8> },
+    /// One Opus packet from the browser (transcoded to [`Media::Audio`]).
+    Opus { ts_us: i64, data: Vec<u8> },
 }
 
 impl Media {
@@ -201,13 +227,13 @@ impl Media {
                 ts_us: i64::from_le_bytes(b[2..10].try_into().ok()?),
                 data: b[10..].to_vec(),
             }),
-            5 if b.len() > 9 => Some(Media::Audio { ts_us: i64::from_le_bytes(b[1..9].try_into().ok()?), data: b[9..].to_vec() }),
+            5 if b.len() > 9 => Some(Media::Opus { ts_us: i64::from_le_bytes(b[1..9].try_into().ok()?), data: b[9..].to_vec() }),
             _ => None,
         }
     }
     fn ts_us(&self) -> i64 {
         match self {
-            Media::Video { ts_us, .. } | Media::Audio { ts_us, .. } => *ts_us,
+            Media::Video { ts_us, .. } | Media::Audio { ts_us, .. } | Media::Opus { ts_us, .. } => *ts_us,
         }
     }
 }
@@ -320,6 +346,9 @@ pub struct Mux {
     /// after the last PES flushed.
     audio_cont: Option<(i64, u64)>,
     audio: Vec<(i64, Vec<u8>)>,
+    /// The browser's Opus to AAC-LC (made on the first packet).
+    aac: Option<super::aac::Transcoder>,
+    aac_failed: bool,
     video_dropping: bool,
     /// The browser should send a keyframe next.
     pub want_key: bool,
@@ -356,6 +385,8 @@ impl Mux {
             anchor: None,
             audio_cont: None,
             audio: Vec::new(),
+            aac: None,
+            aac_failed: false,
             video_dropping: false,
             want_key: false,
             service: service.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(32).collect(),
@@ -381,7 +412,7 @@ impl Mux {
 
     /// The nominal delay from a medium's time to its PTS, 90 kHz ticks.
     fn delay90(&self) -> u64 {
-        ((DELAY_S + self.profile.audio_per_pes as f64 * 0.02).min(self.profile.tstd_max_s) * 90_000.0) as u64
+        ((DELAY_S + self.profile.audio_per_pes as f64 * self.profile.frame_s()).min(self.profile.tstd_max_s) * 90_000.0) as u64
     }
 
     /// The PTS lead over the mux clock from which [`Self::pts90`] takes the
@@ -547,6 +578,21 @@ impl Mux {
                     self.flush_audio();
                 }
             }
+            Media::Opus { ts_us, data } => {
+                if self.aac.is_none() && !self.aac_failed {
+                    match super::aac::Transcoder::new(self.profile.audio_rate, self.profile.audio_bps as u32) {
+                        Ok(t) => self.aac = Some(t),
+                        Err(e) => {
+                            tracing::warn!("DATV audio off: {e}");
+                            self.aac_failed = true;
+                        }
+                    }
+                }
+                let frames = self.aac.as_mut().map(|t| t.push(ts_us, &data)).unwrap_or_default();
+                for (ts_us, data) in frames {
+                    self.push(Media::Audio { ts_us, data });
+                }
+            }
         }
     }
 
@@ -555,20 +601,12 @@ impl Mux {
         let Some(&(ts, _)) = frames.first() else { return };
         let pts = self.pts90(ts);
         let pts = self.monotonic(1, pts);
-        self.audio_cont = Some((ts + frames.len() as i64 * 20_000, pts + frames.len() as u64 * 1800));
-        let mut es = Vec::new();
-        for (_, f) in &frames {
-            // Opus control header (the Opus-in-MPEG-TS mapping, as ffmpeg writes it).
-            es.extend_from_slice(&[0x7F, 0xE0]);
-            let mut n = f.len();
-            while n >= 255 {
-                es.push(0xFF);
-                n -= 255;
-            }
-            es.push(n as u8);
-            es.extend_from_slice(f);
-        }
-        self.queue_pes(PID_AUDIO, 0xBD, pts, &es, false);
+        let n = frames.len() as i64;
+        let us = n * super::aac::FRAME as i64 * 1_000_000 / self.profile.audio_rate as i64;
+        self.audio_cont = Some((ts + us, pts + n as u64 * self.profile.frame90()));
+        // ADTS frames back to back (each carries its own header).
+        let es: Vec<u8> = frames.iter().flat_map(|(_, f)| f.iter().copied()).collect();
+        self.queue_pes(PID_AUDIO, 0xC0, pts, &es, false);
     }
 
     /// Split one PES into queued packets; the last is padded with adaptation
@@ -825,10 +863,8 @@ impl Mux {
         let mut s = vec![0x02, 0xB0, 0, 0x00, 0x01, 0xC1, 0, 0];
         s.extend_from_slice(&[0xE0 | (PID_VIDEO >> 8) as u8, PID_VIDEO as u8, 0xF0, 0]); // PCR PID, no program info
         s.extend_from_slice(&[0x1B, 0xE0 | (PID_VIDEO >> 8) as u8, PID_VIDEO as u8, 0xF0, 0]);
-        // Opus: private data, registration "Opus", DVB extension: 1 channel.
-        let desc = [0x05, 4, b'O', b'p', b'u', b's', 0x7F, 2, 0x80, 1];
-        s.extend_from_slice(&[0x06, 0xE0 | (PID_AUDIO >> 8) as u8, PID_AUDIO as u8, 0xF0, desc.len() as u8]);
-        s.extend_from_slice(&desc);
+        // AAC in ADTS (ISO/IEC 13818-7), as DVB receivers and TVs decode it.
+        s.extend_from_slice(&[0x0F, 0xE0 | (PID_AUDIO >> 8) as u8, PID_AUDIO as u8, 0xF0, 0]);
         finish_section(s)
     }
 
@@ -847,9 +883,10 @@ impl Mux {
     }
 }
 
-/// Pulls H.264 access units and Opus packets out of a received TS (the PMT
-/// says where), as browser messages: `[6][flags: bit 0 = key][i64 LE PTS,
-/// us][Annex B]` and `[7][i64 LE PTS, us][Opus packet]`. A PES hit by a
+/// Pulls H.264 access units and audio out of a received TS (the PMT says
+/// where), as browser messages: `[6][flags: bit 0 = key][i64 LE PTS,
+/// us][Annex B]`, `[12][i64 LE PTS, us][ADTS frame]` (AAC) and, from older
+/// streams, `[7][i64 LE PTS, us][Opus packet]`. A PES hit by a
 /// continuity error is dropped whole.
 /// DVB service information a receiver shows: from the SDT, NIT, EIT
 /// present/following and TDT (single-packet sections, as ours are).
@@ -896,6 +933,8 @@ pub struct Demux {
     pmt: Option<u16>,
     video: Option<u16>,
     audio: Option<u16>,
+    /// The audio is AAC in ADTS (stream type 0x0F); else Opus (older streams).
+    audio_aac: bool,
     pes: std::collections::HashMap<u16, (Vec<u8>, bool)>,
     cc: std::collections::HashMap<u16, u8>,
     /// PSI/SI sections being put together (they may span packets).
@@ -1047,19 +1086,21 @@ impl Demux {
             // The streams as this PMT has them (they may change).
             let info = (((body[2] as usize) & 0x0F) << 8) | body[3] as usize;
             let mut i = 4 + info;
-            let (mut video, mut audio) = (None, None);
+            let (mut video, mut audio, mut aac) = (None, None, false);
             while i + 5 <= body.len() {
                 let (st, epid) = (body[i], u16::from_be_bytes([body[i + 1], body[i + 2]]) & 0x1FFF);
                 let dl = (((body[i + 3] as usize) & 0x0F) << 8) | body[i + 4] as usize;
                 let desc = body.get(i + 5..i + 5 + dl).unwrap_or(&[]);
                 match st {
                     0x1B if video.is_none() => video = Some(epid),
+                    0x0F if audio.is_none() => (audio, aac) = (Some(epid), true),
                     0x06 if audio.is_none() && desc.windows(4).any(|w| w == b"Opus") => audio = Some(epid),
                     _ => {}
                 }
                 i += 5 + dl;
             }
             self.set_streams(video, audio);
+            self.audio_aac = aac;
         } else if pid == PID_SDT && s[0] == 0x42 {
             // services from byte 11: id, flags, then descriptors
             let end = len - 4;
@@ -1167,6 +1208,19 @@ impl Demux {
             m.extend_from_slice(&us.to_le_bytes());
             m.extend_from_slice(data);
             out.push(m);
+        } else if self.audio_aac {
+            // ADTS frames, each its own header; the page decodes them as
+            // they are (WebCodecs mp4a.40.2 without a description = ADTS).
+            let (mut i, mut t) = (0usize, 0i64);
+            while let Some((len, rate)) = data.get(i..).and_then(super::aac::adts_parse) {
+                let Some(f) = data.get(i..i + len) else { break };
+                let mut m = vec![12];
+                m.extend_from_slice(&(us + t * 1_000_000 / rate as i64).to_le_bytes());
+                m.extend_from_slice(f);
+                out.push(m);
+                i += len;
+                t += super::aac::FRAME as i64;
+            }
         } else {
             // Opus access units, each behind a control header.
             let (mut i, mut k) = (0usize, 0i64);
@@ -1341,6 +1395,18 @@ fn pcr_bytes(t27: u64) -> [u8; 6] {
 mod tests {
     use super::*;
 
+    /// One AAC frame at the profile's rate and size: an ADTS header and
+    /// `b` repeated.
+    fn aac(p: &Profile, b: u8) -> Vec<u8> {
+        aac_of(p, (p.audio_bps / 8.0 * p.frame_s()) as usize, b)
+    }
+
+    fn aac_of(p: &Profile, n: usize, b: u8) -> Vec<u8> {
+        let mut f = super::super::aac::adts(n, p.audio_rate).to_vec();
+        f.extend(std::iter::repeat_n(b, n));
+        f
+    }
+
     #[test]
     fn crc32_is_the_mpeg2_one() {
         // A PAT with the CRC appended checks to zero.
@@ -1356,11 +1422,13 @@ mod tests {
     fn stale_media_first_keeps_av_together() {
         let rate = 241_332.0;
         let mut m = Mux::new(rate, "SQ6EMM");
+        let p = m.profile;
+        let fu = (p.frame_s() * 1e6) as i64;
         let pps = rate / (TS_LEN as f64 * 8.0);
         let old = 100_000_000i64; // us
         let live = old + 12_000_000;
         for i in 0..5 {
-            m.push(Media::Audio { ts_us: old + i * 20_000, data: vec![1; 60] });
+            m.push(Media::Audio { ts_us: old + i * fu, data: aac(&p, 1) });
         }
         m.push(Media::Video { ts_us: old, key: true, data: vec![0, 0, 0, 1, 0x65, 1, 2, 3] });
         let mut d = Demux::default();
@@ -1373,15 +1441,15 @@ mod tests {
                 nv += 100_000;
             }
             while (na as f64) <= t {
-                m.push(Media::Audio { ts_us: na, data: vec![2; 60] });
-                na += 20_000;
+                m.push(Media::Audio { ts_us: na, data: aac(&p, 2) });
+                na += fu;
             }
             d.push(&m.next(), &mut got);
         }
         let pts = |k: u8| -> Vec<i64> {
             got.iter().filter(|b| b[0] == k).map(|b| i64::from_le_bytes(b[if k == 6 { 2 } else { 1 }..][..8].try_into().unwrap())).collect()
         };
-        let (v, a) = (pts(6), pts(7));
+        let (v, a) = (pts(6), pts(12));
         let (lv, la) = (*v.last().unwrap(), *a.last().unwrap());
         // the last video and audio sent were within 0.1 s of each other
         assert!((lv - la).abs() < 500_000, "video PTS {lv} us, audio PTS {la} us: {} ms apart", (lv - la) / 1000);
@@ -1422,8 +1490,8 @@ mod tests {
                 next_v += 1.0 / p.fps;
             }
             while next_a <= t {
-                m.push(Media::Audio { ts_us: (next_a * 1e6) as i64, data: vec![0xAB; (p.audio_bps / 8.0 * 0.02) as usize] });
-                next_a += 0.02;
+                m.push(Media::Audio { ts_us: (next_a * 1e6) as i64, data: aac(&p, 0xAB) });
+                next_a += p.frame_s();
             }
             if m.take_key_request() {
                 want_key = true;
@@ -1438,13 +1506,13 @@ mod tests {
         let pts = |k: u8| -> Vec<i64> {
             got.iter().filter(|b| b[0] == k).map(|b| i64::from_le_bytes(b[if k == 6 { 2 } else { 1 }..][..8].try_into().unwrap())).collect()
         };
-        let (v, a) = (pts(6), pts(7));
+        let (v, a) = (pts(6), pts(12));
         // (a picture's PTS against the latest audio PTS before it in the
         // stream: what a receiver has to hold the sound back by)
         let mut la = None;
         let mut ahead: Vec<i64> = Vec::new();
         for b in &got {
-            if b[0] == 7 {
+            if b[0] == 12 {
                 la = Some(i64::from_le_bytes(b[1..9].try_into().unwrap()));
             } else if let Some(la) = la {
                 ahead.push((i64::from_le_bytes(b[2..10].try_into().unwrap()) - la) / 1000);
@@ -1456,7 +1524,7 @@ mod tests {
         let mut fwd = 0;
         for w in a.windows(2) {
             let d = w[1] - w[0];
-            if d != 20_000 {
+            if d != (p.frame_s() * 1e6) as i64 {
                 eprintln!("audio step {:+} ms at {:.2} s", d / 1000, w[0] as f64 / 1e6);
             }
             if d < 0 {
@@ -1490,7 +1558,6 @@ mod tests {
             let p = m.profile;
             let pps = rate / (TS_LEN as f64 * 8.0);
             let frame_bytes = (p.video_budget(rate) / 8.0 / p.fps) as usize;
-            let opus = (p.audio_bps / 8.0 * 0.02) as usize;
             let (mut next_v, mut next_a, mut vi, mut sent) = (0.0f64, 0.0f64, 0u64, 0usize);
             let mut d = Demux::default();
             let mut got = Vec::new();
@@ -1505,16 +1572,16 @@ mod tests {
                     next_v += 1.0 / p.fps;
                 }
                 while next_a <= t {
-                    m.push(Media::Audio { ts_us: (next_a * 1e6) as i64, data: vec![(sent % 251) as u8; opus] });
+                    m.push(Media::Audio { ts_us: (next_a * 1e6) as i64, data: aac(&p, (sent % 251) as u8) });
                     sent += 1;
-                    next_a += 0.02;
+                    next_a += p.frame_s();
                 }
                 let pkt = m.next();
                 d.push(&pkt, &mut got);
             }
-            let audio = got.iter().filter(|b| b.first() == Some(&7)).count();
+            let audio = got.iter().filter(|b| b.first() == Some(&12)).count();
             // What may still be queued at the end: the mux delay plus a PES.
-            let tail = ((DELAY_MAX_S.max(p.tstd_max_s) + p.audio_per_pes as f64 * 0.02) / 0.02) as usize + p.audio_per_pes;
+            let tail = ((DELAY_MAX_S.max(p.tstd_max_s) + p.audio_per_pes as f64 * p.frame_s()) / p.frame_s()) as usize + p.audio_per_pes;
             assert!(audio + tail >= sent, "rate {rate}: {audio} of {sent} audio packets came out (tail allowance {tail})");
         }
     }
@@ -1548,8 +1615,8 @@ mod tests {
                     next_v += 1.0 / p.fps;
                 }
                 while next_a <= t {
-                    m.push(Media::Audio { ts_us: (next_a * 1e6) as i64, data: vec![0xAB; (p.audio_bps / 8.0 * 0.02) as usize] });
-                    next_a += 0.02;
+                    m.push(Media::Audio { ts_us: (next_a * 1e6) as i64, data: aac(&p, 0xAB) });
+                    next_a += p.frame_s();
                 }
                 out.push(m.next());
             }
@@ -1714,6 +1781,7 @@ mod tests {
     #[test]
     fn packets_are_well_formed_and_counters_run() {
         let mut m = Mux::new(54_325.0, "SQ6EMM");
+        let p = m.profile;
         let mut t = 0i64;
         let mut out = Vec::new();
         for i in 0..400 {
@@ -1721,8 +1789,8 @@ mod tests {
                 m.push(Media::Video { ts_us: t, key: i % 70 == 0, data: vec![0, 0, 0, 1, 0x65, i as u8].repeat(60) });
             }
             if i % 3 == 0 {
-                m.push(Media::Audio { ts_us: t, data: vec![0xAB; 30] });
-                t += 20_000;
+                m.push(Media::Audio { ts_us: t, data: aac_of(&p, 30, 0xAB) });
+                t += (p.frame_s() * 1e6) as i64;
             }
             out.push(m.next());
         }
@@ -1748,9 +1816,10 @@ mod tests {
     #[test]
     fn demux_gives_back_what_the_mux_took() {
         let mut m = Mux::new(54_325.0, "SQ6EMM");
+        let p = m.profile;
         let frames: Vec<Vec<u8>> = (0..6u8).map(|i| [vec![0, 0, 0, 1, 0x09, 0xF0, 0, 0, 0, 1, if i == 0 { 0x65 } else { 0x41 }], vec![i; 300 + i as usize * 150]].concat()).collect();
-        // (two whole audio PES of the 15 frames this profile packs)
-        let opus: Vec<Vec<u8>> = (0..30u8).map(|i| vec![i; 30 + i as usize * 7]).collect();
+        // (six whole audio PES of the 5 frames this profile packs)
+        let opus: Vec<Vec<u8>> = (0..30u8).map(|i| aac_of(&p, 30 + i as usize * 7, i)).collect();
         let (mut vi, mut ai) = (0, 0);
         let mut dmx = Demux::default();
         let mut msgs = Vec::new();
@@ -1769,7 +1838,7 @@ mod tests {
             dmx.push(&m.next(), &mut msgs);
         }
         let video: Vec<&Vec<u8>> = msgs.iter().filter(|m| m[0] == 6).collect();
-        let audio: Vec<&Vec<u8>> = msgs.iter().filter(|m| m[0] == 7).collect();
+        let audio: Vec<&Vec<u8>> = msgs.iter().filter(|m| m[0] == 12).collect();
         // The last video PES is only closed by the next one.
         assert_eq!(video.len(), frames.len() - 1);
         for (got, want) in video.iter().zip(&frames) {
@@ -1780,9 +1849,9 @@ mod tests {
         for (got, want) in audio.iter().zip(&opus) {
             assert_eq!(&got[9..], &want[..]);
         }
-        // 20 ms apart on the PTS clock.
+        // A frame (1024 samples) apart on the PTS clock.
         let ts = |m: &Vec<u8>| i64::from_le_bytes(m[1..9].try_into().unwrap());
-        assert_eq!(ts(audio[1]) - ts(audio[0]), 20_000);
+        assert_eq!(ts(audio[1]) - ts(audio[0]), 1024 * 1_000_000 / p.audio_rate as i64);
     }
 
     #[test]
@@ -1793,11 +1862,14 @@ mod tests {
         let v14 = Profile::for_rate(22_878.0).video_budget(22_878.0);
         // (tables every 0.5 s and a PCR slot in every video packet, as TR
         // 101 290 asks, take about 0.5 kbit/s more than before)
-        assert!(v64 > 12_000.0 && v64 < 40_000.0, "{v64}");
+        // (AAC-LC at 12 kbit/s and a 0.7 margin since 2026-10-05: Opus at 8
+        // left about 15 k)
+        assert!(v64 > 8_000.0 && v64 < 40_000.0, "{v64}");
         assert!(v128 > 40_000.0 && v128 < 90_000.0, "{v128}");
         // (tables every second instead of every 2 s, about 1.9 kbit/s, and
         // the NIT, EIT and TDT, about 1.9 kbit/s more)
-        assert!(v14 > 4_000.0, "{v14}");
+        // (AAC-LC at 8 kbit/s and 8 kHz there; Opus at 6 left about 4 k)
+        assert!(v14 > 2_000.0, "{v14}");
     }
 
     /// The delivery system descriptors (EN 300 468 6.2.13.3, 6.4.6.3).

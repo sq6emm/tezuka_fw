@@ -1,5 +1,6 @@
 config BR2_PACKAGE_TRXD
 	bool "trxd"
+	select BR2_PACKAGE_FFMPEG_AAC
 	help
 	  Headless AD936x transceiver (TCI + rigctld, Q65/PI4/CW
 	  decoders) and IARU-R1 MGM beacon transmitter/receiver

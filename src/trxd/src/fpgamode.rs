@@ -5,7 +5,7 @@
 //! S80trxd loop runs `fpga-mode <mode>` (the PL reloaded, the drivers bound
 //! again) and starts trxd, which takes up the saved state.
 //!
-//! Modes: "trx" (radio, wide scope, CW-RS network front end), "s2" (radio,
+//! Modes: "trx" (radio, wide scope, the channel DDC), "s2" (radio,
 //! wide scope, DVB-S2 receive and transmit, LDPC), "t2" (the same for
 //! DVB-T2), and "datv" (both: the single DATV bitstream before the split).
 
@@ -26,8 +26,6 @@ pub enum Part {
     /// DVB-T2 receive and transmit (resampler, OFDM front end, equalizer,
     /// cell router, IFFT, LDPC).
     T2,
-    /// The CW-RS network's front end (rsnn_front).
-    Rsnn,
 }
 
 /// The mode of the bitstream loaded now ("boot": the boot one's, from
@@ -42,7 +40,6 @@ pub fn loaded() -> String {
 
 fn has(mode: &str, part: Part) -> bool {
     match mode {
-        "trx" => part == Part::Rsnn,
         "datv" => part == Part::S2 || part == Part::T2,
         "s2" => part == Part::S2,
         "t2" => part == Part::T2,
@@ -59,7 +56,6 @@ pub fn switch_for(part: Part) -> Option<&'static str> {
     let order: &[&'static str] = match part {
         Part::S2 => &["s2", "datv"],
         Part::T2 => &["t2", "datv"],
-        Part::Rsnn => &["trx"],
     };
     // the boot mode's comes out of the running slot's FIT (fpga-mode)
     let boot = std::fs::read_to_string(BOOT).ok().map(|s| s.trim().to_string());
@@ -99,8 +95,8 @@ pub fn request(mode: &str, resume: &serde_json::Value) -> ! {
     let _ = std::fs::write(WANT, mode);
     tracing::info!(from = %loaded(), to = mode, "FPGA bitstream switch: restarting");
     // The bus masters in the PL to rest before it is reconfigured (fpga-mode
-    // does it again, and the rest: the spectrometer, the T2 router, the
-    // CW-RS network). exit() runs no destructors: the front end's would
+    // does it again, and the rest: the spectrometer, the T2 router).
+    // exit() runs no destructors: the front end's would
     // not stop the ring.
     if loaded() != "trx" {
         crate::dvbs2::fpga_tx::quiesce();
@@ -255,11 +251,11 @@ mod tests {
 
     #[test]
     fn modes_hold_their_parts() {
-        assert!(has("s2", Part::S2) && !has("s2", Part::T2) && !has("s2", Part::Rsnn));
+        assert!(has("s2", Part::S2) && !has("s2", Part::T2));
         assert!(has("t2", Part::T2) && !has("t2", Part::S2));
-        assert!(has("datv", Part::S2) && has("datv", Part::T2) && !has("datv", Part::Rsnn));
-        assert!(has("trx", Part::Rsnn) && !has("trx", Part::S2) && !has("trx", Part::T2));
-        assert!(!has("boot", Part::T2) && !has("", Part::Rsnn));
+        assert!(has("datv", Part::S2) && has("datv", Part::T2));
+        assert!(!has("trx", Part::S2) && !has("trx", Part::T2));
+        assert!(!has("boot", Part::T2) && !has("", Part::S2));
         assert_eq!(datv_part(Some("T2-1.7-QPSK-1/2")), Part::T2);
         assert_eq!(datv_part(Some("L-8PSK-3/4")), Part::S2);
         assert_eq!(datv_part(None), Part::S2);

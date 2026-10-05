@@ -218,6 +218,9 @@ trxd (Rust):
 - The web UI has no third-party code; the browser supplies H.264/Opus
   encoding ([WebCodecs](https://www.w3.org/TR/webcodecs/)) and the RC-28
   link ([WebHID](https://wicg.github.io/webhid/)).
+- DATV audio: [FFmpeg](https://ffmpeg.org/)'s libavcodec (LGPL-2.1+), a
+  minimal static build with the Opus decoder and the AAC encoder only
+  (`package/ffmpeg-aac`), turns the browser's Opus into AAC-LC on the board.
 
 ## Licence
 

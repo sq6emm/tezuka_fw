@@ -67,13 +67,6 @@
 			reg = <0x16100000 0x100000>;
 		};
 
-		/* CW-RS network: the temporal layers' weights, written by trxd
-		 * through /dev/mem, read by the FPGA (rsnn_axi, HP0). */
-		rsnn_weights: rsnn_weights@16200000 {
-			no-map;
-			reg = <0x16200000 0x100000>;
-		};
-
 		/* LDPC decoder (datv bitstream, ldpc_dma): the LLR words in at
 		 * +0 and the packed decisions out at +64 KiB, written and read by
 		 * trxd through /dev/mem. */
