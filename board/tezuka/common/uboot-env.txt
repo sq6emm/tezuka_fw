@@ -204,7 +204,8 @@ pl_init=\
 qspiboot_bootenv=sf probe && sf read ${extraenv_load_address} 0x100000 0x20000;
 qspiboot_extraenv=sf read ${extraenv_load_address} 0xFF000 0x1000;
 # QSPI A/B slots (docs/FLASH.md): linux-a at 0x200000, linux-b at 0xE40000,
-# 0xC40000 each; the DeepCW model lives in its own partition at 0x1A80000.
+# 0xC40000 each; the web page's RADE module (docs/RADE.md) has its own
+# partition at 0x1A80000.
 # iminfo checks every image's hash in the slot before anything boots from it.
 qspi_slot_select=\
   run ab_count; \
