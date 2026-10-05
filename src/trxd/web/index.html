@@ -376,7 +376,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <div class="row" id="steps">
         <button class="k" data-step="10">10</button><button class="k" data-step="100">100</button>
         <button class="k" data-step="1000">1k</button><button class="k" data-step="5000">5k</button>
-        <button class="k" data-step="12500">12.5k</button><button class="k" data-step="25000">25k</button><button class="k" data-step="100000">100k</button>
+        <button class="k" data-step="12500">12.5k</button><button class="k" data-step="25000">25k</button><button class="k" data-step="50000">50k</button><button class="k" data-step="100000">100k</button>
       </div>
       <div class="slider">AF<input type="range" id="af" min="0" max="100" value="60"><b id="af-v">60</b></div>
       <div class="slider">RF gain<input type="range" id="rfg" min="0" max="73" value="40"><b id="rfg-v">AUTO</b></div>
@@ -489,10 +489,14 @@ const BANDS = [
   ["9cm", 3_400_100_000, "USB", 3400e6, 3475e6], ["6cm", 5_760_100_000, "USB", 5650e6, 5850e6],
 ];
 // Receive-only bands: [name, first tune, mode, from, to, channel step].
+// (by frequency, but SATCOM before MIL AIR, which contains it: bandOf takes
+// the first match)
 const RX_BANDS = [
-  ["AIR", 124_000_000, "AM", 118e6, 137e6, 25000], ["MARINE", 156_800_000, "FM", 156e6, 162.025e6, 25000],
-  ["PMR", 446_006_250, "FM", 446.0e6, 446.2e6, 12500], ["LPD", 433_075_000, "FM", 433.05e6, 434.79e6, 25000],
   ["FM", 100_000_000, "WFM", 87.5e6, 108e6, 100000],
+  ["NAV", 112_000_000, "AM", 108.0e6, 117.975e6, 50000], ["AIR", 124_000_000, "AM", 118e6, 137e6, 25000],
+  ["RAIL", 150_100_000, "FM", 150e6, 155.9875e6, 12500], ["MARINE", 156_800_000, "FM", 156e6, 162.025e6, 25000],
+  ["SATCOM", 255_550_000, "FM", 243.6e6, 270e6, 5000], ["MIL AIR", 243_000_000, "AM", 225e6, 400e6, 25000],
+  ["LPD", 433_075_000, "FM", 433.05e6, 434.79e6, 25000], ["PMR", 446_006_250, "FM", 446.0e6, 446.2e6, 12500],
 ];
 // The band button for a frequency: a transverter's range first, then the
 // receive-only bands (LPD lies inside 70cm), then the amateur bands.
@@ -789,6 +793,30 @@ function renderCalib(m) {
   }).join("");
 }
 
+// The deck under the scope shows other controls in each mode; it keeps the
+// height of its tallest mode, so the scope (the row that takes the rest)
+// does not change size on a mode switch. Measured once per window size and
+// firmware (the DATV button), with each mode's classes set in turn.
+const DECK_MODES = ["ssb-mode", "cw-mode", "data-mode", "datv-mode"];
+let deckKey = "";
+function pinDeck() {
+  const b = document.body.classList, d = $("deck");
+  const key = innerWidth + "x" + innerHeight + b.contains("no-datv");
+  if (key === deckKey || !d.offsetParent) return; // (hidden behind the login: later)
+  deckKey = key;
+  const was = DECK_MODES.filter((c) => b.contains(c));
+  d.style.minHeight = "";
+  let h = 0;
+  for (const m of [null, ...DECK_MODES]) {
+    if (m === "datv-mode" && b.contains("no-datv")) continue;
+    DECK_MODES.forEach((c) => b.toggle(c, c === m));
+    h = Math.max(h, d.offsetHeight);
+  }
+  DECK_MODES.forEach((c) => b.toggle(c, was.includes(c)));
+  d.style.minHeight = h + "px";
+}
+addEventListener("resize", () => pinDeck());
+
 // ============================================================ state rendering
 function renderState() {
   const st = S.st;
@@ -802,6 +830,7 @@ function renderState() {
   document.body.classList.toggle("data-mode", !st.datv_mode && st.mode === "PKTUSB");
   document.body.classList.toggle("ssb-mode", !st.datv_mode && (st.mode === "USB" || st.mode === "LSB"));
   $("t-mode").textContent = st.datv_mode ? "DATV" : st.rade ? "RADE" : st.mode === "PKTUSB" ? "USB-D" : st.mode;
+  pinDeck();
   $("t-mode").className = "tag on";
   renderRds();
   if (!S.filIdx) S.filIdx = store.get("filidx", {});
