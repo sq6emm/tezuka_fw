@@ -225,21 +225,24 @@ qspi_slot_select=\
 wdt_start=mw f8005000 00abc000; mw f8005004 00921403; mw f8005000 00abc033; mw f8005008 1999
 
 # Load and boot the slot at ${slot_offset}; returns only if that failed.
+# Nothing past the load (refclk values, PL init, bootargs, bootm) runs
+# unless the whole slot was read and every image's hash checked.
 # The 16-byte read from 0xFF000 (bytes already loaded there) leaves the
 # W25Q256's bank register on the lower 16 MiB: slot b ends above it, and a
 # watchdog reset before Linux touched the flash would otherwise leave the
 # BootROM reading the upper bank (kernel patch 0011 does the same after
 # every flash operation in Linux).
 qspi_try=\
-  echo Copying Linux from QSPI flash to RAM... \
-  && sf probe 0:0 50000000 0 && sf read ${fit_load_address} ${slot_offset} 0xC40000 && iminfo ${fit_load_address} \
-  && sf read ${extraenv_load_address} 0xFF000 0x10 \
-  && if run adi_loadvals; then \
-    echo Loaded AD936x refclk frequency and model into devicetree; \
-  fi; \
-  run pl_init; \
-  setenv bootargs console=ttyPS0,115200 maxcpus=${maxcpus} rootfstype=ramfs root=/dev/ram0 rw earlyprintk clk_ignore_unused cpuidle.off=1 panic=10 uio_pdrv_genirq.of_id=uio_pdrv_genirq UBOOT_MODEBOOT=$modeboot UBOOT_SLOT=${boot_slot} ${boot_note} UBOOT_VERSION='\"'${uboot-version}'\"' \
-  && bootm ${fit_load_address}#${fit_config}
+  echo Copying Linux from QSPI flash to RAM...; \
+  if sf probe 0:0 50000000 0 && sf read ${fit_load_address} ${slot_offset} 0xC40000 && iminfo ${fit_load_address} \
+    && sf read ${extraenv_load_address} 0xFF000 0x10; then \
+    if run adi_loadvals; then \
+      echo Loaded AD936x refclk frequency and model into devicetree; \
+    fi; \
+    run pl_init; \
+    setenv bootargs console=ttyPS0,115200 maxcpus=${maxcpus} rootfstype=ramfs root=/dev/ram0 rw earlyprintk clk_ignore_unused cpuidle.off=1 panic=10 uio_pdrv_genirq.of_id=uio_pdrv_genirq UBOOT_MODEBOOT=$modeboot UBOOT_SLOT=${boot_slot} ${boot_note} UBOOT_VERSION='\"'${uboot-version}'\"'; \
+    bootm ${fit_load_address}#${fit_config}; \
+  fi
 
 # An unconfirmed slot that fails is reset, which counts it (ab_count). A
 # confirmed slot that fails (flash damage, a bad read) boots the other slot,
