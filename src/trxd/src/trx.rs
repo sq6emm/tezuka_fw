@@ -2585,6 +2585,7 @@ impl Trx {
             "freq_min": self.freq_range().0,
             "freq_max": self.freq_range().1,
             "time_synced": time_synced(),
+            "ref": crate::refclock::summary(),
             "temp_fpga": temps.fpga.map(|c| c.round()),
             "temp_ad936x": temps.ad936x.map(|c| c.round()),
             "tci_clients": self.tci.as_ref().map_or(0, |t| t.clients()),

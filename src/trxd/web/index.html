@@ -210,6 +210,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
     <span class="grow"></span>
     <span title="WebSocket"><span class="dot" id="d-ws"></span>LINK</span>
     <span title="System clock synchronised (chrony/GPS)"><span class="dot" id="d-time"></span>TIME</span>
+    <span id="refind" class="hidden"><span class="dot" id="d-ref"></span><span id="t-ref">REF</span></span>
     <span id="temps" title="Die temperatures: Zynq FPGA (XADC) and AD9361"></span>
     <button class="k" id="setbtn" title="Callsign, S-meter calibration, transverters">SET</button>
     <button class="k" id="rc28" title="Icom RC-28 (WebHID: Chrome/Edge over HTTPS)">RC-28</button>
@@ -817,6 +818,23 @@ function pinDeck() {
 }
 addEventListener("resize", () => pinDeck());
 
+// The frequency reference next to LINK and TIME: external 10 MHz (locked or
+// still locking) or the board's own oscillator, with any software correction
+// (GPS 1PPS or NTP time) and the last measured error in the tooltip.
+function renderRef(r) {
+  $("refind").classList.toggle("hidden", !r);
+  if (!r) return;
+  const corr = { pps: "GPS", chrony: "NTP" }[r.corr];
+  const meas = r.ppb == null ? "not measured yet" :
+    `measured ${r.ppb > 0 ? "+" : ""}${(r.ppb / 1000).toFixed(2)} ppm against ${{ pps: "GPS 1PPS", chrony: "NTP time" }[r.meas] || r.meas}`;
+  $("t-ref").textContent = r.src === "int" ? (corr ? `REF INT+${corr}` : "REF INT") : "REF EXT";
+  $("d-ref").className = "dot " + (r.src === "ext" ? "ok" : r.src === "ext-acq" ? "warn" : corr ? "ok" : "");
+  $("refind").title = (r.src === "ext" ? "Locked to the external 10 MHz reference"
+    : r.src === "ext-acq" ? "External 10 MHz present, the lock is being acquired"
+    : corr ? `Internal oscillator, corrected in software from ${corr === "GPS" ? "the GPS 1PPS" : "NTP time"}`
+    : "Internal oscillator, no external reference") + `; ${meas}`;
+}
+
 // ============================================================ state rendering
 function renderState() {
   const st = S.st;
@@ -875,6 +893,7 @@ function renderState() {
   $("ptt").disabled = !txOk; $("tune").disabled = !txOk;
   $("ptt").title = txOk ? "Hold, or Space; Shift-click latches. In CW it is a straight key: carrier at the pitch while held." : "No transmitting on this frequency (receive-only band, outside trx.tx_ranges, or a receive-only transverter)";
   $("d-time").className = "dot " + (st.time_synced ? "ok" : "warn");
+  renderRef(st.ref);
   const tc = (n, c) => c == null ? "" : `<span class="${c >= 85 ? "hot" : c >= 70 ? "warm" : ""}">${n} <b>${c}°C</b></span>`;
   $("temps").innerHTML = [tc("FPGA", st.temp_fpga), tc("AD9361", st.temp_ad936x)].filter(Boolean).join(" · ");
   $("clients").textContent = `TCI ${st.tci_clients} · RIG ${st.rigctl_clients}`;

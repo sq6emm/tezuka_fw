@@ -225,6 +225,46 @@ struct RefState {
     time_synced: bool,
 }
 
+/// What the page shows next to LINK and TIME (trx state "ref").
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RefSummary {
+    /// "ext": the 40 MHz oscillator is locked to an external 10 MHz;
+    /// "ext-acq": a 10 MHz is there, the lock is still being acquired;
+    /// "int": the board's own oscillator.
+    pub src: &'static str,
+    /// Software correction in use ("pps" or "chrony"), if any.
+    pub corr: Option<&'static str>,
+    /// The last measured error of the 40 MHz reference (ppb, to 10 ppb), and
+    /// what it was measured against.
+    pub ppb: Option<i64>,
+    pub meas: Option<&'static str>,
+}
+
+static SUMMARY: std::sync::Mutex<Option<RefSummary>> = std::sync::Mutex::new(None);
+
+/// The reference as last seen by the disciplining thread (None: no thread,
+/// e.g. the ADALM-Pluto or `reference.mode = "off"`).
+pub fn summary() -> Option<RefSummary> {
+    SUMMARY.lock().ok()?.clone()
+}
+
+/// PlutoSky R2: is the ADF4001 charge pump steering the VCTCXO (a valid
+/// 10 MHz present and not forced internal)? Read like `S22refclk status`:
+/// EMIO 35 (zynq_gpio offset 54 + 35) through libgpiod's gpioget. None
+/// without the tools or the chip.
+fn r2_ext_locked() -> Option<bool> {
+    use std::process::Command;
+    let out = Command::new("gpiodetect").output().ok()?;
+    let list = String::from_utf8_lossy(&out.stdout);
+    let chip = list.lines().find(|l| l.contains("[zynq_gpio]"))?.split_whitespace().next()?.to_string();
+    let out = Command::new("gpioget").args([chip.as_str(), "89"]).output().ok()?;
+    match String::from_utf8_lossy(&out.stdout).trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
 fn phy_dir() -> Option<PathBuf> {
     let root = Path::new("/sys/bus/iio/devices");
     std::fs::read_dir(root).ok()?.flatten().map(|e| e.path()).find(|p| {
@@ -328,6 +368,10 @@ fn run(cfg: RefConfig, apply: Apply) -> Result<(), String> {
     let mut last_snap = 0.0f64;
     let mut last_pub = 0.0f64;
     let mut last_seq = meter.rd(0x1C);
+    // for the page: the hardware reference (every 2 s) and the last estimate
+    let mut hw_src = "int";
+    let mut last_hw = 0.0f64;
+    let mut last_est: Option<(f64, &'static str)> = None;
     info!(software, mode = ?cfg.mode, "reference disciplining");
 
     loop {
@@ -368,6 +412,41 @@ fn run(cfg: RefConfig, apply: Apply) -> Result<(), String> {
             tim.reset();
         }
 
+        if let Some(f) = est {
+            last_est = Some((f, source));
+        } else if source == "none" || last_est.is_some_and(|(_, s)| s != source) {
+            last_est = None;
+        }
+        let now = unix_now();
+        if now - last_hw >= 2.0 {
+            last_hw = now;
+            // Libre: vctcxo_lock status (bit 1 reference present, bit 0
+            // locked) and control (bit 0 manual hold, gpsdo_boot.sh). The
+            // core runs on the PS AXI clock, so this read is safe at any time.
+            hw_src = match &vctcxo {
+                Some(r) => {
+                    let (st, manual) = (r.rd(0x10), r.rd(0x00) & 1 != 0);
+                    match (st & 2 != 0, st & 1 != 0 && !manual) {
+                        (true, true) => "ext",
+                        (true, false) => "ext-acq",
+                        _ => "int",
+                    }
+                }
+                None => if r2_ext_locked() == Some(true) { "ext" } else { "int" },
+            };
+        }
+        let sum = RefSummary {
+            src: hw_src,
+            corr: (software && hw_src != "ext" && last_est.is_some()).then_some(source).filter(|s| *s != "none"),
+            ppb: last_est.map(|(f, _)| (((f - NOMINAL_HZ) / NOMINAL_HZ * 1e8).round() as i64) * 10),
+            meas: last_est.map(|(_, s)| s),
+        };
+        if let Ok(mut g) = SUMMARY.lock() {
+            if g.as_ref() != Some(&sum) {
+                *g = Some(sum);
+            }
+        }
+
         if let (true, Some(f)) = (software, est) {
             if (f - applied).abs() >= cfg.min_step_hz && matches!(apply, Apply::Engine) {
                 if let Ok(mut p) = PENDING.lock() {
@@ -386,7 +465,6 @@ fn run(cfg: RefConfig, apply: Apply) -> Result<(), String> {
             }
         }
 
-        let now = unix_now();
         // the state in the log every 5 minutes
         if now - last_pub >= 300.0 {
             last_pub = now;
