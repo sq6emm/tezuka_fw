@@ -277,7 +277,7 @@ pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Maia> {
                 }
                 let base = newest * BINS * 8;
                 let mut row = Vec::with_capacity(BINS);
-                let g = norm(cur);
+                let g = norm(cur) * if cur_zoom { ZOOM_GAIN } else { 1.0 };
                 for k in 0..BINS {
                     row.push(if k == 0 { 0.0 } else { decode_bin(ring.rd64(base + k * 8)) * g });
                 }
@@ -292,6 +292,14 @@ pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Maia> {
     info!(zoom_capable, "Maia spectrometer zoom input");
     Some(Maia { rows: rx, rows_per_s: want, zoom: want_zoom, zoom_capable, adc_rate })
 }
+
+/// The zoom input (the first x8 FIR stage's output) carries a signal 6.0 dB
+/// below the converter's: measured 2026-10-06 on Libre 2, one carrier at
+/// +26 kHz and +300 kHz in both rows at the same gain (-6.01, -5.94 dB).
+/// Zoom rows are scaled back by it, so the scope and the level meter (its
+/// calibration is the full-rate rows') read the same in every view: the
+/// meter read 6.4 dB low in the +/-1.25 MHz view.
+pub const ZOOM_GAIN: f32 = 3.98;
 
 /// Bin 0 carries the fastlock flag, not a power: its neighbour's value.
 /// (Until 2026-10-06 the rows were also rotated back by 545 bins: that was
