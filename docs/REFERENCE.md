@@ -92,7 +92,17 @@ min_step_hz = 0.2      # rewrite xo_correction only past this (Hz at 40 MHz = 5 
 kernel reports the clock synchronised. On Libre the hardware loop belongs to
 the board's `S22gpsdo` (`gpsdo_boot.sh`: reference choice, calibrated DAC
 centre); trxd only reports it there, and corrects in software only with
-`mode = "chrony"`. On R2, `S22refclk` still picks the ADF4001 source. Status goes to the log (`reference`) every 5 minutes:
+`mode = "chrony"`. On R2 the FPGA's ADF4001 controller (`ADF4001_refctl`,
+ported from upstream tezuka_fw #482 / maia-sdr f7092ba, 2026-10-06) probes the
+10 MHz input once a second, closes the loop when a clean reference is there
+and watches the ADF4001's own lock detect (the yellow LED shows lock);
+`S22refclk set auto|external|internal` chooses (stored with fw_setenv),
+`S22refclk status` shows mode, state, present, locked, charge pump and the
+edge count. Its EMIO lines are in `/etc/refclk.conf`: here locked is on 53
+and the state on 54-55 (upstream 52 and 53-54; 52 is our GPS 1PPS). The
+page's REF indicator reads the state: EXT locked, EXT (amber) acquiring or
+rechecking, INT without a reference. Status goes to the log (`reference`)
+every 5 minutes:
 source, measured frequency, error in ppb, applied `xo_correction`, and the
 Libre lock bit.
 

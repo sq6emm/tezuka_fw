@@ -228,7 +228,8 @@ struct RefState {
 /// What the page shows next to LINK and TIME (trx state "ref").
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RefSummary {
-    /// "ext": the 40 MHz oscillator is locked to an external 10 MHz;
+    /// "ext": the 40 MHz oscillator is locked to an external 10 MHz (on the
+/// R2 the ADF4001's own lock detect);
     /// "ext-acq": a 10 MHz is there, the lock is still being acquired;
     /// "int": the board's own oscillator.
     pub src: &'static str,
@@ -248,21 +249,32 @@ pub fn summary() -> Option<RefSummary> {
     SUMMARY.lock().ok()?.clone()
 }
 
-/// PlutoSky R2: is the ADF4001 charge pump steering the VCTCXO (a valid
-/// 10 MHz present and not forced internal)? Read like `S22refclk status`:
-/// EMIO 35 (zynq_gpio offset 54 + 35) through libgpiod's gpioget. None
-/// without the tools or the chip.
-fn r2_ext_locked() -> Option<bool> {
+/// PlutoSky R2: the FPGA's ADF4001 reference controller (ADF4001_refctl,
+/// upstream #482): "ext" locked, "ext-acq" acquiring or rechecking, "int"
+/// no reference. Read like `S22refclk status`: the state's two EMIO lines
+/// from /etc/refclk.conf (REFCLK_EMIO_BASE + REFCLK_I_STATE, here 54 - 55:
+/// 52 is the GPS 1PPS) through libgpiod's gpioget. None without the tools,
+/// the chip or the file.
+fn r2_ref_state() -> Option<&'static str> {
     use std::process::Command;
+    let conf = std::fs::read_to_string("/etc/refclk.conf").ok()?;
+    let val = |k: &str| -> Option<u32> {
+        conf.lines().find_map(|l| l.trim().strip_prefix(k)?.strip_prefix('=')?.split_whitespace().next()?.parse().ok())
+    };
+    let line = val("REFCLK_EMIO_BASE")? + val("REFCLK_I_STATE")?;
     let out = Command::new("gpiodetect").output().ok()?;
     let list = String::from_utf8_lossy(&out.stdout);
     let chip = list.lines().find(|l| l.contains("[zynq_gpio]"))?.split_whitespace().next()?.to_string();
-    let out = Command::new("gpioget").args([chip.as_str(), "89"]).output().ok()?;
-    match String::from_utf8_lossy(&out.stdout).trim() {
-        "1" => Some(true),
-        "0" => Some(false),
-        _ => None,
-    }
+    let out = Command::new("gpioget").args([chip.as_str(), &line.to_string(), &(line + 1).to_string()]).output().ok()?;
+    let bits: Vec<u32> = String::from_utf8_lossy(&out.stdout).split_whitespace().filter_map(|b| b.parse().ok()).collect();
+    Some(match bits.as_slice() {
+        [lo, hi] => match lo + 2 * hi {
+            2 => "ext",
+            1 | 3 => "ext-acq",
+            _ => "int",
+        },
+        _ => return None,
+    })
 }
 
 fn phy_dir() -> Option<PathBuf> {
@@ -432,7 +444,7 @@ fn run(cfg: RefConfig, apply: Apply) -> Result<(), String> {
                         _ => "int",
                     }
                 }
-                None => if r2_ext_locked() == Some(true) { "ext" } else { "int" },
+                None => r2_ref_state().unwrap_or("int"),
             };
         }
         let sum = RefSummary {
