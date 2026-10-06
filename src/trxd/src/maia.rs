@@ -22,7 +22,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, bounded};
@@ -44,6 +44,8 @@ const RING_BYTES: usize = BUFFERS * BINS * 8;
 const REG_CONTROL: usize = 0x08;
 const REG_INTERRUPTS: usize = 0x0C;
 const REG_SPECTROMETER: usize = 0x20;
+/// Spectrometer register bit 16 (maia_hdl use_zoom): the zoom input.
+const ZOOM_BIT: u32 = 1 << 16;
 
 struct Mapping {
     ptr: *mut u8,
@@ -121,6 +123,9 @@ pub fn decode_bin(x: u64) -> f32 {
 pub struct Row {
     pub at: Instant,
     pub bins: Vec<f32>,
+    /// From the zoom input (the first x8 decimation stage) rather than the
+    /// converter's full rate.
+    pub zoom: bool,
 }
 
 /// The running spectrometer: its rows, and the rate it makes them at
@@ -128,6 +133,9 @@ pub struct Row {
 pub struct Maia {
     pub rows: Receiver<Row>,
     rows_per_s: Arc<AtomicU32>,
+    zoom: Arc<AtomicBool>,
+    /// The bitstream has the zoom input (register bit 16 reads back).
+    pub zoom_capable: bool,
     adc_rate: f64,
 }
 
@@ -135,6 +143,12 @@ impl Maia {
     /// Rows a second (the integration count follows), from the next row on.
     pub fn set_rows_per_s(&self, r: f64) {
         self.rows_per_s.store(r.round() as u32, Ordering::Relaxed);
+    }
+
+    /// The spectrometer on the zoom input (the 3.072 MS/s first decimation
+    /// stage) or on the full rate, from the next row on.
+    pub fn set_zoom(&self, on: bool) {
+        self.zoom.store(on && self.zoom_capable, Ordering::Relaxed);
     }
 
     /// How long one row integrates at that rate.
@@ -190,9 +204,16 @@ pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Maia> {
     let want = Arc::new(AtomicU32::new(rows_per_s.round() as u32));
     let mut cur = nint(adc_rate, rows_per_s);
     regs.wr32(REG_CONTROL, 0); // out of reset
+    // The zoom input, if the bitstream has it (bit 16 reads back).
+    regs.wr32(REG_SPECTROMETER, (cur << 1) | ZOOM_BIT);
+    let zoom_capable = regs.rd32(REG_SPECTROMETER) & ZOOM_BIT != 0;
     // Full-rate ADC input, average mode, nint integrations; abort any
     // integration in progress so the new count takes effect now.
     regs.wr32(REG_SPECTROMETER, (cur << 1) | (1 << 11));
+    let want_zoom = Arc::new(AtomicBool::new(false));
+    let zoom_rd = want_zoom.clone();
+    let mut cur_zoom = false;
+    let mut skip = 0u32;
     // Full-scale 12-bit tone through a 4096-point FFT, averaged nint times.
     let norm = |n: u32| 1.0 / (n as f32 * (2048.0f32 * BINS as f32).powi(2));
     info!(nint = cur, rows_per_s = adc_rate / (BINS as f64 * cur as f64), "Maia FPGA spectrometer running");
@@ -207,11 +228,16 @@ pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Maia> {
             loop {
                 // A new rate: the count, and the integration under way
                 // aborted so the next row is all at the new one.
+                // (the count and the zoom bit share the register: always both)
                 let n = nint(adc_rate, want_rd.load(Ordering::Relaxed) as f64);
-                if n != cur {
+                let z = zoom_rd.load(Ordering::Relaxed);
+                if n != cur || z != cur_zoom {
                     cur = n;
-                    regs.wr32(REG_SPECTROMETER, (cur << 1) | (1 << 11));
+                    cur_zoom = z;
+                    regs.wr32(REG_SPECTROMETER, (cur << 1) | (1 << 11) | if z { ZOOM_BIT } else { 0 });
                     last = None;
+                    // a row already under way when it changed is not used
+                    skip = 1;
                 }
                 if uio.write_all(&1u32.to_ne_bytes()).is_err() {
                     break;
@@ -243,6 +269,10 @@ pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Maia> {
                     continue;
                 }
                 last = Some(newest);
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
                 let base = newest * BINS * 8;
                 let mut row = Vec::with_capacity(BINS);
                 let g = norm(cur);
@@ -250,14 +280,15 @@ pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Maia> {
                     row.push(if k == 0 { 0.0 } else { decode_bin(ring.rd64(base + k * 8)) * g });
                 }
                 derotate(&mut row);
-                if let Err(crossbeam_channel::TrySendError::Disconnected(_)) = tx.try_send(Row { at: Instant::now(), bins: row }) {
+                if let Err(crossbeam_channel::TrySendError::Disconnected(_)) = tx.try_send(Row { at: Instant::now(), bins: row, zoom: cur_zoom }) {
                     break; // engine gone
                 }
             }
             warn!("Maia spectrometer reader stopped");
         })
         .ok()?;
-    Some(Maia { rows: rx, rows_per_s: want, adc_rate })
+    info!(zoom_capable, "Maia spectrometer zoom input");
+    Some(Maia { rows: rx, rows_per_s: want, zoom: want_zoom, zoom_capable, adc_rate })
 }
 
 /// A row as the spectrometer wrote it to the row in frequency order (DC in

@@ -50,3 +50,19 @@ channel DDC decimates 512x (24.576 MS/s -> 48 kHz). trxd takes the rate from
 the image's rate file (`/lib/firmware/fpga-trx.rate`: "24576000 64"); the
 DATV images stay at 3.072 MS/s and x8. FPGA: 138 of 220 DSPs (the two new
 stages: 42), WNS +0.5 ns.
+
+## Zoom and the analog filter on the wide image (2026-10-06 later)
+
+- Maia's core has a second spectrometer input on the wide image (maia_hdl
+  config.spectrometer_zoom, register 0x20 bit 16): the first x8 decimation
+  stage's output, 3.072 MS/s, 750 Hz bins. The planner takes it for the
+  views between the stream (+/-150 kHz, 94 Hz bins) and the full band
+  (+/-2.5 MHz and wider, 6 kHz bins): no "big squares" when zooming in.
+  Switching inputs is one register bit, no AD9361 recalibration.
+- The analog RX filter follows the view in steps on the wide image: 1 MHz
+  for the channel/stream views (listening), 6 MHz up to +/-2.5 MHz, all
+  of Maia's view above. Kept open at 22 MHz, the whole FM band took the
+  AD9361 gain from 73 to 61 dB and RDS decoded on 0 of 6 stations (6 of 6
+  at 1 MHz). In the +/-5M and +/-10M views RDS is weaker for that reason.
+- Maia's rows are rotated -545 bins by the core (maia.rs ROTATION): trxd
+  rotates them back, the zoom rows too.

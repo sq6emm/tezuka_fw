@@ -267,7 +267,8 @@ pub struct Trx {
     /// The stream meter runs until then (or while DATV is received).
     stream_meter_until: Instant,
     /// The latest Maia spectrometer row (wide bands).
-    maia_last: Option<Vec<f32>>,
+    /// The last Maia row and the rate it covers (full or zoom).
+    maia_last: Option<(Vec<f32>, f64)>,
     /// Largest stream sample magnitude since the last reading.
     stream_peak: f32,
     /// (dial, LO, socket) the meters last averaged at: a change restarts them.
@@ -1215,6 +1216,8 @@ impl Trx {
             // A sweep moves the LO: not while sending, receiving DATV, with
             // the LOs split, or through a transverter (its IF range).
             sweep_ok: self.tx_on.is_none() && !self.rf_live && !self.datv_mode && self.datv_rx.is_none() && self.lo_split.is_none() && self.xvtr.is_none(),
+            // the zoom input: the first x8 stage (wide image only)
+            zoom_rate: self.maia.as_ref().filter(|m| m.zoom_capable).map(|_| self.cfg.radio.adc_rate as f64 / 8.0),
         }
     }
 
@@ -1262,6 +1265,7 @@ impl Trx {
     fn sweep_step(&mut self, view: f64, span: f64) -> Option<Vec<u8>> {
         let adc = self.cfg.radio.adc_rate as f64;
         let m = self.maia.as_ref()?;
+        m.set_zoom(false);
         if self.sweep.as_ref().is_none_or(|s| s.view != (view, span)) {
             let (min, max) = (self.cfg.radio.freq_min_hz, self.cfg.radio.freq_max_hz);
             let los = crate::scopeplan::sweep_los(view, span, adc, min, max);
@@ -1284,7 +1288,7 @@ impl Trx {
                 None
             }
             Some(t) => {
-                let row = m.rows.try_iter().filter(|r| r.at >= t + settle).last()?;
+                let row = m.rows.try_iter().filter(|r| !r.zoom && r.at >= t + settle).last()?;
                 sw.stitch.add(lo, &row.bins, adc);
                 sw.k += 1;
                 sw.set_at = None;
@@ -1789,17 +1793,20 @@ impl Trx {
         let mut maia = None;
         if chan.is_none() && stream.is_none() {
             use crate::scopeplan::Source;
-            let scope_reads = self.scope_watching() && matches!(self.scope_source(), Source::Maia { .. } | Source::Sweep);
+            let scope_reads = self.scope_watching() && matches!(self.scope_source(), Source::Maia { .. } | Source::Zoom { .. } | Source::Sweep);
             if !scope_reads {
-                if let Some(r) = self.maia.as_ref().and_then(|m| m.rows.try_iter().last()) {
-                    self.maia_last = Some(r.bins);
+                if let Some(m) = &self.maia {
+                    m.set_zoom(false);
+                    if let Some(r) = m.rows.try_iter().filter(|r| !r.zoom).last() {
+                        self.maia_last = Some((r.bins, self.cfg.radio.adc_rate as f64));
+                    }
                 }
             }
-            if let Some(row) = &self.maia_last {
+            if let Some((row, row_rate)) = &self.maia_last {
                 // The row is the AD936x's own spectrum, centred on its LO.
                 let inv = self.xvtr.as_ref().is_some_and(|t| t.inverted);
                 let (a, b) = if inv { (-(o + hi), -(o + lo)) } else { (o + lo, o + hi) };
-                maia = crate::power::maia_band(row, self.cfg.radio.adc_rate as f64, a, b).map(|(p, d)| RawLevel {
+                maia = crate::power::maia_band(row, *row_rate, a, b).map(|(p, d)| RawLevel {
                     dbfs: db(p),
                     peak_dbfs: db(p),
                     noise_dbfs_hz: d.map(db),
@@ -1852,7 +1859,7 @@ impl Trx {
         let scope_off = table.map(|_| {
             if self.web_span <= NARROW_SPAN_MAX {
                 off
-            } else if matches!(self.scope_source(), crate::scopeplan::Source::Maia { .. } | crate::scopeplan::Source::Sweep) {
+            } else if matches!(self.scope_source(), crate::scopeplan::Source::Maia { .. } | crate::scopeplan::Source::Zoom { .. } | crate::scopeplan::Source::Sweep) {
                 off + mdb
             } else {
                 off + sdb
@@ -2189,16 +2196,28 @@ impl Trx {
         });
         // A wide scope view opens it over the view (scopeplan): beyond the
         // default 1 MHz, Maia saw only the filter's skirts. On a wide image
-        // (24.576 MS/s) it stays open over all Maia sees, as in Maia SDR:
-        // every change recalibrates the AD936x and stalls reception for
-        // about 55 ms, which span changes made audible.
+        // (24.576 MS/s) in steps (1 MHz, 6 MHz, all Maia sees): every change
+        // recalibrates the AD936x and stalls reception for about 55 ms, so
+        // it must not follow every click or small span change. Not always
+        // open: the whole FM band in the filter took the AD936x gain 12 dB
+        // down and RDS decoded on 0 of 6 stations (6 of 6 at 1 MHz).
         let r = self.scope_radio();
         let want = if r.adc_rate >= WIDE_ADC_RATE {
-            want.max((2.0 * r.maia_half()) as u32)
+            let need = if self.scope_watching() {
+                match self.scope_source() {
+                    crate::scopeplan::Source::Maia { rf_bw } | crate::scopeplan::Source::Zoom { rf_bw } => rf_bw,
+                    crate::scopeplan::Source::Sweep => 2.0 * r.maia_half(),
+                    _ => 0.0,
+                }
+            } else {
+                0.0
+            };
+            let step = if need <= 1.0e6 { 0.0 } else if need <= 6.0e6 { 6.0e6 } else { 2.0 * r.maia_half() };
+            want.max(step as u32)
         } else if self.scope_watching() {
             let r = self.scope_radio();
             match self.scope_source() {
-                crate::scopeplan::Source::Maia { rf_bw } => want.max(rf_bw as u32),
+                crate::scopeplan::Source::Maia { rf_bw } | crate::scopeplan::Source::Zoom { rf_bw } => want.max(rf_bw as u32),
                 crate::scopeplan::Source::Sweep => want.max((2.0 * r.maia_half()) as u32),
                 _ => want,
             }
@@ -2370,12 +2389,17 @@ impl Trx {
                         cols
                     })
                 }
-                Source::Maia { .. } => {
-                    let adc = self.cfg.radio.adc_rate as f64;
-                    let got = self.maia.as_ref().and_then(|m| m.rows.try_iter().last()).map(|r| r.bins);
+                Source::Maia { .. } | Source::Zoom { .. } => {
+                    // the zoom input's rows at its own rate (750 Hz bins)
+                    let zoom = matches!(src, Source::Zoom { .. });
+                    let adc = if zoom { self.cfg.radio.adc_rate as f64 / 8.0 } else { self.cfg.radio.adc_rate as f64 };
+                    let got = self.maia.as_ref().and_then(|m| {
+                        m.set_zoom(zoom);
+                        m.rows.try_iter().filter(|r| r.zoom == zoom).last()
+                    }).map(|r| r.bins);
                     // (The level meter measures wide bands on it too.)
                     if let Some(r) = &got {
-                        self.maia_last = Some(r.clone());
+                        self.maia_last = Some((r.clone(), adc));
                     }
                     got.map(|mut r| {
                         if inverted {

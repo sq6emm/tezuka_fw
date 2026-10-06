@@ -35,6 +35,9 @@ pub enum Source {
     Stream,
     /// One Maia look; `rf_bw`: the analog RX filter that covers the view.
     Maia { rf_bw: f64 },
+    /// Maia on its zoom input (the first x8 decimation stage: 750 Hz bins
+    /// on the wide image) for the views between the stream and the band.
+    Zoom { rf_bw: f64 },
     Sweep,
 }
 
@@ -44,6 +47,7 @@ impl Source {
             Source::Channel => "channel",
             Source::Stream => "stream",
             Source::Maia { .. } => "maia",
+            Source::Zoom { .. } => "zoom",
             Source::Sweep => "sweep",
         }
     }
@@ -64,12 +68,19 @@ pub struct Radio {
     pub maia: bool,
     /// A sweep may move the LO now (not transmitting, no DATV receiver).
     pub sweep_ok: bool,
+    /// Maia's zoom input rate, if the bitstream has one.
+    pub zoom_rate: Option<f64>,
 }
 
 impl Radio {
     /// How far from the LO one Maia look reaches.
     pub fn maia_half(&self) -> f64 {
         self.adc_rate * MAIA_USE
+    }
+
+    /// How far from the LO one zoomed look reaches (0: no zoom input).
+    pub fn zoom_half(&self) -> f64 {
+        self.zoom_rate.map_or(0.0, |z| z * MAIA_USE)
     }
 }
 
@@ -88,6 +99,9 @@ pub fn source(c: f64, span: f64, r: &Radio) -> Source {
     if !r.maia || (span <= STREAM_SPAN_MAX && reach <= r.stream_rate / 2.0) {
         return Source::Stream;
     }
+    if r.zoom_rate.is_some() && reach <= r.zoom_half() {
+        return Source::Zoom { rf_bw: rf_bw_for(reach, r) };
+    }
     // One look whenever one can show the view, the LO where it is or not
     // (lo_window brings it over; a sweep that held the LO kept on sweeping
     // a view one look could take). A sweep only for wider views.
@@ -104,6 +118,7 @@ pub fn covers(c: f64, span: f64, r: &Radio, src: Source) -> bool {
         Source::Channel => (c - r.chan_center).abs() + half <= r.chan_rate * 0.45,
         Source::Stream => reach <= r.stream_rate / 2.0,
         Source::Maia { .. } => reach <= r.maia_half(),
+        Source::Zoom { .. } => reach <= r.zoom_half(),
         Source::Sweep => true,
     }
 }
@@ -124,6 +139,8 @@ pub fn lo_window(c: f64, span: f64, r: &Radio) -> Option<(f64, f64)> {
         None
     } else if span <= STREAM_SPAN_MAX || !r.maia {
         Some((c, (r.stream_rate / 2.0 - half).max(0.0)))
+    } else if half <= r.zoom_half() {
+        Some((c, r.zoom_half() - half))
     } else if half <= r.maia_half() {
         Some((c, r.maia_half() - half))
     } else {
@@ -197,7 +214,7 @@ mod tests {
     use super::*;
 
     fn radio(lo: f64, vfo: f64) -> Radio {
-        Radio { lo, stream_rate: 384_000.0, chan_center: vfo, chan_rate: 48_000.0, adc_rate: 3_072_000.0, maia: true, sweep_ok: true }
+        Radio { lo, stream_rate: 384_000.0, chan_center: vfo, chan_rate: 48_000.0, adc_rate: 3_072_000.0, maia: true, sweep_ok: true, zoom_rate: None }
     }
 
     /// The view the source draws from covers the whole view.
@@ -207,6 +224,7 @@ mod tests {
             Source::Channel => (c - r.chan_center).abs() + span / 2.0 <= r.chan_rate / 2.0,
             Source::Stream => reach <= r.stream_rate / 2.0,
             Source::Maia { rf_bw } => reach <= r.maia_half() && rf_bw / 2.0 >= reach,
+            Source::Zoom { rf_bw } => reach <= r.zoom_half() && rf_bw / 2.0 >= reach,
             Source::Sweep => true,
         }
     }
@@ -271,6 +289,25 @@ mod tests {
         let r = radio(99_975_000.0, 87_534_000.0);
         assert!(matches!(source(87_534_000.0, 2_500_000.0, &r), Source::Maia { .. }));
         assert!(lo_window(87_534_000.0, 2_500_000.0, &r).is_some());
+    }
+
+    /// The wide image: the zoom input (3.072 MS/s, 750 Hz bins) between the
+    /// stream and the full rate (6 kHz bins), never a sweep up to +/-11 MHz.
+    #[test]
+    fn the_wide_image_zooms_by_span() {
+        let wide = |lo: f64| Radio { adc_rate: 24_576_000.0, zoom_rate: Some(3_072_000.0), ..radio(lo, 100e6) };
+        let r = wide(100e6 - 25e3);
+        assert_eq!(source(100e6, 250_000.0, &r), Source::Stream);
+        assert!(matches!(source(100e6, 1_000_000.0, &r), Source::Zoom { .. }));
+        assert!(matches!(source(100e6, 2_500_000.0, &r), Source::Zoom { .. }));
+        assert!(matches!(source(100e6, 5_000_000.0, &r), Source::Maia { .. }));
+        assert!(matches!(source(100e6, 20_000_000.0, &r), Source::Maia { .. }));
+        // a zoom view the LO is too far from for the zoom: the LO window
+        // brings it over (narrow), or the full rate covers it meanwhile
+        let far = wide(100e6 + 2e6);
+        assert!(matches!(source(100e6, 1_000_000.0, &far), Source::Maia { .. }));
+        let (w, m) = lo_window(100e6, 1_000_000.0, &far).unwrap();
+        assert!((w - 100e6).abs() < 1.0 && (m - (3_072_000.0 * MAIA_USE - 500e3)).abs() < 1.0);
     }
 
     #[test]
