@@ -100,6 +100,9 @@ const NARROW_SPAN_MAX: f64 = crate::scopeplan::NARROW_SPAN_MAX;
 /// view: the LO goes beside the view, at most `rate * 0.4` from the VFO, which
 /// leaves tuning room either way up to +/-50 kHz. Wider views blank it instead.
 const DC_AVOID_SPAN_MAX: f64 = 100_000.0;
+/// From this converter rate up (the wide LibreSDR image) the analog RX filter
+/// stays open over all of Maia's view.
+const WIDE_ADC_RATE: f64 = 10e6;
 /// Maia's rows a second normally, and while sweeping (shorter looks, so a
 /// sweep line over the FM band takes about half a second).
 const MAIA_ROWS_PER_S: f64 = 15.0;
@@ -764,9 +767,15 @@ impl Trx {
         };
         // Wide FM's channel reaches WFM_HALF_HZ either side of the dial.
         let rx_half = if self.mode == Mode::Wfm { WFM_HALF_HZ } else { 0.0 };
+        // The channel from the FPGA's DDC works on the converter's full rate,
+        // so the receiver may sit anywhere Maia sees (+/-11 MHz on the wide
+        // LibreSDR image), not only in the 384 kS/s stream: a click in a
+        // wide view moves the DDC, not the LO (and the view). The stream
+        // still bounds what is sent (the TX path is 384 kS/s around the LO).
+        let rx_reach = if self.chan_fpga.is_some() { (self.cfg.radio.adc_rate as f64 * 0.45).max(half) } else { half };
         let fits_rx = |c: f64| {
             let off = rx - c;
-            off.abs() < half - EDGE_MARGIN_HZ - rx_half && off.abs() > EDGE_MARGIN_HZ
+            off.abs() < rx_reach - EDGE_MARGIN_HZ - rx_half && off.abs() > EDGE_MARGIN_HZ
         };
         let fits_all = |c: f64| fits_rx(c) && (self.tx_on.is_none() || fits(tx, c));
         // (The web view has to lie inside what its source covers.)
@@ -2179,8 +2188,14 @@ impl Trx {
             self.cfg.radio.rf_bandwidth.max((bw * 1.3) as u32)
         });
         // A wide scope view opens it over the view (scopeplan): beyond the
-        // default 1 MHz, Maia saw only the filter's skirts.
-        let want = if self.scope_watching() {
+        // default 1 MHz, Maia saw only the filter's skirts. On a wide image
+        // (24.576 MS/s) it stays open over all Maia sees, as in Maia SDR:
+        // every change recalibrates the AD936x and stalls reception for
+        // about 55 ms, which span changes made audible.
+        let r = self.scope_radio();
+        let want = if r.adc_rate >= WIDE_ADC_RATE {
+            want.max((2.0 * r.maia_half()) as u32)
+        } else if self.scope_watching() {
             let r = self.scope_radio();
             match self.scope_source() {
                 crate::scopeplan::Source::Maia { rf_bw } => want.max(rf_bw as u32),
