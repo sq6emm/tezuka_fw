@@ -533,6 +533,42 @@ mod tests {
         assert!(design(FS, 1e6, 0.35).is_err(), "1 MS/s: under 2 samples a symbol");
     }
 
+    /// The wide LibreSDR images run the converter at 24.576 MS/s: every
+    /// offered symbol rate (and the radio's channel) still fits the DDC and
+    /// filters as well (a tone in band passes, its alias is 50 dB down).
+    #[test]
+    fn designs_fit_and_filter_at_the_wide_rate() {
+        const WIDE: f64 = 24_576_000.0;
+        let run = |d: &Design, center: f64, hz: f64| {
+            let mut m = DdcModel::new(d, frequency_word(center, WIDE));
+            let x: Vec<[i16; 2]> = (0..200_000)
+                .map(|k| {
+                    let p = std::f64::consts::TAU * hz * k as f64 / WIDE;
+                    [(1000.0 * p.cos()).round() as i16, (1000.0 * p.sin()).round() as i16]
+                })
+                .collect();
+            let mut y = Vec::new();
+            m.process(&x, &mut y);
+            let tail = &y[y.len() / 2..];
+            (tail.iter().map(|v| (v[0] as f64).powi(2) + (v[1] as f64).powi(2)).sum::<f64>() / tail.len() as f64).sqrt()
+        };
+        for rs in [33e3, 66e3, 125e3, 250e3, 333e3, 500e3] {
+            let d = design(WIDE, rs, 0.35).unwrap_or_else(|e| panic!("{rs}: {e}"));
+            let sps = d.fs_out() / rs;
+            assert!((2.0..4.0).contains(&sps), "{rs}: {sps}");
+            let pass = run(&d, 100e3, 100e3 + rs * 0.3);
+            let stop = run(&d, 100e3, 100e3 + d.fs_out() * 1.1);
+            assert!(pass > 300.0, "{rs}: pass-band level {pass}");
+            assert!(20.0 * (pass / stop.max(1e-9)).log10() > 50.0, "{rs}: pass {pass} stop {stop}");
+        }
+        for (fs_out, pass_hz) in [(48e3, 12e3), (192e3, 85e3)] {
+            let d = design_channel(WIDE, fs_out, pass_hz).unwrap_or_else(|e| panic!("channel {fs_out}: {e}"));
+            let pass = run(&d, 0.0, pass_hz * 0.5);
+            let stop = run(&d, 0.0, fs_out * 1.2);
+            assert!(20.0 * (pass / stop.max(1e-9)).log10() > 50.0, "channel {fs_out}: pass {pass} stop {stop}");
+        }
+    }
+
     /// Test vectors for maia-hdl (`test/test_datv_ddc.py`): the designs,
     /// the coefficient RAM image and registers, ADC input, and this model's
     /// mixer and filter outputs. `DDC_VECTORS=<file> cargo test dump -- --ignored`

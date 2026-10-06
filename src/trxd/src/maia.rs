@@ -31,6 +31,14 @@ use tracing::{info, warn};
 const RING_PHYS: u64 = 0x1600_0000;
 const BUFFERS: usize = 8;
 pub const BINS: usize = 4096;
+/// Maia's spectrometer (every simple bitstream, 3.072 and 24.576 MS/s alike,
+/// back to at least 2026-10-01) writes its spectra rotated: a carrier lands
+/// 545 bins below where it belongs (measured 2026-10-06 on the raw rows in
+/// DDR: a known carrier in bin 1538 instead of 2083; -407 kHz at 3.072 MS/s,
+/// -3.27 MHz at 24.576 MS/s). The shape is intact (clean sidelobes), so the
+/// whole spectrum is moved, probably in the FFT core (its 3x-clocked
+/// complex multiplier). Until that is found, each row is rotated back here.
+pub const ROTATION: usize = 545;
 const RING_BYTES: usize = BUFFERS * BINS * 8;
 
 const REG_CONTROL: usize = 0x08;
@@ -241,6 +249,7 @@ pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Maia> {
                 for k in 0..BINS {
                     row.push(if k == 0 { 0.0 } else { decode_bin(ring.rd64(base + k * 8)) * g });
                 }
+                derotate(&mut row);
                 if let Err(crossbeam_channel::TrySendError::Disconnected(_)) = tx.try_send(Row { at: Instant::now(), bins: row }) {
                     break; // engine gone
                 }
@@ -251,9 +260,30 @@ pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Maia> {
     Some(Maia { rows: rx, rows_per_s: want, adc_rate })
 }
 
+/// A row as the spectrometer wrote it to the row in frequency order (DC in
+/// the middle): bin 0 (the fastlock flag, no power) takes its neighbour's
+/// value, then the rotation is undone.
+pub fn derotate(row: &mut [f32]) {
+    if row.len() > 1 {
+        row[0] = row[1];
+    }
+    row.rotate_right(ROTATION % row.len().max(1));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rows_are_derotated_to_where_the_carrier_is() {
+        // the 2026-10-06 measurement: bin 2083 (the carrier) written at 1538
+        let mut row = vec![1e-6f32; BINS];
+        row[1538] = 1.0;
+        derotate(&mut row);
+        let k = (0..BINS).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap();
+        assert_eq!(k, 2083);
+        assert!(row.iter().all(|&p| p > 0.0), "no hole where bin 0 went");
+    }
 
     #[test]
     fn decodes_maia_floating_point() {
