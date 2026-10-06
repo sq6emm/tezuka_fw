@@ -12,6 +12,8 @@ CW decoders) or an IARU-R1 MGM beacon transmitter/receiver. See `docs/PLAN.md` f
 frequency-reference design and `docs/DATV.md` for DVB-S2 video (trxd
 `src/dvbs2/`: TX, RX, TS mux/demux; web UI DATV panel) and `docs/DATV-FPGA.md`
 for its FPGA front end (Maia DDC + ring DMA, maia-sdr branch `datv-ddc`); `docs/DATV-OTA.md` has every DATV mode over the air on every band.
+`docs/SCOPE.md`: the web scope (one planner for sources and LO placement,
+Maia with the analog filter opened, the sweep up to +/-12.5 MHz).
 `docs/RADE.md`: RADE V2 digital voice, run in the browser (rade_c built to
 WASM in `src/rade-web/`, the module in the `model` flash partition).
 

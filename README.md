@@ -78,7 +78,7 @@ start in `/mnt/jffs2/trxd-web/password`.
 
 The layout follows an IC-9700 front panel:
 - **LCD:** a large VFO display (scroll or drag a digit to tune it), VFO A/B, split, the mode/filter/AGC tags, and an S-meter that switches to Po on TX.
-- **Scope:** spectrum over waterfall, with click, drag and wheel tuning and automatic reference level. Spans from ±2.5 kHz to ±1.25 MHz; the wide ones come straight from Maia's FPGA spectrometer over the full ADC bandwidth.
+- **Scope:** spectrum over waterfall, with click, drag and wheel tuning and automatic reference level. Spans from ±2.5 kHz to ±1.25 MHz in one look (the wide ones straight from Maia's FPGA spectrometer, the analog filter opened over the view), and swept views up to ±12.5 MHz (the whole FM band; no audio while sweeping). docs/SCOPE.md.
 - **Touch keys:** band, mode, FIL1-3, AGC, tuning step, RF/AF/drive/TX-attenuator, and 8 memories.
 - **Transmit:** PTT (hold, Space, or Shift-click to latch) with your microphone, TUNE, a CW keyboard with macros, and the Q65/PI4 decode list (click to tune).
 

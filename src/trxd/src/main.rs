@@ -29,6 +29,7 @@ mod radio;
 mod refclock;
 mod safety;
 mod scope;
+mod scopeplan;
 mod slots;
 mod speech;
 mod stream;

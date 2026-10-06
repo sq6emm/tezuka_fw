@@ -109,6 +109,7 @@ header a { color: var(--dim); }
   padding: 1px 5px; border-radius: 4px; pointer-events: none; transform: translate(-50%, -130%); white-space: nowrap; }
 
 /* ---------- control deck ---------- */
+@media (min-width: 721px) { body.datv-mode #deck { max-height: var(--deck-h, none); overflow-y: auto; } }
 #deck { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.1fr); gap: 6px; }
 .card { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px; padding: 8px; display: grid; gap: 7px; align-content: start; }
 .card h3 { margin: 0; font-size: 11px; letter-spacing: .12em; color: var(--dim); font-weight: 700; }
@@ -234,8 +235,10 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
     <div class="row">
       <span class="note">My call</span>
       <input type="text" id="set-call" placeholder="e.g. SQ6EMM" maxlength="12" style="max-width:160px" autocomplete="off">
+      <span class="note">My locator</span>
+      <input type="text" id="set-loc" placeholder="e.g. JO81HU" maxlength="10" style="max-width:130px" autocomplete="off">
       <button class="k" id="call-save">SAVE</button>
-      <span class="note">used in the header and the CW macros; empty = trxd.toml's</span>
+      <span class="note">shown in the header (call in the CW macros too); empty = trxd.toml's</span>
     </div>
     <h3>LEVEL CALIBRATION <span class="note">S-meter and readout in dBm at the antenna socket, the same in every mode, filter and AGC state.
       IARU: S9 = -73 dBm below 30 MHz, -93 dBm above; 6 dB per S unit</span></h3>
@@ -313,6 +316,9 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <button class="k" data-span="500000">±250k</button>
       <button class="k" data-span="1000000">±500k</button>
       <button class="k" data-span="2500000">±1.25M</button>
+      <button class="k" data-span="5000000" title="Swept view: the LO steps across, no audio meanwhile; click a station to listen">±2.5M</button>
+      <button class="k" data-span="10000000" title="Swept view: the LO steps across, no audio meanwhile; click a station to listen">±5M</button>
+      <button class="k" data-span="25000000" title="Swept view (the whole FM broadcast band from 100 MHz): the LO steps across, no audio meanwhile; click a station to listen">±12.5M</button>
       <button class="k" id="ref-auto" title="Keep the noise floor near the bottom of the scope">AUTO</button>
       <button class="k" id="ref-dn" title="Reference level down">REF−</button>
       <button class="k" id="ref-up" title="Reference level up">REF+</button>
@@ -349,14 +355,9 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       </div>
       <div class="slider voice-only">SQL<input type="range" id="sql" min="0" max="100" value="0"><b id="sql-v">OFF</b></div>
       <div class="row datv-only">
-        <select id="datv-sr" title="Symbol rate (amateur standard rates): lower is narrower and more sensitive">
-          <option value="0">Auto (receive)</option><option value="33000">33 kS/s</option><option value="66000">66 kS/s</option><option value="125000">125 kS/s</option>
-          <option value="250000" selected>250 kS/s</option><option value="333000">333 kS/s</option><option value="500000">500 kS/s</option>
-        </select>
-        <select id="datv-fec" title="DVB-S2 (long frames, pilots) or DVB-T2 mode: lower rates are more robust, carry less">
-          <optgroup label="DVB-S2"><option value="L-QPSK-1/2" selected>QPSK 1/2</option><option value="L-QPSK-3/4">QPSK 3/4</option><option value="L-8PSK-3/4">8PSK 3/4</option></optgroup>
-          <optgroup label="DVB-T2 (bandwidth in the mode)"><option value="T2-1.7-QPSK-1/2">1.7 MHz QPSK 1/2</option><option value="T2-1.7-QPSK-3/4">1.7 MHz QPSK 3/4</option><option value="T2-1.7-16QAM-1/2">1.7 MHz 16QAM 1/2</option><option value="T2-1.7-16QAM-3/4">1.7 MHz 16QAM 3/4</option><option value="T2-2.0-QPSK-1/2">2.0 MHz QPSK 1/2</option><option value="T2-2.0-16QAM-1/2">2.0 MHz 16QAM 1/2</option><option value="T2-1.35-QPSK-1/2">1.35 MHz QPSK 1/2</option></optgroup>
-        </select>
+        <select id="datv-sys" title="System: DVB-S2 (one carrier) or DVB-T2 (OFDM); Auto receive scans for DVB-S2 at the standard symbol rates and reads the mode from the signal (receive only)"><option value="AUTO">Auto receive (DVB-S2)</option><option value="S2" selected>DVB-S2</option><option value="T2">DVB-T2</option></select>
+        <select id="datv-sr" title="DVB-S2: symbol rate (amateur standard rates); DVB-T2: channel bandwidth. Narrower is more sensitive"></select>
+        <select id="datv-fec" title="Modulation and code rate (those that exist for this width): lower rates are more robust, carry less"></select>
       </div>
       <div class="note datv-only" id="datv-info">—</div>
       <div class="note datv-only">Both stations use the same settings. The picture adapts to the rate (160x120 at 2 fps
@@ -392,6 +393,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <div class="row">
         <button class="k voice-only" id="ptt" title="Hold, or Space; Shift-click latches. In CW it is a straight key: carrier at the pitch while held.">PTT</button>
         <button class="k voice-only" id="tune">TUNE</button>
+        <button class="k voice-only ssb-only" id="two-tone" title="Two-tone test (linearity): 700 and 1900 Hz, equal, at TUNE's peak power; click again to stop">2TONE</button>
         <button class="k voice-only" id="mic">MIC</button>
         <button class="k" id="mute-tx" title="Lit: the receiver is muted while transmitting. Off: keep receiving during TX (satellites, crossband).">MUTE AT TX</button>
       </div>
@@ -762,6 +764,7 @@ function openSettings() {
   const st = S.st; if (!st) return;
   send({ cmd: "calib_get" });
   $("set-call").value = st.call || "";
+  $("set-loc").value = st.loc || "";
   $("xv-body").innerHTML = "";
   (st.xvtrs || []).forEach(addXvRow);
   renderPorts(st);
@@ -795,26 +798,30 @@ function renderCalib(m) {
 }
 
 // The deck under the scope shows other controls in each mode; it keeps the
-// height of its tallest mode, so the scope (the row that takes the rest)
-// does not change size on a mode switch. Measured once per window size and
-// firmware (the DATV button), with each mode's classes set in turn.
+// height of its tallest voice mode, so the scope (the row that takes the
+// rest) does not change size on a mode switch. DATV's panes are taller
+// still: they scroll inside that height rather than shrink the waterfall
+// everywhere. Measured once per window size, with each mode's classes set
+// in turn.
 const DECK_MODES = ["ssb-mode", "cw-mode", "data-mode", "datv-mode"];
 let deckKey = "";
 function pinDeck() {
   const b = document.body.classList, d = $("deck");
-  const key = innerWidth + "x" + innerHeight + b.contains("no-datv");
+  const key = innerWidth + "x" + innerHeight;
   if (key === deckKey || !d.offsetParent) return; // (hidden behind the login: later)
   deckKey = key;
   const was = DECK_MODES.filter((c) => b.contains(c));
   d.style.minHeight = "";
   let h = 0;
+  d.style.maxHeight = "";
   for (const m of [null, ...DECK_MODES]) {
-    if (m === "datv-mode" && b.contains("no-datv")) continue;
+    if (m === "datv-mode") continue;
     DECK_MODES.forEach((c) => b.toggle(c, c === m));
     h = Math.max(h, d.offsetHeight);
   }
   DECK_MODES.forEach((c) => b.toggle(c, was.includes(c)));
   d.style.minHeight = h + "px";
+  d.style.setProperty("--deck-h", h + "px");
 }
 addEventListener("resize", () => pinDeck());
 
@@ -841,7 +848,7 @@ function renderState() {
   document.body.classList.toggle("no-datv", !!(st.features && st.features.datv === false));
   DATV.state(st);
   RADE.state(st);
-  $("callsign").textContent = st.call || "";
+  $("callsign").textContent = [st.call, st.loc].filter(Boolean).join(" / ");
   renderFreq();
   $("t-vfo").textContent = "VFO " + st.active;
   document.body.classList.toggle("cw-mode", !st.datv_mode && st.mode === "CW");
@@ -886,11 +893,12 @@ function renderState() {
   $("scope-ctr").textContent = st.scope_center ? "CTR" : "FIX"; $("scope-ctr").classList.toggle("on", !!st.scope_center);
   const decs = st.decoders || [];
   document.querySelectorAll("#decoders [data-dec]").forEach((b) => b.classList.toggle("on", decs.includes(b.dataset.dec)));
-  $("ptt").classList.toggle("on", !!st.ptt && st.tx_source !== "tune");
+  $("ptt").classList.toggle("on", !!st.ptt && st.tx_source !== "tune" && st.tx_source !== "two_tone");
   $("tune").classList.toggle("on", !!st.tune);
+  $("two-tone").classList.toggle("on", !!st.two_tone);
   // (tx_ok: allowed here at all - trx.allow_tx, the TX ranges, a transverter's TX)
   const txOk = st.allow_tx && st.tx_ok !== false;
-  $("ptt").disabled = !txOk; $("tune").disabled = !txOk;
+  $("ptt").disabled = !txOk; $("tune").disabled = !txOk; $("two-tone").disabled = !txOk;
   $("ptt").title = txOk ? "Hold, or Space; Shift-click latches. In CW it is a straight key: carrier at the pitch while held." : "No transmitting on this frequency (receive-only band, outside trx.tx_ranges, or a receive-only transverter)";
   $("d-time").className = "dot " + (st.time_synced ? "ok" : "warn");
   renderRef(st.ref);
@@ -911,7 +919,8 @@ function renderState() {
     b.classList.toggle("on", +b.dataset.span === st.span);
     b.disabled = +b.dataset.span > st.span_max;
   });
-  $("scopeinfo").textContent = `SPAN ±${fmtHz(st.span / 2)}  REF ${S.refAuto ? "AUTO" + (S.refOffset ? (S.refOffset > 0 ? "+" : "") + S.refOffset : "") : S.refDb + " dBFS"}`;
+  $("scopeinfo").textContent = `SPAN ±${fmtHz(st.span / 2)}  REF ${S.refAuto ? "AUTO" + (S.refOffset ? (S.refOffset > 0 ? "+" : "") + S.refOffset : "") : S.refDb + " dBFS"}` +
+    (st.scope_src === "sweep" ? "  SWEEP: no audio, click a station to listen" : "");
   drawSpectrum();
 }
 function setSlider(id, v) {
@@ -1171,6 +1180,8 @@ function setupScope() {
       // CW: put the clicked signal on the sidetone; SSB: on the carrier.
       const off = S.st && S.st.mode === "CW" ? -700 : 0;
       tuneTo(Math.round((f + off) / 10) * 10);
+      // In a swept view: stop sweeping and listen there (one look, +/-1.25 MHz).
+      if (S.st && S.st.scope_src === "sweep") send({ cmd: "span", hz: 2500000 });
     });
     c.addEventListener("wheel", (e) => { e.preventDefault(); tuneBy(e.deltaY < 0 ? 1 : -1); }, { passive: false });
     c.addEventListener("pointermove", (e) => {
@@ -1649,7 +1660,10 @@ function buildStatic() {
   $("call-save").onclick = () => {
     const c = $("set-call").value.trim().toUpperCase();
     if (c && !/^(?=.*[0-9])(?=.*[A-Z])[A-Z0-9/]{3,12}$/.test(c)) { alert("A callsign: 3 to 12 of A-Z, 0-9 and /, e.g. SQ6EMM or SQ6EMM/P."); return; }
+    const l = $("set-loc").value.trim().toUpperCase();
+    if (l && !/^[A-R]{2}[0-9]{2}([A-X]{2}([0-9]{2}([A-X]{2})?)?)?$/.test(l)) { alert("A Maidenhead locator: 4, 6, 8 or 10 characters, e.g. JO81, JO81HU, JO81HU42 or JO81HU42AX."); return; }
     send({ cmd: "callsign", call: c });
+    send({ cmd: "locator", loc: l });
   };
   $("micg").oninput = () => { $("micg-v").textContent = $("micg").value + "%"; send({ cmd: "mic_gain", value: +$("micg").value / 100 }); };
   $("compl").oninput = () => { $("compl-v").textContent = $("compl").value + " dB"; if (S.st && S.st.comp !== null) send({ cmd: "comp", on: true, db: +$("compl").value }); };
@@ -1691,6 +1705,7 @@ $("datv-sound").onclick = () => { audioUserOff = false; audioStart().then(() => 
   $("ptt").addEventListener("pointerup", () => pttUp(false));
   $("ptt").addEventListener("pointerleave", () => { if (!S.pttLatched && S.st && S.st.ptt) pttUp(false); });
   $("tune").onclick = () => send({ cmd: "tune", on: !(S.st && S.st.tune) });
+  $("two-tone").onclick = () => send({ cmd: "two_tone", on: !(S.st && S.st.two_tone) });
   $("mic").onclick = () => micStart();
   $("ain").onchange = () => { audioDev.in = $("ain").value; store.set("audio_in", audioDev.in); micSwitch(); };
   $("aout").onchange = () => { audioDev.out = $("aout").value; store.set("audio_out", audioDev.out); audioOutApply(); };
@@ -1939,13 +1954,66 @@ const DATV = (() => {
                "T2-2.0-16QAM-1/2": [16e6 / 7, 578304] };
   const tsRate = (sr, fec) => T2[fec] ? T2[fec][0] * T2[fec][1] / (T2[fec][2] || 458240) : sr * LONG[fec][0] / LONG[fec][1];
   const occupied = (sr, fec) => T2[fec] ? T2[fec][0] * 1705 / 2048 : sr * 1.35;
-  const settings = () => ({ sr: +$("datv-sr").value, rate: $("datv-fec").value });
+  // The menu: the system, then its width (DVB-S2: symbol rate; DVB-T2:
+  // bandwidth), then the modulations and code rates there are for it. Each
+  // system keeps its own last choice; DVB-T2 still sends DVB-S2's symbol rate
+  // (trxd ignores it there).
+  const S2_RATES = [[33000, "33 kS/s"], [66000, "66 kS/s"], [125000, "125 kS/s"],
+                    [250000, "250 kS/s"], [333000, "333 kS/s"], [500000, "500 kS/s"]];
+  const S2_FECS = [["L-QPSK-1/2", "QPSK 1/2"], ["L-QPSK-3/4", "QPSK 3/4"], ["L-8PSK-3/4", "8PSK 3/4"]];
+  const T2_BWS = ["1.35", "1.7", "2.0"];
+  const pick = { S2: { sr: "250000", fec: "L-QPSK-1/2" }, T2: { sr: "1.7", fec: "T2-1.7-QPSK-1/2" } };
+  const fill = (id, opts, want) => {
+    const el = $(id);
+    el.innerHTML = opts.map(([v, t]) => `<option value="${v}">${t}</option>`).join("");
+    el.value = opts.some(([v]) => String(v) === want) ? want : String(opts[0][0]);
+  };
+  function buildMenu() {
+    const sys = $("datv-sys").value, p = pick[sys];
+    const auto = sys === "AUTO";
+    if (auto) {
+      $("datv-sr").innerHTML = `<option value="0">rate: found</option>`;
+      $("datv-fec").innerHTML = `<option value="L-QPSK-1/2">mode: found</option>`;
+      return;
+    }
+    if (sys === "T2") {
+      fill("datv-sr", T2_BWS.map((b) => [b, b + " MHz"]), p.sr);
+      const head = `T2-${$("datv-sr").value}-`;
+      fill("datv-fec", Object.keys(T2).filter((k) => k.startsWith(head)).map((k) => [k, k.slice(head.length).replace("-", " ")]), p.fec);
+    } else {
+      fill("datv-sr", S2_RATES, p.sr);
+      fill("datv-fec", S2_FECS, p.fec);
+    }
+    p.sr = $("datv-sr").value; p.fec = $("datv-fec").value;
+  }
+  // This page's own choice, until the board's state shows it (an FPGA
+  // switch can swallow it: resync sends it again). Otherwise the page follows
+  // the board: another page may have changed the settings, and two pages
+  // each sending their own after every switch took turns loading the
+  // DVB-S2 and DVB-T2 images.
+  let mine = null;
+  const matches = (s, r) => !!r && (!s.sr && !T2[s.rate] ? !!r.auto
+    : T2[s.rate] ? r.rate === s.rate : !r.auto && r.rate === s.rate && r.sr === s.sr);
+  function adopt(r) {
+    if (r.auto) $("datv-sys").value = "AUTO";
+    else if (T2[r.rate]) { $("datv-sys").value = "T2"; pick.T2 = { sr: r.rate.split("-")[1], fec: r.rate }; }
+    else if (LONG[r.rate] && r.sr) { $("datv-sys").value = "S2"; pick.S2 = { sr: String(r.sr), fec: r.rate }; }
+    else return;
+    buildMenu(); render(); info();
+  }
+  const settings = () => $("datv-sys").value === "AUTO" ? { sr: 0, rate: "L-QPSK-1/2" } : { sr: +pick.S2.sr, rate: $("datv-fec").value };
   function info() {
     const { sr, rate } = settings(), f = S.st ? curFreq() : 0;
+    if (!sr && !T2[rate]) {
+      $("datv-info").textContent = "Auto: scans the standard symbol rates (33-500 kS/s) and reads the mode from the signal" +
+        (f ? ` · centred on ${(f / 1e6).toFixed(3)} MHz` : "");
+      $("datv-note").textContent = "DVB-S2 only; to send, choose DVB-S2 or DVB-T2.";
+      return;
+    }
     $("datv-info").textContent = `TS ${(tsRate(sr, rate) / 1000).toFixed(1)} kbit/s · ${(occupied(sr, rate) / 1000).toFixed(0)} kHz wide` +
       (f ? ` · centred on ${(f / 1e6).toFixed(3)} MHz` : "");
     $("datv-note").textContent = T2[rate]
-      ? "DVB-T2: 2K FFT, guard 1/8, PP2 pilots, rotated constellation, 64K LDPC (the amateur Portsdown / Ryde profile); the symbol rate setting does not apply."
+      ? "DVB-T2: 2K FFT, guard 1/8, PP2 pilots, rotated constellation, 64K LDPC (the amateur Portsdown / Ryde profile)."
       : "DVB-S2, long frames with pilots, roll-off 0.35.";
   }
   function sendBin(b) { if (ws && ws.readyState === 1 && ws.bufferedAmount < 256e3) { ws.send(b); sent += b.length; return true; } return false; }
@@ -1955,19 +2023,18 @@ const DATV = (() => {
   // ---- mode
   async function enter() {
     if (!supported()) { alert("DATV needs WebCodecs: Chrome, Edge or Firefox 130 and later."); return; }
-    send({ cmd: "datv_mode", on: true, ...settings() });
+    mine = settings();
+    send({ cmd: "datv_mode", on: true, ...mine });
     audioStart().catch(() => {});   // a click: the browser allows audio now
-  }
-  // DVB-T2 carries its bandwidth in the mode: the symbol rate does not apply.
-  function limitModes() {
-    $("datv-sr").disabled = on || starting || $("datv-fec").value.startsWith("T2-");
   }
   let refusal = null;
   function settingsChanged() {
-    limitModes();
+    buildMenu();
+    render();
     info();
     // A new setting restarts the receiver (not while sending: that has its own).
-    if (S.st && S.st.datv_mode && !on) send({ cmd: "datv_rx", on: true, ...settings() });
+    mine = settings();
+    if (S.st && S.st.datv_mode && !on) send({ cmd: "datv_rx", on: true, ...mine });
   }
 
   // ---- send
@@ -2244,17 +2311,21 @@ const DATV = (() => {
   function render() {
     const b = $("datv-go");
     b.textContent = on ? "STOP" : starting ? "STARTING…" : "START"; b.classList.toggle("on", on);
-    for (const id of ["datv-sr", "datv-fec", "datv-src"]) $(id).disabled = on || starting;
-    limitModes();
+    for (const id of ["datv-sys", "datv-sr", "datv-fec", "datv-src"]) $(id).disabled = on || starting;
+    const auto = $("datv-sys").value === "AUTO";
+    $("datv-sr").disabled ||= auto; $("datv-fec").disabled ||= auto;
     if (!on) $("datv-stat").textContent = "";
   }
   return {
     init() {
       $("datv-go").onclick = () => (on ? stop(true) : start());
-      for (const id of ["datv-sr", "datv-fec"]) $(id).onchange = settingsChanged;
+      buildMenu();
+      $("datv-sys").onchange = settingsChanged;
+      const keep = (k, id) => { const p = pick[$("datv-sys").value]; if (p) p[k] = $(id).value; settingsChanged(); };
+      $("datv-sr").onchange = () => keep("sr", "datv-sr");
+      $("datv-fec").onchange = () => keep("fec", "datv-fec");
       $("datv-src").value = store.get("datv_src", "cam");
       $("datv-src").onchange = () => store.set("datv_src", $("datv-src").value);
-      limitModes();
       window.addEventListener("pagehide", () => { if (on) stop(true); });
       info();
     },
@@ -2263,8 +2334,8 @@ const DATV = (() => {
     // then; a code rate picked while it restarted never reached it.
     resync(st, starting_too) {
       if (!st || !st.datv_mode || on || (starting && !starting_too)) return;
-      const s = settings(), r = st.datv_rx;
-      if (!r || r.rate !== s.rate || (!s.rate.startsWith("T2-") && r.sr !== s.sr)) send({ cmd: "datv_rx", on: true, ...s });
+      const want = starting_too ? settings() : mine;
+      if (want && !matches(want, st.datv_rx)) send({ cmd: "datv_rx", on: true, ...want });
     },
     // The board's state: DATV mode, receiver, sender.
     state(st) {
@@ -2272,6 +2343,12 @@ const DATV = (() => {
       if (on && !st.datv) stop(false);
       const r = !!st.datv_rx;
       if (r !== rxOn) { rxOn = r; rxReset(); if (!r) $("datv-rxstat").textContent = "—"; }
+      // (the board's settings into the menu, unless this page's own are on the way)
+      const rx = st.datv_rx;
+      if (st.datv_mode && rx && !on && !starting) {
+        if (mine && matches(mine, rx)) mine = null;
+        if (!mine && !matches(settings(), rx)) adopt(rx);
+      }
       if (st.datv_mode) info();
     },
     rxVideo, rxAudio, rxConst,

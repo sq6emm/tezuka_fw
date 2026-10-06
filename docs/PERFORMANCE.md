@@ -42,7 +42,8 @@ The Libre bitstream (`simple` project, Vivado 2023.1) uses 27 % of the LUTs,
 26 % of the BRAM (37 of 140 tiles), 44 % of the DSP48 (96 of 220) and meets
 timing with 0.63 ns to spare. It already does the heavy fixed-rate work:
 the x8 FIR decimator/interpolator (3.072 MS/s <-> 384 kS/s) and Maia's wide
-spectrometer (every span above 300 kHz).
+spectrometer (spans above 300 kHz, views the stream misses, and the sweep;
+docs/SCOPE.md).
 
 | Candidate | CPU saved | FPGA cost | Verdict |
 |---|---|---|---|

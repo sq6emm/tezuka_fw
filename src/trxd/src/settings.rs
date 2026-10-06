@@ -55,6 +55,9 @@ pub struct Settings {
     /// The operator's callsign; overrides `callsign` in trxd.toml when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callsign: Option<String>,
+    /// The station's Maidenhead locator; overrides `locator` in trxd.toml.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
     /// Mute the receiver while transmitting (its AGC and S-meter held). Off:
     /// keep receiving during TX (satellites, crossband).
     #[serde(default = "yes")]
@@ -81,6 +84,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             callsign: None,
+            locator: None,
             mute_at_tx: true,
             transverters: Vec::new(),
             smeter: Default::default(),
@@ -122,6 +126,22 @@ impl Settings {
             && c.chars().any(|ch| ch.is_ascii_digit())
             && c.chars().any(|ch| ch.is_ascii_alphabetic());
         ok.then_some(c)
+    }
+
+    /// A Maidenhead locator as it is stored: 4, 6, 8 or 10 characters in
+    /// pairs (field A-R, square 0-9, subsquare A-X, extended square 0-9,
+    /// extended subsquare A-X), upper case. `None` for anything else.
+    pub fn clean_locator(s: &str) -> Option<String> {
+        let l = s.trim().to_ascii_uppercase();
+        let ok = matches!(l.len(), 4 | 6 | 8 | 10)
+            && l.as_bytes().chunks(2).enumerate().all(|(i, p)| {
+                p.iter().all(|c| match i {
+                    0 => (b'A'..=b'R').contains(c),
+                    1 | 3 => c.is_ascii_digit(),
+                    _ => (b'A'..=b'X').contains(c),
+                })
+            });
+        ok.then_some(l)
     }
 
     pub fn transverter(&self, rf: f64) -> Option<&Transverter> {
@@ -237,6 +257,13 @@ mod tests {
         let s = Settings { callsign: Some("SQ6EMM".into()), ..Settings::default() };
         s.save(dir.path());
         assert_eq!(Settings::load(dir.path()).callsign.as_deref(), Some("SQ6EMM"));
+        assert_eq!(Settings::clean_locator(" jo81hu "), Some("JO81HU".into()));
+        assert_eq!(Settings::clean_locator("JO81"), Some("JO81".into()));
+        assert_eq!(Settings::clean_locator("jo81hu42"), Some("JO81HU42".into()));
+        assert_eq!(Settings::clean_locator("JO81HU42AX"), Some("JO81HU42AX".into()));
+        for bad in ["", "JO8", "JO81H", "SZ81", "JO81HZ", "JO81HU4", "JO81HUA2", "JO81HU42AY", "JO81HU42AX00", "1O81"] {
+            assert_eq!(Settings::clean_locator(bad), None, "{bad}");
+        }
         // Files from before MUTE AT TX existed mute at TX.
         assert!(serde_json::from_str::<Settings>("{}").unwrap().mute_at_tx);
     }

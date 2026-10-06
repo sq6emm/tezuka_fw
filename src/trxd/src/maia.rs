@@ -21,6 +21,10 @@ use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
+
 use crossbeam_channel::{Receiver, bounded};
 use tracing::{info, warn};
 
@@ -104,7 +108,39 @@ pub fn decode_bin(x: u64) -> f32 {
 /// Start the spectrometer and a thread reading it. Rows come out as linear
 /// powers, FFT-shifted, normalised so a full-scale tone reads about 0 dBFS
 /// (approximately: the IP's internal scaling is fixed-point).
-pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Receiver<Vec<f32>>> {
+/// One spectrometer row: when it came off the DMA, and its bins (power per
+/// bin, DC in the middle).
+pub struct Row {
+    pub at: Instant,
+    pub bins: Vec<f32>,
+}
+
+/// The running spectrometer: its rows, and the rate it makes them at
+/// (changed on the fly: a sweep wants short integrations).
+pub struct Maia {
+    pub rows: Receiver<Row>,
+    rows_per_s: Arc<AtomicU32>,
+    adc_rate: f64,
+}
+
+impl Maia {
+    /// Rows a second (the integration count follows), from the next row on.
+    pub fn set_rows_per_s(&self, r: f64) {
+        self.rows_per_s.store(r.round() as u32, Ordering::Relaxed);
+    }
+
+    /// How long one row integrates at that rate.
+    pub fn row_time(&self) -> std::time::Duration {
+        let n = nint(self.adc_rate, self.rows_per_s.load(Ordering::Relaxed) as f64);
+        std::time::Duration::from_secs_f64(n as f64 * BINS as f64 / self.adc_rate)
+    }
+}
+
+fn nint(adc_rate: f64, rows_per_s: f64) -> u32 {
+    ((adc_rate / (BINS as f64 * rows_per_s.max(1.0))).round() as u32).clamp(1, 1023)
+}
+
+pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Maia> {
     let uio_path = find_uio("maia-sdr")?;
     let run = || -> Result<(File, Mapping, Mapping), String> {
         let uio = OpenOptions::new().read(true).write(true).open(&uio_path).map_err(|e| format!("{uio_path}: {e}"))?;
@@ -143,22 +179,32 @@ pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Receiver<Vec<f32>>> {
         warn!("no Maia IP core at the maia-sdr UIO (id {id:?})");
         return None;
     }
-    let nint = ((adc_rate / (BINS as f64 * rows_per_s)).round() as u32).clamp(1, 1023);
+    let want = Arc::new(AtomicU32::new(rows_per_s.round() as u32));
+    let mut cur = nint(adc_rate, rows_per_s);
     regs.wr32(REG_CONTROL, 0); // out of reset
     // Full-rate ADC input, average mode, nint integrations; abort any
     // integration in progress so the new count takes effect now.
-    regs.wr32(REG_SPECTROMETER, (nint << 1) | (1 << 11));
+    regs.wr32(REG_SPECTROMETER, (cur << 1) | (1 << 11));
     // Full-scale 12-bit tone through a 4096-point FFT, averaged nint times.
-    let norm = 1.0 / (nint as f32 * (2048.0f32 * BINS as f32).powi(2));
-    info!(nint, rows_per_s = adc_rate / (BINS as f64 * nint as f64), "Maia FPGA spectrometer running");
+    let norm = |n: u32| 1.0 / (n as f32 * (2048.0f32 * BINS as f32).powi(2));
+    info!(nint = cur, rows_per_s = adc_rate / (BINS as f64 * cur as f64), "Maia FPGA spectrometer running");
 
-    let (tx, rx) = bounded::<Vec<f32>>(2);
+    let (tx, rx) = bounded::<Row>(2);
+    let want_rd = want.clone();
     std::thread::Builder::new()
         .name("maia-scope".into())
         .spawn(move || {
             let mut last: Option<usize> = None;
             let mut quiet_logged = false;
             loop {
+                // A new rate: the count, and the integration under way
+                // aborted so the next row is all at the new one.
+                let n = nint(adc_rate, want_rd.load(Ordering::Relaxed) as f64);
+                if n != cur {
+                    cur = n;
+                    regs.wr32(REG_SPECTROMETER, (cur << 1) | (1 << 11));
+                    last = None;
+                }
                 if uio.write_all(&1u32.to_ne_bytes()).is_err() {
                     break;
                 }
@@ -191,17 +237,18 @@ pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Receiver<Vec<f32>>> {
                 last = Some(newest);
                 let base = newest * BINS * 8;
                 let mut row = Vec::with_capacity(BINS);
+                let g = norm(cur);
                 for k in 0..BINS {
-                    row.push(if k == 0 { 0.0 } else { decode_bin(ring.rd64(base + k * 8)) * norm });
+                    row.push(if k == 0 { 0.0 } else { decode_bin(ring.rd64(base + k * 8)) * g });
                 }
-                if let Err(crossbeam_channel::TrySendError::Disconnected(_)) = tx.try_send(row) {
+                if let Err(crossbeam_channel::TrySendError::Disconnected(_)) = tx.try_send(Row { at: Instant::now(), bins: row }) {
                     break; // engine gone
                 }
             }
             warn!("Maia spectrometer reader stopped");
         })
         .ok()?;
-    Some(rx)
+    Some(Maia { rows: rx, rows_per_s: want, adc_rate })
 }
 
 #[cfg(test)]

@@ -68,6 +68,9 @@ fn narrow_mode(m: Mode) -> bool {
 }
 /// CW sidetone pitch: CW sits this far above the dial, as in sdroxide.
 const CW_PITCH_HZ: f64 = 700.0;
+/// The two-tone test's tones (Hz from the dial, below it in LSB): the usual
+/// SSB linearity test pair inside a 2.4 kHz passband.
+const TWO_TONE_HZ: (f64, f64) = (700.0, 1_900.0);
 /// Tune carrier offset in the sideband modes.
 const TUNE_TONE_HZ: f64 = 1_000.0;
 /// Keep the VFO at least this far from the LO (DC spike) and from the band edge.
@@ -90,19 +93,29 @@ const MIC_PREROLL: usize = 1_200;
 const MIC_DRAIN_MAX: Duration = Duration::from_millis(1_500);
 /// Web microphone silent this long while keyed: the browser is gone.
 const MIC_STARVE: Duration = Duration::from_secs(2);
-/// Scope spans served from the 48 kS/s channel (finer bins) up to this. The
-/// view stays put while the VFO moves inside it, so the channel must cover a
-/// whole span either side of the VFO: 2 x 10 kHz fits in its +/-21.6 kHz.
-const NARROW_SPAN_MAX: f64 = 20_000.0;
-/// Up to this the ARM FFT of the decimated stream serves the scope; wider
-/// spans come from Maia's spectrometer in the FPGA (full ADC rate).
-const STREAM_SPAN_MAX: f64 = 300_000.0;
+/// Scope spans the channel (48 kS/s) can serve; which source a view takes
+/// is scopeplan.rs's to say.
+const NARROW_SPAN_MAX: f64 = crate::scopeplan::NARROW_SPAN_MAX;
 /// Web scope spans up to this keep the LO (the AD936x DC spike) outside the
 /// view: the LO goes beside the view, at most `rate * 0.4` from the VFO, which
 /// leaves tuning room either way up to +/-50 kHz. Wider views blank it instead.
 const DC_AVOID_SPAN_MAX: f64 = 100_000.0;
+/// Maia's rows a second normally, and while sweeping (shorter looks, so a
+/// sweep line over the FM band takes about half a second).
+const MAIA_ROWS_PER_S: f64 = 15.0;
+const SWEEP_ROWS_PER_S: f64 = 60.0;
 /// Room between the edge of the view and the LO.
 const DC_GUARD_HZ: f64 = 5_000.0;
+
+/// A sweep under way: the LOs to visit, the one being looked at (and when
+/// the LO went there), and the line put together so far.
+struct SweepRun {
+    view: (f64, f64),
+    los: Vec<f64>,
+    k: usize,
+    set_at: Option<Instant>,
+    stitch: crate::scopeplan::Stitch,
+}
 
 /// One source's raw level of a band (power.rs), its own dBFS.
 #[derive(Debug, Clone)]
@@ -154,6 +167,8 @@ enum TxSource {
     /// transmitter stays up until PTT is released.
     CwPtt,
     Tune,
+    /// TUNE's sibling for linearity tests: two equal tones ([`TWO_TONE_HZ`]).
+    TwoTone,
     /// The web UI's PTT in CW mode: a straight key, carrier at the pitch
     /// while it is held, with shaped edges.
     Key,
@@ -326,6 +341,7 @@ pub struct Trx {
     keyer: CwKeyer,
     cw_idle_since: Option<Instant>,
     tune_phase: f64,
+    tune_phase2: f64,
     tx_fifo: VecDeque<f32>,
     tx_bb: Vec<Complex32>,
     tx_up: Vec<Complex32>,
@@ -353,7 +369,9 @@ pub struct Trx {
     web: Option<WebHandle>,
     scope_wide: Scope,
     scope_narrow: Scope,
-    maia: Option<Receiver<Vec<f32>>>,
+    maia: Option<crate::maia::Maia>,
+    /// A view wider than one Maia look, being swept (scopeplan).
+    sweep: Option<SweepRun>,
     web_span: f64,
     /// Centre of the web scope: fixed while the VFO moves inside the view,
     /// recentred on the VFO when it leaves (0 = recentre on the next row).
@@ -509,6 +527,7 @@ impl Trx {
             stream_spec: None,
             stream_meter_until: Instant::now(),
             maia_last: None,
+            sweep: None,
             stream_peak: 0.0,
             meter_at: (0.0, 0.0, 0),
             calib: crate::calib::Calib::load_both(&std::path::PathBuf::from(&cfg.web.state_dir)),
@@ -577,6 +596,7 @@ impl Trx {
             keyer: CwKeyer::new(CH_RATE, CW_PITCH_HZ, cfg.trx.cw_wpm as f32),
             cw_idle_since: None,
             tune_phase: 0.0,
+            tune_phase2: 0.0,
             tx_fifo: VecDeque::new(),
             tx_bb: Vec::new(),
             tx_up: Vec::new(),
@@ -627,7 +647,7 @@ impl Trx {
         }
         if t.web.is_some() && t.cfg.radio.backend == crate::config::Backend::Iio {
             t.temps = crate::temps::start();
-            t.maia = crate::maia::start(t.cfg.radio.adc_rate as f64, 15.0);
+            t.maia = crate::maia::start(t.cfg.radio.adc_rate as f64, MAIA_ROWS_PER_S);
         }
         if t.cfg.radio.fpga_ddc && t.cfg.radio.backend == crate::config::Backend::Iio && !t.datv_mode {
             match crate::dvbs2::fpga::FrontEnd::start_channel(CH_RATE, CHAN_PASS_HZ, t.chan_offset()) {
@@ -717,6 +737,10 @@ impl Trx {
     /// sockets): a change that would need that ends the transmission first,
     /// and so does one that takes the TX frequency out of where it may send.
     fn retune(&mut self, force: bool) {
+        // (A sweep has the LO; ending it retunes with force.)
+        if self.sweep.is_some() && !force {
+            return;
+        }
         if self.rf_live {
             if let Err(e) = self.tx_check(self.tx_eff(), self.tx_half_bw()) {
                 warn!("transmission ended: {e}");
@@ -745,8 +769,11 @@ impl Trx {
             off.abs() < half - EDGE_MARGIN_HZ - rx_half && off.abs() > EDGE_MARGIN_HZ
         };
         let fits_all = |c: f64| fits_rx(c) && (self.tx_on.is_none() || fits(tx, c));
+        // (The web view has to lie inside what its source covers.)
+        let view = self.scope_lo_window();
+        let covers = |c: f64| view.is_none_or(|(w, m)| (c - w).abs() <= m);
         let datv = self.datv_lo_offset();
-        if datv.is_none() && !force && self.lo_split.is_none() && fits_all(self.center) && clear(self.center) {
+        if datv.is_none() && !force && self.lo_split.is_none() && fits_all(self.center) && clear(self.center) && covers(self.center) {
             self.apply_offsets();
             return;
         }
@@ -1153,12 +1180,115 @@ impl Trx {
         self.settings.callsign.clone().unwrap_or_else(|| self.cfg.callsign.trim().to_ascii_uppercase())
     }
 
+    /// The station locator: the one set in the web UI, else trxd.toml's.
+    fn locator(&self) -> String {
+        self.settings.locator.clone().unwrap_or_else(|| self.cfg.locator.trim().to_ascii_uppercase())
+    }
+
     /// The S-meter calibration table in force: the transverter's name, or the band.
     fn cal_band(&self) -> String {
         let f = self.rx_eff();
         match self.settings.transverter(f) {
             Some(t) => t.name.clone(),
             None => Band::containing(f).label().to_string(),
+        }
+    }
+
+    /// The radio as the scope planner (scopeplan.rs) sees it.
+    fn scope_radio(&self) -> crate::scopeplan::Radio {
+        crate::scopeplan::Radio {
+            lo: self.center,
+            stream_rate: self.rate,
+            chan_center: self.rx_eff(),
+            chan_rate: self.chan_rate,
+            adc_rate: self.cfg.radio.adc_rate as f64,
+            maia: self.maia.is_some(),
+            // A sweep moves the LO: not while sending, receiving DATV, with
+            // the LOs split, or through a transverter (its IF range).
+            sweep_ok: self.tx_on.is_none() && !self.rf_live && !self.datv_mode && self.datv_rx.is_none() && self.lo_split.is_none() && self.xvtr.is_none(),
+        }
+    }
+
+    fn scope_watching(&self) -> bool {
+        self.web.as_ref().is_some_and(|w| w.clients() > 0)
+    }
+
+    /// The web view: centre and span.
+    fn scope_view(&self) -> (f64, f64) {
+        (if self.web_center == 0.0 { self.rx_vfo() } else { self.web_center }, self.web_span)
+    }
+
+    /// Where the scope's picture comes from now.
+    fn scope_source(&self) -> crate::scopeplan::Source {
+        let (c, span) = self.scope_view();
+        crate::scopeplan::source(c, span, &self.scope_radio())
+    }
+
+    /// Where the view wants the LO (centre, how far off it may be): None
+    /// while sending, without a browser, and for DATV (its LO goes beside
+    /// the signal, and the scope takes Maia instead).
+    fn scope_lo_window(&self) -> Option<(f64, f64)> {
+        if self.rf_live || !self.scope_watching() || self.datv_mode || self.datv_lo_offset().is_some() {
+            return None;
+        }
+        let (c, span) = self.scope_view();
+        crate::scopeplan::lo_window(c, span, &self.scope_radio())
+    }
+
+    /// End a sweep: Maia back to its usual rate, the LO back where the
+    /// receiver wants it.
+    fn sweep_end(&mut self) {
+        if self.sweep.take().is_some() {
+            if let Some(m) = &self.maia {
+                m.set_rows_per_s(MAIA_ROWS_PER_S);
+            }
+            info!("scope sweep off");
+            self.retune(true);
+        }
+    }
+
+    /// One step of a sweep (called per block): move the LO to the next look,
+    /// take Maia's first row integrated wholly after it settled, and when
+    /// the last look is in, the stitched line for the scope.
+    fn sweep_step(&mut self, view: f64, span: f64) -> Option<Vec<u8>> {
+        let adc = self.cfg.radio.adc_rate as f64;
+        let m = self.maia.as_ref()?;
+        if self.sweep.as_ref().is_none_or(|s| s.view != (view, span)) {
+            let (min, max) = (self.cfg.radio.freq_min_hz, self.cfg.radio.freq_max_hz);
+            let los = crate::scopeplan::sweep_los(view, span, adc, min, max);
+            if self.sweep.is_none() {
+                m.set_rows_per_s(SWEEP_ROWS_PER_S);
+                info!(looks = los.len(), span, "scope sweep on");
+            }
+            self.sweep = Some(SweepRun { view: (view, span), los, k: 0, set_at: None, stitch: crate::scopeplan::Stitch::new(view, span, adc, crate::maia::BINS) });
+        }
+        let settle = m.row_time() * 2 + Duration::from_millis(3);
+        let sw = self.sweep.as_mut()?;
+        let Some(&lo) = sw.los.get(sw.k) else { return None };
+        match sw.set_at {
+            None => {
+                if let Err(e) = self.radio.set_rx_lo(lo) {
+                    warn!("sweep LO {lo}: {e}");
+                }
+                sw.set_at = Some(Instant::now());
+                for _ in m.rows.try_iter() {}
+                None
+            }
+            Some(t) => {
+                let row = m.rows.try_iter().filter(|r| r.at >= t + settle).last()?;
+                sw.stitch.add(lo, &row.bins, adc);
+                sw.k += 1;
+                sw.set_at = None;
+                if sw.k < sw.los.len() {
+                    return None;
+                }
+                let done = std::mem::replace(&mut sw.stitch, crate::scopeplan::Stitch::new(view, span, adc, crate::maia::BINS));
+                sw.k = 0;
+                let rate = done.rate();
+                let row = done.finish();
+                // (the stitched row starts at the view's low edge)
+                Some(scope::render(&row, view - span / 2.0 + rate / 2.0, rate, view, span))
+            }
         }
     }
 
@@ -1519,13 +1649,8 @@ impl Trx {
         let half = self.web_span / 2.0;
         let margin = self.web_span * 0.05;
         let c = self.web_center;
-        let covered = if self.web_span <= NARROW_SPAN_MAX {
-            (c - vfo).abs() + half <= self.chan_rate * 0.45
-        } else if self.web_span <= STREAM_SPAN_MAX || self.maia.is_none() {
-            (c - self.center).abs() + half <= self.rate / 2.0
-        } else {
-            true
-        };
+        let r = self.scope_radio();
+        let covered = crate::scopeplan::covers(c, self.web_span, &r, crate::scopeplan::source(c, self.web_span, &r));
         if self.scope_center || c == 0.0 || (vfo - c).abs() > half - margin || !covered {
             self.web_center = vfo;
         }
@@ -1535,6 +1660,11 @@ impl Trx {
     // ---- Transmit control ----
 
     fn key(&mut self, source: TxSource) {
+        // Sending: the LO back from a sweep first (the scope falls back to
+        // one Maia look while transmitting).
+        if self.tx_on.is_none() {
+            self.sweep_end();
+        }
         if let Some(now) = self.tx_on {
             // One source at a time: another one taking over mid-transmission
             // (rigctl T1 during DATV) would feed the wrong path.
@@ -1593,7 +1723,7 @@ impl Trx {
         }
         let mut fresh = false;
         // (DATV mode with a wide scope leaves the channel silent.)
-        if self.datv_mode && self.web_span > NARROW_SPAN_MAX {
+        if (self.datv_mode && self.web_span > NARROW_SPAN_MAX) || self.sweep.is_some() {
             self.chan_spec = None;
         } else if let Some(sp) = self.chan_meter.feed(&self.chan) {
             self.chan_spec = Some(sp);
@@ -1649,10 +1779,11 @@ impl Trx {
         // scope is reading them (then its last one).
         let mut maia = None;
         if chan.is_none() && stream.is_none() {
-            let scope_reads = self.web_span > STREAM_SPAN_MAX && self.web.as_ref().is_some_and(|w| w.clients() > 0);
+            use crate::scopeplan::Source;
+            let scope_reads = self.scope_watching() && matches!(self.scope_source(), Source::Maia { .. } | Source::Sweep);
             if !scope_reads {
-                if let Some(r) = self.maia.as_ref().and_then(|m| m.try_iter().last()) {
-                    self.maia_last = Some(r);
+                if let Some(r) = self.maia.as_ref().and_then(|m| m.rows.try_iter().last()) {
+                    self.maia_last = Some(r.bins);
                 }
             }
             if let Some(row) = &self.maia_last {
@@ -1712,7 +1843,7 @@ impl Trx {
         let scope_off = table.map(|_| {
             if self.web_span <= NARROW_SPAN_MAX {
                 off
-            } else if self.web_span > STREAM_SPAN_MAX && self.maia.is_some() {
+            } else if matches!(self.scope_source(), crate::scopeplan::Source::Maia { .. } | crate::scopeplan::Source::Sweep) {
                 off + mdb
             } else {
                 off + sdb
@@ -2047,6 +2178,18 @@ impl Trx {
         let want = self.datv_rx.as_ref().and_then(|r| r.t2_bw).or(s2).map_or(self.cfg.radio.rf_bandwidth, |bw| {
             self.cfg.radio.rf_bandwidth.max((bw * 1.3) as u32)
         });
+        // A wide scope view opens it over the view (scopeplan): beyond the
+        // default 1 MHz, Maia saw only the filter's skirts.
+        let want = if self.scope_watching() {
+            let r = self.scope_radio();
+            match self.scope_source() {
+                crate::scopeplan::Source::Maia { rf_bw } => want.max(rf_bw as u32),
+                crate::scopeplan::Source::Sweep => want.max((2.0 * r.maia_half()) as u32),
+                _ => want,
+            }
+        } else {
+            want
+        };
         if want != self.rx_bw {
             match self.radio.set_rx_bandwidth(want) {
                 Ok(()) => info!(hz = want, "RX bandwidth"),
@@ -2063,7 +2206,7 @@ impl Trx {
         // A9 core) runs only if the narrow waterfall shows it; otherwise
         // silence of the same length keeps the rest in step.
         self.chan.clear();
-        if self.datv_mode && self.web_span > NARROW_SPAN_MAX {
+        if (self.datv_mode && self.web_span > NARROW_SPAN_MAX) || self.sweep.is_some() {
             self.chan_frac += iq.len() as f64 * CH_RATE / self.rate;
             let n = self.chan_frac.floor();
             self.chan_frac -= n;
@@ -2084,7 +2227,7 @@ impl Trx {
             nb.process(&mut self.chan);
         }
         self.audio.clear();
-        if self.datv_mode {
+        if self.datv_mode || self.sweep.is_some() {
             // DATV mode: nothing to demodulate (the DVB-S2 receiver has the IQ);
             // silence of the same length keeps the rest of the chain in step.
             self.audio.resize(if self.narrow { self.chan.len() / 4 } else { self.chan.len() }, 0.0);
@@ -2187,33 +2330,48 @@ impl Trx {
                     self.retune(false);
                 }
             }
+            // (a sweep that is no longer wanted gives the LO back first)
+            use crate::scopeplan::Source;
+            if self.scope_source() != Source::Sweep {
+                self.sweep_end();
+            }
+            // ... and where the view's source covers all of it (a span
+            // widened from a narrow one). Never mid-transmission.
+            if self.scope_lo_window().is_some_and(|(w, m)| (self.center - w).abs() > m) {
+                self.retune(false);
+            }
+            let src = self.scope_source();
             let lo = self.center;
-            let row = if span <= NARROW_SPAN_MAX {
-                self.scope_narrow
+            let row = match src {
+                Source::Channel => self
+                    .scope_narrow
                     .process(&self.chan)
-                    .map(|r| scope::render(&r, vfo, self.chan_rate, view, span))
-            } else if let (true, Some(m)) = (span > STREAM_SPAN_MAX, &self.maia) {
-                let adc = self.cfg.radio.adc_rate as f64;
-                let got = m.try_iter().last();
-                // (The level meter measures wide bands on it too.)
-                if let Some(r) = &got {
-                    self.maia_last = Some(r.clone());
+                    .map(|r| scope::render(&r, vfo, self.chan_rate, view, span)),
+                Source::Stream => {
+                    let rate = self.rate;
+                    self.scope_wide.process(iq).map(|r| {
+                        let mut cols = scope::render(&r, lo, rate, view, span);
+                        scope::blank_dc(&mut cols, lo, view, span, 1_000.0);
+                        cols
+                    })
                 }
-                got.map(|mut r| {
-                    if inverted {
-                        r.reverse();
+                Source::Maia { .. } => {
+                    let adc = self.cfg.radio.adc_rate as f64;
+                    let got = self.maia.as_ref().and_then(|m| m.rows.try_iter().last()).map(|r| r.bins);
+                    // (The level meter measures wide bands on it too.)
+                    if let Some(r) = &got {
+                        self.maia_last = Some(r.clone());
                     }
-                    let mut cols = scope::render(&r, lo, adc, view, span);
-                    scope::blank_dc(&mut cols, lo, view, span, 2.5 * adc / crate::maia::BINS as f64);
-                    cols
-                })
-            } else {
-                let rate = self.rate;
-                self.scope_wide.process(iq).map(|r| {
-                    let mut cols = scope::render(&r, lo, rate, view, span);
-                    scope::blank_dc(&mut cols, lo, view, span, 1_000.0);
-                    cols
-                })
+                    got.map(|mut r| {
+                        if inverted {
+                            r.reverse();
+                        }
+                        let mut cols = scope::render(&r, lo, adc, view, span);
+                        scope::blank_dc(&mut cols, lo, view, span, 2.5 * adc / crate::maia::BINS as f64);
+                        cols
+                    })
+                }
+                Source::Sweep => self.sweep_step(view, span),
             };
             if let (Some(cols), Some(w)) = (row, &self.web) {
                 w.send_spectrum(view, span, &cols);
@@ -2373,6 +2531,20 @@ impl Trx {
                 for _ in 0..n48 {
                     self.tune_phase = (self.tune_phase + step) % std::f64::consts::TAU;
                     self.tx_bb.push(Complex32::new(self.tune_phase.cos() as f32, self.tune_phase.sin() as f32));
+                }
+            }
+            Some(TxSource::TwoTone) => {
+                // Each tone at half amplitude: the peak envelope of TUNE's
+                // single tone, half its average power.
+                use std::f64::consts::TAU;
+                let side = if self.mode == Mode::Lsb { -1.0 } else { 1.0 };
+                let (s1, s2) = (TAU * side * TWO_TONE_HZ.0 / CH_RATE, TAU * side * TWO_TONE_HZ.1 / CH_RATE);
+                for _ in 0..n48 {
+                    self.tune_phase = (self.tune_phase + s1) % TAU;
+                    self.tune_phase2 = (self.tune_phase2 + s2) % TAU;
+                    let z = Complex32::new(self.tune_phase.cos() as f32, self.tune_phase.sin() as f32)
+                        + Complex32::new(self.tune_phase2.cos() as f32, self.tune_phase2.sin() as f32);
+                    self.tx_bb.push(z * 0.5);
                 }
             }
             Some(TxSource::Web(_)) => {
@@ -2542,6 +2714,7 @@ impl Trx {
         let mut v = serde_json::json!({
             "type": "state",
             "call": self.callsign(),
+            "loc": self.locator(),
             "vfo_a": self.vfo_a,
             "vfo_b": self.vfo_b,
             "active": if self.active == Vfo::A { "A" } else { "B" },
@@ -2550,11 +2723,13 @@ impl Trx {
             "filter": [self.filter.0, self.filter.1],
             "ptt": self.tx_on.is_some(),
             "tune": self.tx_on == Some(TxSource::Tune),
+            "two_tone": self.tx_on == Some(TxSource::TwoTone),
             "tx_source": self.tx_on.map(|s| match s {
                 TxSource::Tci => "tci",
                 TxSource::Ptt => "ptt",
                 TxSource::Cw | TxSource::CwPtt => "cw",
                 TxSource::Tune => "tune",
+                TxSource::TwoTone => "two_tone",
                 TxSource::Key => "key",
                 TxSource::Web(_) => "web",
                 TxSource::Datv(_) => "datv",
@@ -2573,7 +2748,8 @@ impl Trx {
             "center": self.center,
             "rate": self.rate,
             "span": self.web_span,
-            "span_max": if self.maia.is_some() { self.cfg.radio.adc_rate as f64 } else { self.rate },
+            "span_max": crate::scopeplan::span_max(&self.scope_radio()),
+            "scope_src": self.scope_source().name(),
             "allow_tx": self.cfg.trx.allow_tx,
             "rade": self.rade,
             "tx_ok": self.tx_check(self.tx_eff(), self.tx_half_bw()).is_ok(),
@@ -2786,10 +2962,22 @@ impl Trx {
                 if let Some(w) = &self.web {
                     w.send_json(&serde_json::json!({"type": "fpga_switch", "mode": want}));
                 }
+                // In DATV mode the replay has to enter it again: the voice
+                // mode comes back first (which leaves DATV mode), and a
+                // receiver or sender setting alone did not, so after a
+                // DVB-S2 <-> DVB-T2 switch the page came back in USB with
+                // the receiver running.
+                let cmds = if self.datv_mode && cmd != "datv_mode" {
+                    let mut enter = m.clone();
+                    enter["cmd"] = serde_json::json!("datv_mode");
+                    if cmd == "datv_rx" { vec![enter] } else { vec![enter, m.clone()] }
+                } else {
+                    vec![m.clone()]
+                };
                 let resume = serde_json::json!({
                     "vfo_a": self.vfo_a, "vfo_b": self.vfo_b, "active_b": self.active == Vfo::B,
                     "split": self.split, "mode": mode_name(self.mode),
-                    "filter": [self.filter.0, self.filter.1], "cmds": [m],
+                    "filter": [self.filter.0, self.filter.1], "cmds": cmds,
                     // the levels too: a TX attenuation set before entering
                     // DATV mode was lost and DATV went out 20 dB down
                     "txatt": self.tx_att_db, "drive": (self.drive * 100.0).round(),
@@ -2849,6 +3037,13 @@ impl Trx {
                 }
             }
             "tune" => self.apply(Command::SetTune(on)),
+            "two_tone" => {
+                if on {
+                    self.key(TxSource::TwoTone);
+                } else {
+                    self.unkey();
+                }
+            }
             "datv_mode" => {
                 if on {
                     self.datv_mode = true;
@@ -2912,7 +3107,7 @@ impl Trx {
             }
             "span" => {
                 if let Some(sp) = num("hz") {
-                    let max = if self.maia.is_some() { self.cfg.radio.adc_rate as f64 } else { self.rate };
+                    let max = crate::scopeplan::span_max(&self.scope_radio());
                     self.web_span = sp.clamp(2_000.0, max);
                     self.web_center = 0.0;
                     self.scope_wide.reset();
@@ -3017,6 +3212,20 @@ impl Trx {
                 }
                 self.settings.save(&self.settings_dir);
                 info!(call = %self.callsign(), "callsign set");
+            }
+            "locator" => {
+                // An empty locator goes back to trxd.toml's.
+                let raw = m["loc"].as_str().unwrap_or("");
+                match Settings::clean_locator(raw) {
+                    Some(l) => self.settings.locator = Some(l),
+                    None if raw.trim().is_empty() => self.settings.locator = None,
+                    None => {
+                        warn!(loc = raw, "locator refused");
+                        return;
+                    }
+                }
+                self.settings.save(&self.settings_dir);
+                info!(loc = %self.locator(), "locator set");
             }
             "xvtr_set" => {
                 if let Ok(list) = serde_json::from_value::<Vec<Transverter>>(m["list"].clone()) {

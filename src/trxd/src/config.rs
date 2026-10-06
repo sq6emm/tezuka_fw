@@ -22,7 +22,7 @@ pub enum Role {
 pub struct Config {
     pub role: Role,
     pub callsign: String,
-    /// Maidenhead locator, 4 or 6 characters.
+    /// Maidenhead locator, 4, 6, 8 or 10 characters.
     pub locator: String,
     pub radio: RadioConfig,
     pub trx: TrxConfig,
@@ -398,9 +398,8 @@ impl Config {
                 return Err(format!("beacon.freq_hz {f} is outside trx.tx_ranges"));
             }
         }
-        let loc = self.locator.trim();
-        if !(loc.len() == 4 || loc.len() == 6) {
-            return Err("locator must be 4 or 6 characters".into());
+        if crate::settings::Settings::clean_locator(&self.locator).is_none() {
+            return Err("locator must be a Maidenhead locator of 4, 6, 8 or 10 characters".into());
         }
         for sub in [&self.trx.q65_submode, &self.beacon_rx.q65_submode] {
             if !matches!(sub.to_ascii_uppercase().as_str(), "A" | "B" | "C" | "D" | "E") {
