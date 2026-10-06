@@ -1217,7 +1217,13 @@ impl Trx {
             // the LOs split, or through a transverter (its IF range).
             sweep_ok: self.tx_on.is_none() && !self.rf_live && !self.datv_mode && self.datv_rx.is_none() && self.lo_split.is_none() && self.xvtr.is_none(),
             // the zoom input: the first x8 stage (wide image only)
-            zoom_rate: self.maia.as_ref().filter(|m| m.zoom_capable).map(|_| self.cfg.radio.adc_rate as f64 / 8.0),
+            // (only the wide images feed the zoom input: on the others the
+            // core has it, unconnected, and its rows would be empty)
+            zoom_rate: self
+                .maia
+                .as_ref()
+                .filter(|m| m.zoom_capable && self.cfg.radio.adc_rate as f64 >= WIDE_ADC_RATE)
+                .map(|_| self.cfg.radio.adc_rate as f64 / 8.0),
         }
     }
 
@@ -2202,6 +2208,7 @@ impl Trx {
         // open: the whole FM band in the filter took the AD936x gain 12 dB
         // down and RDS decoded on 0 of 6 stations (6 of 6 at 1 MHz).
         let r = self.scope_radio();
+        let rx_need = 2.0 * ((self.rx_eff() - self.center).abs() + 0.5 * self.chan_rate as f64) * 1.1;
         let want = if r.adc_rate >= WIDE_ADC_RATE {
             let need = if self.scope_watching() {
                 match self.scope_source() {
@@ -2212,6 +2219,10 @@ impl Trx {
             } else {
                 0.0
             };
+            // The receiver may sit up to 0.45 x adc from the LO (rx_reach):
+            // the filter must cover it too, page or no page (with 1 MHz a
+            // click 4 MHz out heard nothing once the view narrowed).
+            let need = need.max(rx_need);
             let step = if need <= 1.0e6 { 0.0 } else if need <= 6.0e6 { 6.0e6 } else { 2.0 * r.maia_half() };
             want.max(step as u32)
         } else if self.scope_watching() {
@@ -2221,8 +2232,9 @@ impl Trx {
                 crate::scopeplan::Source::Sweep => want.max((2.0 * r.maia_half()) as u32),
                 _ => want,
             }
+            .max(rx_need as u32)
         } else {
-            want
+            want.max(rx_need as u32)
         };
         if want != self.rx_bw {
             match self.radio.set_rx_bandwidth(want) {
@@ -2376,6 +2388,12 @@ impl Trx {
             }
             let src = self.scope_source();
             let lo = self.center;
+            // (the zoom input only while a zoom view shows it)
+            if let Some(m) = &self.maia {
+                if !matches!(src, Source::Zoom { .. }) {
+                    m.set_zoom(false);
+                }
+            }
             let row = match src {
                 Source::Channel => self
                     .scope_narrow

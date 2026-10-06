@@ -31,14 +31,7 @@ use tracing::{info, warn};
 const RING_PHYS: u64 = 0x1600_0000;
 const BUFFERS: usize = 8;
 pub const BINS: usize = 4096;
-/// Maia's spectrometer (every simple bitstream, 3.072 and 24.576 MS/s alike,
-/// back to at least 2026-10-01) writes its spectra rotated: a carrier lands
-/// 545 bins below where it belongs (measured 2026-10-06 on the raw rows in
-/// DDR: a known carrier in bin 1538 instead of 2083; -407 kHz at 3.072 MS/s,
-/// -3.27 MHz at 24.576 MS/s). The shape is intact (clean sidelobes), so the
-/// whole spectrum is moved, probably in the FFT core (its 3x-clocked
-/// complex multiplier). Until that is found, each row is rotated back here.
-pub const ROTATION: usize = 545;
+
 const RING_BYTES: usize = BUFFERS * BINS * 8;
 
 const REG_CONTROL: usize = 0x08;
@@ -153,9 +146,16 @@ impl Maia {
 
     /// How long one row integrates at that rate.
     pub fn row_time(&self) -> std::time::Duration {
-        let n = nint(self.adc_rate, self.rows_per_s.load(Ordering::Relaxed) as f64);
-        std::time::Duration::from_secs_f64(n as f64 * BINS as f64 / self.adc_rate)
+        let fs = input_rate(self.adc_rate, self.zoom.load(Ordering::Relaxed));
+        let n = nint(fs, self.rows_per_s.load(Ordering::Relaxed) as f64);
+        std::time::Duration::from_secs_f64(n as f64 * BINS as f64 / fs)
     }
+}
+
+/// The spectrometer's input rate: the converter's, or the zoom input's (the
+/// first x8 decimation stage).
+fn input_rate(adc_rate: f64, zoom: bool) -> f64 {
+    if zoom { adc_rate / 8.0 } else { adc_rate }
 }
 
 fn nint(adc_rate: f64, rows_per_s: f64) -> u32 {
@@ -229,8 +229,10 @@ pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Maia> {
                 // A new rate: the count, and the integration under way
                 // aborted so the next row is all at the new one.
                 // (the count and the zoom bit share the register: always both)
-                let n = nint(adc_rate, want_rd.load(Ordering::Relaxed) as f64);
+                // (the count for the input's own rate: the zoom input's
+                // rows came 8x too slowly with the converter's)
                 let z = zoom_rd.load(Ordering::Relaxed);
+                let n = nint(input_rate(adc_rate, z), want_rd.load(Ordering::Relaxed) as f64);
                 if n != cur || z != cur_zoom {
                     cur = n;
                     cur_zoom = z;
@@ -279,7 +281,7 @@ pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Maia> {
                 for k in 0..BINS {
                     row.push(if k == 0 { 0.0 } else { decode_bin(ring.rd64(base + k * 8)) * g });
                 }
-                derotate(&mut row);
+                fill_bin0(&mut row);
                 if let Err(crossbeam_channel::TrySendError::Disconnected(_)) = tx.try_send(Row { at: Instant::now(), bins: row, zoom: cur_zoom }) {
                     break; // engine gone
                 }
@@ -291,14 +293,14 @@ pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Maia> {
     Some(Maia { rows: rx, rows_per_s: want, zoom: want_zoom, zoom_capable, adc_rate })
 }
 
-/// A row as the spectrometer wrote it to the row in frequency order (DC in
-/// the middle): bin 0 (the fastlock flag, no power) takes its neighbour's
-/// value, then the rotation is undone.
-pub fn derotate(row: &mut [f32]) {
+/// Bin 0 carries the fastlock flag, not a power: its neighbour's value.
+/// (Until 2026-10-06 the rows were also rotated back by 545 bins: that was
+/// the spectrometer DMA's address skew after a reset of the core, fixed in
+/// maia_hdl dma.py; a fixed rotation was wrong after every fresh boot.)
+pub fn fill_bin0(row: &mut [f32]) {
     if row.len() > 1 {
         row[0] = row[1];
     }
-    row.rotate_right(ROTATION % row.len().max(1));
 }
 
 #[cfg(test)]
@@ -306,14 +308,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rows_are_derotated_to_where_the_carrier_is() {
-        // the 2026-10-06 measurement: bin 2083 (the carrier) written at 1538
+    fn rows_stay_where_the_spectrometer_put_them() {
         let mut row = vec![1e-6f32; BINS];
-        row[1538] = 1.0;
-        derotate(&mut row);
+        row[0] = 0.0;
+        row[2083] = 1.0;
+        fill_bin0(&mut row);
         let k = (0..BINS).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap();
         assert_eq!(k, 2083);
-        assert!(row.iter().all(|&p| p > 0.0), "no hole where bin 0 went");
+        assert!(row.iter().all(|&p| p > 0.0), "no hole at bin 0");
+    }
+
+    #[test]
+    fn zoom_rows_integrate_for_their_own_rate() {
+        // 15 rows/s: 400 integrations at 24.576 MS/s, 50 at the zoom's 3.072
+        assert_eq!(nint(input_rate(24_576_000.0, false), 15.0), 400);
+        assert_eq!(nint(input_rate(24_576_000.0, true), 15.0), 50);
     }
 
     #[test]

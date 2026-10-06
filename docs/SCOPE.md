@@ -64,5 +64,14 @@ stages: 42), WNS +0.5 ns.
   of Maia's view above. Kept open at 22 MHz, the whole FM band took the
   AD9361 gain from 73 to 61 dB and RDS decoded on 0 of 6 stations (6 of 6
   at 1 MHz). In the +/-5M and +/-10M views RDS is weaker for that reason.
-- Maia's rows are rotated -545 bins by the core (maia.rs ROTATION): trxd
-  rotates them back, the zoom rows too.
+- Maia's rows are written where they belong. (Until 2026-10-06 they could
+  land 544 bins low: the spectrometer DMA queued write addresses ahead of
+  its data, and the core's reset on a trxd stop or mode switch left them
+  queued. maia_hdl dma.py now issues addresses only for the buffer being
+  written; the fixed 545-bin rotation trxd applied meanwhile was wrong
+  after every fresh boot and is gone.) Bin 0 (the fastlock flag) takes
+  its neighbour's value.
+- The zoom input integrates for its own rate (3.072 MS/s): nint and the
+  row time follow the input, not the converter.
+- On a wide image the RX analog filter covers the view and the receiver:
+  a channel up to 0.45 x adc from the LO opens it to the next step.
