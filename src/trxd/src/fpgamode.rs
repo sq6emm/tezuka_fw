@@ -30,6 +30,16 @@ pub enum Part {
 
 /// The mode of the bitstream loaded now ("boot": the boot one's, from
 /// /etc/fpga-boot-mode; "trx" when the firmware says nothing).
+/// The loaded bitstream's converter rate and FPGA decimation, from its rate
+/// file (board-fpga installs `fpga-<mode>.rate` beside the images: "24576000
+/// 64"). None: the usual 3.072 MS/s and x8.
+pub fn rate(mode: &str) -> Option<(u32, u32)> {
+    let s = std::fs::read_to_string(format!("/lib/firmware/fpga-{mode}.rate")).ok()?;
+    let mut it = s.split_whitespace().map(|v| v.parse::<u32>().ok());
+    let (rate, decim) = (it.next()??, it.next()??);
+    (rate > 0 && decim > 0 && rate % decim == 0).then_some((rate, decim))
+}
+
 pub fn loaded() -> String {
     let read = |p: &str| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     match read(LOADED) {

@@ -316,9 +316,9 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <button class="k" data-span="500000">±250k</button>
       <button class="k" data-span="1000000">±500k</button>
       <button class="k" data-span="2500000">±1.25M</button>
-      <button class="k" data-span="5000000" title="Swept view: the LO steps across, no audio meanwhile; click a station to listen">±2.5M</button>
-      <button class="k" data-span="10000000" title="Swept view: the LO steps across, no audio meanwhile; click a station to listen">±5M</button>
-      <button class="k" data-span="25000000" title="Swept view (the whole FM broadcast band from 100 MHz): the LO steps across, no audio meanwhile; click a station to listen">±12.5M</button>
+      <button class="k" data-span="5000000">±2.5M</button>
+      <button class="k" data-span="10000000">±5M</button>
+      <button class="k" data-span="20000000" title="The FM broadcast band from 97.75 MHz">±10M</button>
       <button class="k" id="ref-auto" title="Keep the noise floor near the bottom of the scope">AUTO</button>
       <button class="k" id="ref-dn" title="Reference level down">REF−</button>
       <button class="k" id="ref-up" title="Reference level up">REF+</button>
@@ -920,7 +920,7 @@ function renderState() {
     b.disabled = +b.dataset.span > st.span_max;
   });
   $("scopeinfo").textContent = `SPAN ±${fmtHz(st.span / 2)}  REF ${S.refAuto ? "AUTO" + (S.refOffset ? (S.refOffset > 0 ? "+" : "") + S.refOffset : "") : S.refDb + " dBFS"}` +
-    (st.scope_src === "sweep" ? "  SWEEP: no audio, click a station to listen" : "");
+    (st.scope_src === "sweep" ? "  SWEPT (this FPGA image sees less in one look): no audio meanwhile" : "");
   drawSpectrum();
 }
 function setSlider(id, v) {
@@ -1180,8 +1180,6 @@ function setupScope() {
       // CW: put the clicked signal on the sidetone; SSB: on the carrier.
       const off = S.st && S.st.mode === "CW" ? -700 : 0;
       tuneTo(Math.round((f + off) / 10) * 10);
-      // In a swept view: stop sweeping and listen there (one look, +/-1.25 MHz).
-      if (S.st && S.st.scope_src === "sweep") send({ cmd: "span", hz: 2500000 });
     });
     c.addEventListener("wheel", (e) => { e.preventDefault(); tuneBy(e.deltaY < 0 ? 1 : -1); }, { passive: false });
     c.addEventListener("pointermove", (e) => {

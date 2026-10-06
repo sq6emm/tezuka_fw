@@ -91,6 +91,11 @@ pub struct RadioConfig {
     /// Use the simple bitstream's x8 FIR decimator / interpolator. Off streams
     /// the full `adc_rate` to the ARM (works with any ADI bitstream, costs CPU).
     pub fpga_decimation: bool,
+    /// The FPGA's decimation (and interpolation) factor: 8, or the loaded
+    /// bitstream's own from its rate file (fpgamode::apply_rate: the wide
+    /// LibreSDR trx image runs the AD9361 at 24.576 MS/s with x64).
+    #[serde(skip)]
+    pub fpga_decim: u32,
     /// The radio's 48 kHz channel from the trx bitstream's DDC (NCO and
     /// decimation in the fabric, the channel read from a ring in DDR) when
     /// the loaded bitstream has it; off, or without one, the ARM makes it
@@ -132,6 +137,7 @@ impl Default for RadioConfig {
             backend: Backend::Iio,
             adc_rate: 3_072_000,
             fpga_decimation: true,
+            fpga_decim: 8,
             fpga_ddc: true,
             rf_bandwidth: 1_000_000,
             rx_gain_mode: GainMode::SlowAttack,
@@ -154,7 +160,7 @@ impl Default for RadioConfig {
 impl RadioConfig {
     /// Sample rate the ARM sees.
     pub fn stream_rate(&self) -> f64 {
-        if self.fpga_decimation { self.adc_rate as f64 / 8.0 } else { self.adc_rate as f64 }
+        if self.fpga_decimation { self.adc_rate as f64 / self.fpga_decim.max(1) as f64 } else { self.adc_rate as f64 }
     }
 }
 

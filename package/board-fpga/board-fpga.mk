@@ -26,8 +26,11 @@ define BOARD_FPGA_INSTALL_IMAGES_CMDS
 	$(UNZIP) -p $(@D)/$(BOARD_FPGA_PROJECT)-$$mode.xsa system_top.bit > $(BINARIES_DIR)/system_top.bit
 endef
 
+# A mode whose image runs the AD936x at another converter rate than 3.072
+# MS/s (x8) has a rate file beside it, "<rate> <decimation>" (the wide LibreSDR
+# trx image: "24576000 64"); trxd reads /lib/firmware/fpga-<mode>.rate.
 define BOARD_FPGA_INSTALL_TARGET_CMDS
-	rm -f $(TARGET_DIR)/lib/firmware/fpga-*.bin $(TARGET_DIR)/etc/fpga-boot-mode $(TARGET_DIR)/etc/fw-flavour
+	rm -f $(TARGET_DIR)/lib/firmware/fpga-*.bin $(TARGET_DIR)/lib/firmware/fpga-*.rate $(TARGET_DIR)/etc/fpga-boot-mode $(TARGET_DIR)/etc/fw-flavour
 	$(if $(BOARD_FPGA_FLAVOUR),echo $(BOARD_FPGA_FLAVOUR) > $(TARGET_DIR)/etc/fw-flavour)
 	mode=$$(cat $(@D)/boot-mode) || exit 1; \
 	mkdir -p $(TARGET_DIR)/lib/firmware; \
@@ -40,6 +43,11 @@ define BOARD_FPGA_INSTALL_TARGET_CMDS
 		$(UNZIP) -p $$x system_top.bit > $(@D)/mode.bit; \
 		python3 $(BR2_EXTERNAL_PLUTOSDR_PATH)/board/tezuka/common/bit2bin.py \
 			$(@D)/mode.bit $(TARGET_DIR)/lib/firmware/fpga-$$m.bin || exit 1; \
+	done; \
+	for r in $(@D)/$(BOARD_FPGA_PROJECT)-*.rate; do \
+		[ -e "$$r" ] || continue; \
+		m=$${r##*/$(BOARD_FPGA_PROJECT)-}; m=$${m%.rate}; \
+		cp $$r $(TARGET_DIR)/lib/firmware/fpga-$$m.rate; \
 	done
 endef
 

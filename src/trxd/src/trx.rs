@@ -1325,7 +1325,7 @@ impl Trx {
         // at 436 MHz gave MER 6 dB with the LO in the middle, 15 dB 100 kHz
         // below, 27 dB with the signal on one side (docs/DATV-OTA.md).
         if let Some(half) = self.datv_rx_half() {
-            return Some((half + 10e3).min(crate::dvbs2::fpga::FS_IN * 0.4 - half).max(0.0));
+            return Some((half + 10e3).min(crate::dvbs2::fpga::FS_IN() * 0.4 - half).max(0.0));
         }
         let d = self.datv.as_ref().filter(|_| matches!(self.tx_on, Some(TxSource::Datv(_))))?;
         if d.fpga.is_some() || d.t2.is_some() {
@@ -1507,7 +1507,7 @@ impl Trx {
             self.retune(false);
             return;
         }
-        let ddc = fpga::available() && ddc::symbol_rate_ok(fpga::FS_IN, sr);
+        let ddc = fpga::available() && ddc::symbol_rate_ok(fpga::FS_IN(), sr);
         let center = self.rx_eff() - self.center;
         if let Some(mode) = LongMode::parse(rate) {
             if !ddc {

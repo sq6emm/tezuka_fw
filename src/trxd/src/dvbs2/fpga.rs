@@ -58,7 +58,21 @@ pub const RING_WORDS: u64 = RING_BYTES as u64 / 4;
 /// Absolute ring positions as the wrap counter gives them: modulo 65536 rings.
 pub const RING_SPAN_WORDS: u64 = 65536 * RING_WORDS;
 /// The DDC's input: the AD936x rate before the x8 decimator.
-pub const FS_IN: f64 = 3_072_000.0;
+pub const FS_IN_DEFAULT: f64 = 3_072_000.0;
+
+static FS_IN_HZ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(3_072_000);
+
+/// The converter rate the loaded image runs at (set once at start-up).
+pub fn set_fs_in(hz: f64) {
+    FS_IN_HZ.store(hz.round() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The DDC's input rate: the converter rate (3.072 MS/s, or the wide trx
+/// image's 24.576 MS/s).
+#[allow(non_snake_case)]
+pub fn FS_IN() -> f64 {
+    FS_IN_HZ.load(std::sync::atomic::Ordering::Relaxed) as f64
+}
 const PLATFORM_DATV: u32 = 0xD5;
 /// The trx bitstream's core: the DDC feeds the ring with the radio's
 /// channel (maia_iio_lite_trx, platform 0xD7).
@@ -275,7 +289,7 @@ impl FrontEnd {
             return Err(format!("the FPGA has no DATV ring recorder (version {:#010x})", regs.rd32(REG_VERSION)));
         }
         let ring = Mapping::new(&mem, RING_BYTES, RING_START as u64).map_err(|e| format!("map DATV ring: {e}"))?;
-        let design = design(FS_IN, rs, rolloff)?;
+        let design = design(FS_IN(), rs, rolloff)?;
         let r = design.registers();
         // Stop a ring left running by a previous instance before rewriting
         // the filters under it (a stop while stopped is harmless here: the
@@ -287,7 +301,7 @@ impl FrontEnd {
             regs.wr32(REG_COEFF, 1 | (((c as u32) & 0x3_FFFF) << 1));
         }
         regs.wr32(REG_DECIMATION, r.decimation[0] as u32 | (r.decimation[1] as u32) << 7 | (r.decimation[2] as u32) << 13);
-        regs.wr32(REG_FREQUENCY, frequency_word(center_hz, FS_IN) & 0x0FFF_FFFF);
+        regs.wr32(REG_FREQUENCY, frequency_word(center_hz, FS_IN()) & 0x0FFF_FFFF);
         regs.wr32(
             REG_DDC_CONTROL,
             r.operations_minus_one[0] as u32
@@ -341,7 +355,7 @@ impl FrontEnd {
             return Err(format!("the FPGA has no channel ring (version {:#010x})", regs.rd32(REG_VERSION)));
         }
         let ring = Mapping::new(&mem, RING_BYTES, RING_START as u64).map_err(|e| format!("map channel ring: {e}"))?;
-        let design = super::ddc::design_channel(FS_IN, fs_out, pass_hz)?;
+        let design = super::ddc::design_channel(FS_IN(), fs_out, pass_hz)?;
         let r = design.registers();
         stop_recorder(&regs);
         out_of_reset(&regs);
@@ -350,7 +364,7 @@ impl FrontEnd {
             regs.wr32(REG_COEFF, 1 | (((c as u32) & 0x3_FFFF) << 1));
         }
         regs.wr32(REG_DECIMATION, r.decimation[0] as u32 | (r.decimation[1] as u32) << 7 | (r.decimation[2] as u32) << 13);
-        regs.wr32(REG_FREQUENCY, frequency_word(center_hz, FS_IN) & 0x0FFF_FFFF);
+        regs.wr32(REG_FREQUENCY, frequency_word(center_hz, FS_IN()) & 0x0FFF_FFFF);
         regs.wr32(
             REG_DDC_CONTROL,
             r.operations_minus_one[0] as u32
@@ -415,13 +429,13 @@ impl FrontEnd {
         let table: Vec<i32> = if passthrough {
             (0..resamp::SPAN * resamp::PHASES).map(|a| if a / resamp::PHASES == resamp::SPAN / 2 { 1 << 14 } else { 0 }).collect()
         } else {
-            resamp::t2_table(FS_IN, fs)
+            resamp::t2_table(FS_IN(), fs)
         };
         for (addr, &c) in table.iter().enumerate() {
             regs.wr32(REG_COEFF_ADDR, addr as u32);
             regs.wr32(REG_COEFF, 1 | (((c as u32) & 0x3_FFFF) << 1));
         }
-        let step = if passthrough { 1 << resamp::FRAC } else { resamp::step(FS_IN, fs) };
+        let step = if passthrough { 1 << resamp::FRAC } else { resamp::step(FS_IN(), fs) };
         regs.wr32(REG_OMEGA, step);
         regs.wr32(REG_SYMSYNC, 0); // resets the resampler
         // The OFDM front end, if there (its layout reads back), off until
@@ -480,7 +494,7 @@ impl FrontEnd {
             regs.wr32(REG_T2_CONTROL, T2_ENABLE);
         }
         regs.wr32(REG_REC_CONTROL, 1);
-        let fs_out = resamp::rate_out(FS_IN, step);
+        let fs_out = resamp::rate_out(FS_IN(), step);
         let fe = FrontEnd::new(mem, regs, ring, fs_out, 0.0, generation, false, false, t2_fe, t2_eq, 4.0 * fs_out);
         fe.t2_ext.set(t2_ext);
         tracing::info!(reports = t2_ext.is_some(), "DVB-T2 front end: P1 / GI / MER reports");
@@ -728,7 +742,7 @@ impl FrontEnd {
     pub fn set_center(&mut self, hz: f64) {
         if (hz - self.center_hz).abs() > 0.1 {
             self.center_hz = hz;
-            self.regs.wr32(REG_FREQUENCY, frequency_word(hz, FS_IN) & 0x0FFF_FFFF);
+            self.regs.wr32(REG_FREQUENCY, frequency_word(hz, FS_IN()) & 0x0FFF_FFFF);
         }
     }
 

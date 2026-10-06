@@ -11,8 +11,8 @@ beside the signal).
 |---|---|---|
 | Channel | 48 kS/s around the receive frequency | spans up to +/-10 kHz the channel covers |
 | Stream | the FPGA's x8 decimated 384 kS/s, LO +/-192 kHz | spans up to +/-150 kHz the stream covers |
-| Maia | 4096-bin spectrometer at the ADC rate, LO +/-1.38 MHz (0.45 x 3.072 MS/s) | anything one look can show: wider views, and narrower ones the stream misses (DATV's LO beside the signal) |
-| Sweep | the LO stepped across, Maia's rows stitched | views wider than one look (+/-2.5, +/-5, +/-12.5 MHz) |
+| Maia | 4096-bin spectrometer at the ADC rate, LO +/-0.45 x the rate: +/-11 MHz on the LibreSDR trx image (24.576 MS/s), +/-1.38 MHz on the others (3.072 MS/s) | anything one look can show: wider views, and narrower ones the stream misses (DATV's LO beside the signal) |
+| Sweep | the LO stepped across, Maia's rows stitched | views wider than one look: only on the 3.072 MS/s images (+/-2.5, +/-5, +/-10 MHz) |
 
 Rules:
 
@@ -37,3 +37,16 @@ Measured on Libre 2, 100 MHz WFM: +/-125 kHz stream 15 rows/s, +/-1.25 MHz
 Maia 15 rows/s with the filter at 2.7 MHz, +/-12.5 MHz sweep 1.5 lines/s
 over 87.5-112.5 MHz; DATV mode at 33-500 kS/s (LO 54-347 kHz below the
 signal) with no empty columns.
+
+## The wide LibreSDR trx image (2026-10-06)
+
+The LibreSDR's trx image runs the AD9361 at 24.576 MS/s and decimates x64
+(two ADI x8 FIR stages) to the same 384 kS/s stream; transmit interpolates
+x64 the same way (maia-hdl projects/simple/rate64.tcl: the DAC-side stage
+pulls a pre-stage through a small FIFO, a saturating x4 restores the 12 dB
+the second stage's FIR scaling costs). Maia's spectrometer therefore sees
++/-11 MHz in one look: the whole FM band live at 15 rows/s, with audio. The
+channel DDC decimates 512x (24.576 MS/s -> 48 kHz). trxd takes the rate from
+the image's rate file (`/lib/firmware/fpga-trx.rate`: "24576000 64"); the
+DATV images stay at 3.072 MS/s and x8. FPGA: 138 of 220 DSPs (the two new
+stages: 42), WNS +0.5 ns.

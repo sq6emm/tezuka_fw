@@ -429,7 +429,7 @@ pub fn open(cfg: &RadioConfig) -> Result<Radio, String> {
 
     if cfg.iio_root == "/sys/bus/iio/devices" {
         match set_fpga_filters(cfg.fpga_decimation) {
-            Ok(()) => info!(on = cfg.fpga_decimation, "FPGA x8 decimator/interpolator"),
+            Ok(()) => info!(on = cfg.fpga_decimation, decim = cfg.fpga_decim, "FPGA decimator/interpolator"),
             Err(e) if cfg.fpga_decimation => {
                 return Err(format!("cannot enable the FPGA decimator ({e}); set radio.fpga_decimation = false"));
             }

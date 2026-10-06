@@ -21,9 +21,10 @@
 pub const NARROW_SPAN_MAX: f64 = 20_000.0;
 /// Up to this the stream's FFT serves it (finer than Maia's 750 Hz bins).
 pub const STREAM_SPAN_MAX: f64 = 300_000.0;
-/// The widest view on offer (a sweep): the whole FM broadcast band around
-/// its middle, +/-12.5 MHz.
-pub const SWEEP_SPAN_MAX: f64 = 25_000_000.0;
+/// The widest view on offer: the FM broadcast band around its middle,
+/// +/-10 MHz (one look on the wide LibreSDR image at 24.576 MS/s, a sweep
+/// where the converter runs at 3.072 MS/s).
+pub const SWEEP_SPAN_MAX: f64 = 20_000_000.0;
 /// Room left at the edges of one Maia look (the AD936x's own decimation
 /// filters roll off towards the Nyquist edge).
 const MAIA_USE: f64 = 0.45;

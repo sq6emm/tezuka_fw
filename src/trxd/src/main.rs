@@ -166,6 +166,16 @@ fn main() -> ExitCode {
     if sim {
         cfg.radio.backend = Backend::Sim;
     }
+    // The converter rate the loaded FPGA image is built for (the wide trx
+    // image: 24.576 MS/s, x64 to the same 384 kS/s stream).
+    if cfg.radio.backend == Backend::Iio {
+        if let Some((rate, decim)) = fpgamode::rate(&fpgamode::loaded()) {
+            info!(rate, decim, "converter rate from the FPGA image");
+            cfg.radio.adc_rate = rate;
+            cfg.radio.fpga_decim = decim;
+        }
+    }
+    dvbs2::fpga::set_fs_in(cfg.radio.adc_rate as f64);
     if check {
         println!("{cfg:#?}");
         return ExitCode::SUCCESS;
