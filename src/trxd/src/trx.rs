@@ -773,7 +773,9 @@ impl Trx {
         // LibreSDR image), not only in the 384 kS/s stream: a click in a
         // wide view moves the DDC, not the LO (and the view). The stream
         // still bounds what is sent (the TX path is 384 kS/s around the LO).
-        let rx_reach = if self.chan_fpga.is_some() { (self.cfg.radio.adc_rate as f64 * 0.45).max(half) } else { half };
+        // (the DDC's input: the converter's rate, 3.072 MS/s on the DATV
+        // images, whose DDC takes the first decimation stage)
+        let rx_reach = if self.chan_fpga.is_some() { (crate::dvbs2::fpga::FS_IN() * 0.45).max(half) } else { half };
         let fits_rx = |c: f64| {
             let off = rx - c;
             off.abs() < rx_reach - EDGE_MARGIN_HZ - rx_half && off.abs() > EDGE_MARGIN_HZ
@@ -2236,7 +2238,12 @@ impl Trx {
         } else {
             want.max(rx_need as u32)
         };
-        if want != self.rx_bw {
+        // (Not while the view is about to move the LO, later in this block:
+        // a far tune first looked like a Maia view, then the LO followed
+        // and it was a stream view again: 22 then 1 MHz, two AD936x
+        // recalibrations per tune, seen at every band change.)
+        let lo_moving = self.scope_lo_window().is_some_and(|(w, m)| (self.center - w).abs() > m);
+        if want != self.rx_bw && !lo_moving {
             match self.radio.set_rx_bandwidth(want) {
                 Ok(()) => info!(hz = want, "RX bandwidth"),
                 Err(e) => warn!("RX bandwidth: {e}"),
@@ -3110,10 +3117,18 @@ impl Trx {
                 }
             }
             "datv_rx" => {
+                let req = on.then(|| (num("sr").unwrap_or(64_000.0), m["rate"].as_str().unwrap_or("L-QPSK-1/2").to_string()));
+                // The page sends the same request several times within
+                // milliseconds (menu, adopt, resume): a receiver already on
+                // with it keeps running (each restart costs the lock, and
+                // overlapping ones raced in the FPGA front end).
+                if req.is_some() && req == self.datv_rx_req && (self.datv_rx.is_some() || self.datv_scan.is_some()) {
+                    return;
+                }
                 self.datv_rx = None;
                 self.datv_scan = None;
                 self.datv_rx_stats = Default::default();
-                self.datv_rx_req = on.then(|| (num("sr").unwrap_or(64_000.0), m["rate"].as_str().unwrap_or("L-QPSK-1/2").to_string()));
+                self.datv_rx_req = req;
                 // Sending DATV the A9 cannot carry as well (DVB-T2, the
                 // software modulator): the receiver starts when that ends.
                 if let Some((sr, rate)) = self.datv_rx_req.clone().filter(|_| self.datv_rx_alongside_tx()) {

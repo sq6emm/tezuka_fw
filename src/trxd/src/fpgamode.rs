@@ -30,14 +30,34 @@ pub enum Part {
 
 /// The mode of the bitstream loaded now ("boot": the boot one's, from
 /// /etc/fpga-boot-mode; "trx" when the firmware says nothing).
-/// The loaded bitstream's converter rate and FPGA decimation, from its rate
-/// file (board-fpga installs `fpga-<mode>.rate` beside the images: "24576000
-/// 64"). None: the usual 3.072 MS/s and x8.
-pub fn rate(mode: &str) -> Option<(u32, u32)> {
-    let s = std::fs::read_to_string(format!("/lib/firmware/fpga-{mode}.rate")).ok()?;
+/// The loaded bitstream's rates, from its rate file (board-fpga installs
+/// `fpga-<mode>.rate` beside the images): "<converter> <decimation>
+/// [<DATV input>]", e.g. "24576000 64" (the wide trx image) or "24576000 64
+/// 3072000" (the wide DATV images: their DDC and T2 resampler take the first
+/// decimation stage's output). None: the usual 3.072 MS/s and x8.
+pub fn rate(mode: &str) -> Option<Rates> {
+    parse_rate(&std::fs::read_to_string(format!("/lib/firmware/fpga-{mode}.rate")).ok()?)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rates {
+    /// The AD936x converter rate (S/s).
+    pub adc: u32,
+    /// The FPGA decimation to the stream.
+    pub decim: u32,
+    /// The rate the FPGA DDC (the channel, DATV) and the T2 resampler take
+    /// their input at: the converter's unless the file says otherwise.
+    pub ddc_in: u32,
+}
+
+fn parse_rate(s: &str) -> Option<Rates> {
     let mut it = s.split_whitespace().map(|v| v.parse::<u32>().ok());
-    let (rate, decim) = (it.next()??, it.next()??);
-    (rate > 0 && decim > 0 && rate % decim == 0).then_some((rate, decim))
+    let (adc, decim) = (it.next()??, it.next()??);
+    let ddc_in = match it.next() {
+        Some(v) => v?,
+        None => adc,
+    };
+    (adc > 0 && decim > 0 && adc % decim == 0 && ddc_in > 0 && adc % ddc_in == 0).then_some(Rates { adc, decim, ddc_in })
 }
 
 pub fn loaded() -> String {
@@ -215,6 +235,15 @@ pub fn bit2bin_cli() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_files() {
+        assert_eq!(parse_rate("24576000 64\n"), Some(Rates { adc: 24_576_000, decim: 64, ddc_in: 24_576_000 }));
+        assert_eq!(parse_rate("24576000 64 3072000\n"), Some(Rates { adc: 24_576_000, decim: 64, ddc_in: 3_072_000 }));
+        assert_eq!(parse_rate("24576000 64 x"), None);
+        assert_eq!(parse_rate("24576000 64 5000000"), None);
+        assert_eq!(parse_rate("24576000"), None);
+    }
 
     /// A tiny FIT-like tree: / { images { fpga@1 { data = <..>; }; }; };
     fn tree() -> Vec<u8> {

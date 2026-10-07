@@ -1534,7 +1534,13 @@ pub struct RxShared {
 /// blocks (never stalls the engine) if the CPU cannot keep up.
 pub struct RxThread {
     /// Dropped with this handle: its threads end on that.
-    _tx: crossbeam_channel::Sender<()>,
+    _tx: Option<crossbeam_channel::Sender<()>>,
+    /// The receive thread (FPGA front end): joined on drop, so a receiver
+    /// that replaces this one finds the front end stopped; an old one still
+    /// starting its front end after a newer one had (the page asks for the
+    /// default rate, then the chosen one) left the hardware set for the old
+    /// rate: 33k never locked (2026-10-07).
+    thread: Option<std::thread::JoinHandle<()>>,
     shared: std::sync::Arc<std::sync::Mutex<RxShared>>,
     pub spec: FrameSpec,
     /// The mode as the UI names it (e.g. "1/2", "L-8PSK-3/4").
@@ -1754,6 +1760,19 @@ fn label_log(m: &crate::dvbt2::tx::Mode) -> String {
     format!("{:.2} MHz {:?} {:?}", m.bw_hz / 1e6, m.p.constellation, m.p.rate)
 }
 
+impl Drop for RxThread {
+    fn drop(&mut self) {
+        self._tx.take();
+        if let Some(t) = self.thread.take() {
+            let t0 = std::time::Instant::now();
+            let _ = t.join();
+            if t0.elapsed() > std::time::Duration::from_millis(200) {
+                tracing::warn!(ms = t0.elapsed().as_millis() as u64, "DATV receive: the old receiver took long to stop");
+            }
+        }
+    }
+}
+
 impl RxThread {
     /// DVB-S2 long frames through the FPGA front end (DDC, symbol timing,
     /// header detector) into the DDR ring: a reader thread drains the ring
@@ -1777,7 +1796,7 @@ impl RxThread {
         let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let fpga_center = Some(Arc::new(std::sync::atomic::AtomicU64::new(center_hz.to_bits())));
         let (fc, dr) = (fpga_center.clone().expect("set above"), dropped.clone());
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("datv-rx".into())
             .spawn(move || {
                 crate::stream::thread_nice(-5);
@@ -1884,7 +1903,7 @@ impl RxThread {
                 let _ = ring.join();
             })
             .expect("spawn datv-rx");
-        RxThread { _tx: tx, shared, fec_stats, spec: p, label, sr, dropped, started: std::time::Instant::now(), fpga_center, t2_bw: None }
+        RxThread { _tx: Some(tx), thread: Some(thread), shared, fec_stats, spec: p, label, sr, dropped, started: std::time::Instant::now(), fpga_center, t2_bw: None }
     }
 
     /// DVB-T2 through the FPGA's T2 resampler: [`crate::dvbt2::stream::Demod`]
@@ -1907,7 +1926,7 @@ impl RxThread {
         let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let center = Arc::new(std::sync::atomic::AtomicU64::new(center_hz.to_bits()));
         let (fc, dr) = (center.clone(), dropped.clone());
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("datv-rx".into())
             .spawn(move || {
                 crate::stream::thread_nice(-5);
@@ -2088,7 +2107,7 @@ impl RxThread {
                 let _ = ring.join();
             })
             .expect("spawn datv-rx");
-        RxThread { _tx: tx, shared, fec_stats, spec, label, sr: 0.0, dropped, started: std::time::Instant::now(), fpga_center: Some(center), t2_bw: Some(mode.bw_hz) }
+        RxThread { _tx: Some(tx), thread: Some(thread), shared, fec_stats, spec, label, sr: 0.0, dropped, started: std::time::Instant::now(), fpga_center: Some(center), t2_bw: Some(mode.bw_hz) }
     }
 
     /// The signal's offset from the LO (the front end's NCO follows it).

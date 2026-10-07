@@ -27,8 +27,10 @@ define BOARD_FPGA_INSTALL_IMAGES_CMDS
 endef
 
 # A mode whose image runs the AD936x at another converter rate than 3.072
-# MS/s (x8) has a rate file beside it, "<rate> <decimation>" (the wide LibreSDR
-# trx image: "24576000 64"); trxd reads /lib/firmware/fpga-<mode>.rate.
+# MS/s (x8) has a rate file beside it, "<rate> <decimation> [<DATV input>]"
+# (the wide trx images: "24576000 64"; the wide DATV images, whose DDC and T2
+# resampler take the first decimation stage: "24576000 64 3072000"); trxd
+# reads /lib/firmware/fpga-<mode>.rate.
 define BOARD_FPGA_INSTALL_TARGET_CMDS
 	rm -f $(TARGET_DIR)/lib/firmware/fpga-*.bin $(TARGET_DIR)/lib/firmware/fpga-*.rate $(TARGET_DIR)/etc/fpga-boot-mode $(TARGET_DIR)/etc/fw-flavour
 	$(if $(BOARD_FPGA_FLAVOUR),echo $(BOARD_FPGA_FLAVOUR) > $(TARGET_DIR)/etc/fw-flavour)

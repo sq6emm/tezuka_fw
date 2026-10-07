@@ -11,7 +11,9 @@ its own bitstream, and trxd loads the one a feature needs while Linux runs.
 | `s2` | radio, wide scope, DVB-S2 receive (DDC, symsync, hdrdet) and transmit, LDPC | 52 % | 108.5 | 115 |
 | `t2` | radio, wide scope, DVB-T2 receive (OFDM front end with P1/GI/MER reports, t2eq, cell router) and transmit (IFFT), LDPC | 70 % | 117.5 | 208 |
 
-On LibreSDR BASIC+ carries `trx` (boot), `s2` and `t2`: trxd loads `s2`
+On LibreSDR and (since 2026-10-07, when the wide combined `datv` no longer
+met timing: LDPC paths -0.32 ns, block RAM 96 %) PlutoSky R2 BASIC+ carries
+`trx` (boot), `s2` and `t2`: trxd loads `s2`
 for a DVB-S2 mode and `t2` for a DVB-T2 one (`fpgamode::datv_part`: the
 rate's "T2-" prefix). `datv` (both) stays a mode trxd accepts, so an image
 that still has it, or a board running it, needs no switch; a DATV command
@@ -23,6 +25,28 @@ free for more of the S2 receiver.
 "Radio" is the AD936x interface, the DMAs, the x8 decimator/interpolator,
 refmeter and on Libre `vctcxo_lock` and the XO corrector: in every mode, at
 the same addresses, so the device tree is the same for all.
+
+## Converter rate (since 2026-10-07: every mode at 24.576 MS/s)
+
+On LibreSDR and PlutoSky R2 every mode runs the AD936x at 24.576 MS/s with
+x64 between it and the DMAs (maia-sdr-simple `rate64.tcl`): the stream stays
+384 kS/s, Maia's spectrometer sees ~24 MHz, and its zoom input is the first
+decimation stage (3.072 MS/s, at the converter's level).
+
+The DATV signal paths keep the 3.072 MS/s they were built and tested at:
+- receive: Maia's DDC and the T2 resampler take the zoom input
+  (`config.datv_from_zoom`), not the ADC samples;
+- transmit: `datv_merge` sits in front of the DAC-side x8 stage (unity gain
+  there: 18 output bits, saturated, `rate64_bits.v`) instead of after it;
+  `datv_tx`'s interpolator (16 taps a sample on the CPU clock) could not
+  make 24.576 MS/s. It and the IQ path's FIFO advance when that stage's FIR
+  takes a sample (its input pulse AND the DAC FIFO's valid, which comes in
+  bursts: util_rfifo), not on every pulse. Both x8 filters are flat to +/-1.2 MHz (0.2 dB), DVB-T2
+  1.7 MHz uses +/-0.85.
+
+Each image's rate file (`fpga-<mode>.rate`, board-fpga) says so: trx
+"24576000 64" (the channel DDC on the ADC samples), s2/t2/datv "24576000 64
+3072000"; trxd sets `dvbs2::fpga::FS_IN` from the third field.
 
 ## How a switch works
 

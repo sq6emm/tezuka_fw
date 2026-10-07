@@ -84,6 +84,43 @@ const DT_RING: &str = "/proc/device-tree/reserved-memory/maia_sdr_datv_ring@1610
 /// receiver on every setting): only the newest may stop the ring.
 static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// One DATV front end at a time (S2, T2, the blind scan's): a new one waits
+/// until the one before is dropped, its stop sequence written. GENERATION
+/// alone left a race: the web UI restarts the receiver several times within
+/// milliseconds, and an old front end that had passed its check still
+/// stopped the recorder under the new one ("the recorder did not settle
+/// after stop", the run never locked or lost a third of its frames;
+/// 2026-10-07, the 24.576 MS/s images).
+static LEASE: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+struct Lease;
+
+impl Lease {
+    fn take() -> Lease {
+        let (m, cv) = &LEASE;
+        let mut busy = m.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while *busy {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                tracing::warn!("DATV front end: the previous one did not let go within 2 s");
+                break;
+            }
+            busy = cv.wait_timeout(busy, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        *busy = true;
+        Lease
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let (m, cv) = &LEASE;
+        *m.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        cv.notify_all();
+    }
+}
+
 const REG_ID: usize = 0x00;
 const REG_VERSION: usize = 0x04;
 const REG_REC_CONTROL: usize = 0x10;
@@ -224,6 +261,9 @@ fn platform(regs: &Mapping) -> Option<u32> {
 
 /// The running front end: DDC set up for one symbol rate, recorder running.
 pub struct FrontEnd {
+    /// (dropped after Drop::drop has stopped the hardware: the next front
+    /// end starts only then)
+    _lease: Option<Lease>,
     _mem: File,
     regs: Mapping,
     ring: Mapping,
@@ -281,8 +321,9 @@ impl FrontEnd {
         if !std::path::Path::new(DT_RING).exists() {
             return Err("no DATV ring reserved in the device tree".into());
         }
-        // Claim the hardware first: from here on an older front end being
-        // dropped leaves it alone.
+        // Wait for the one before to be gone, then claim the hardware: from
+        // here on an older front end being dropped leaves it alone.
+        let lease = Lease::take();
         let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let (mem, regs) = Self::open_regs()?;
         if !is_datv_core(&regs) {
@@ -337,6 +378,7 @@ impl FrontEnd {
         regs.wr32(REG_REC_CONTROL, 1);
         let ring_rate = 4.0 * if symbols { rs } else { design.fs_out() };
         let mut fe = FrontEnd::new(mem, regs, ring, design.fs_out(), center_hz, generation, symbols, flagged, false, None, ring_rate);
+        fe._lease = Some(lease);
         fe.s2trk = s2trk;
         tracing::info!(s2trk, "DVB-S2 front end: known-symbol accumulator");
         Ok(fe)
@@ -406,6 +448,7 @@ impl FrontEnd {
         if !std::path::Path::new(DT_RING).exists() {
             return Err("no DATV ring reserved in the device tree".into());
         }
+        let lease = Lease::take();
         let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let (mem, regs) = Self::open_regs()?;
         if !is_datv_core(&regs) {
@@ -495,7 +538,8 @@ impl FrontEnd {
         }
         regs.wr32(REG_REC_CONTROL, 1);
         let fs_out = resamp::rate_out(FS_IN(), step);
-        let fe = FrontEnd::new(mem, regs, ring, fs_out, 0.0, generation, false, false, t2_fe, t2_eq, 4.0 * fs_out);
+        let mut fe = FrontEnd::new(mem, regs, ring, fs_out, 0.0, generation, false, false, t2_fe, t2_eq, 4.0 * fs_out);
+        fe._lease = Some(lease);
         fe.t2_ext.set(t2_ext);
         tracing::info!(reports = t2_ext.is_some(), "DVB-T2 front end: P1 / GI / MER reports");
         Ok(fe)
@@ -505,6 +549,7 @@ impl FrontEnd {
     fn new(mem: File, regs: Mapping, ring: Mapping, fs_out: f64, center_hz: f64, generation: u64, symbols: bool, flagged: bool, t2_fe: bool, t2_eq: Option<u32>, ring_rate: f64) -> FrontEnd {
         let wraps_hw = regs.rd32(REG_REC_WRAPS) & WRAPS_PRESENT != 0;
         FrontEnd {
+            _lease: None,
             _mem: mem,
             regs,
             ring,
