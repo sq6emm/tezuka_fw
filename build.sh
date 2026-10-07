@@ -154,11 +154,19 @@ build_board() {
         rm -f "${trxd_build}"/.stamp_built "${trxd_build}"/.stamp_installed "${trxd_build}"/.stamp_target_installed "${trxd_build}"/.stamp_staging_installed
     fi
     # The same for the bitstreams (package/board-fpga takes them from the
-    # tree): a newer .xsa than its last build.
-    local fpga_build
+    # tree): any file in bitstream/ newer than its last build (.xsa, .rate,
+    # boot-mode), or one its copy has that the tree no longer does (a mode
+    # dropped: the rsync left it there and it went into the rootfs).
+    local fpga_build fpga_src f stale
+    fpga_src="${SCRIPT_DIR}/board/tezuka/${HW[$board]:-$board}/bitstream"
     for fpga_build in "${output_dir}"/build/board-fpga*; do
-        if [ -f "${fpga_build}/.stamp_built" ] && [ -n "$(find "${SCRIPT_DIR}/board/tezuka/${HW[$board]:-$board}/bitstream" -name '*.xsa' -newer "${fpga_build}/.stamp_built" -print -quit 2>/dev/null)" ]; then
-            echo "    a bitstream changed since its last build: rebuilding board-fpga"
+        [ -f "${fpga_build}/.stamp_built" ] || continue
+        stale=
+        for f in "${fpga_build}"/*.xsa "${fpga_build}"/*.rate; do
+            [ -e "$f" ] && [ ! -e "${fpga_src}/${f##*/}" ] && stale="${f##*/}"
+        done
+        if [ -n "${stale}" ] || [ -n "$(find "${fpga_src}" -type f -newer "${fpga_build}/.stamp_built" -print -quit 2>/dev/null)" ]; then
+            echo "    a bitstream changed or went since its last build${stale:+ (${stale})}: rebuilding board-fpga"
             rm -f "${fpga_build}"/.stamp_built "${fpga_build}"/.stamp_installed "${fpga_build}"/.stamp_target_installed "${fpga_build}"/.stamp_staging_installed "${fpga_build}"/.stamp_extracted "${fpga_build}"/.stamp_rsynced
         fi
     done

@@ -21,6 +21,18 @@ BOARD_FPGA_PROJECT = $(call qstrip,$(BR2_PACKAGE_BOARD_FPGA_PROJECT))
 BOARD_FPGA_MODES = $(call qstrip,$(BR2_PACKAGE_BOARD_FPGA_MODES))
 BOARD_FPGA_FLAVOUR = $(call qstrip,$(BR2_PACKAGE_BOARD_FPGA_FLAVOUR))
 
+# The local site's rsync copies but never deletes: a bitstream or rate file
+# gone from the tree (a mode dropped) stayed in $(@D) and went into the
+# rootfs again (2026-10-07: a stale fpga-datv.bin made the PlutoSky R2 FIT
+# 12 KB too big for its slot). Drop what the tree no longer has.
+define BOARD_FPGA_DROP_STALE
+	for f in $(@D)/*.xsa $(@D)/*.rate; do \
+		[ -e "$$f" ] || continue; \
+		[ -e "$(BOARD_FPGA_SITE)/$${f##*/}" ] || { echo "board-fpga: dropping stale $${f##*/}"; rm -f "$$f"; }; \
+	done
+endef
+BOARD_FPGA_POST_RSYNC_HOOKS += BOARD_FPGA_DROP_STALE
+
 define BOARD_FPGA_INSTALL_IMAGES_CMDS
 	mode=$$(cat $(@D)/boot-mode) || { echo "board-fpga: no boot-mode file beside the bitstreams" >&2; exit 1; }; \
 	$(UNZIP) -p $(@D)/$(BOARD_FPGA_PROJECT)-$$mode.xsa system_top.bit > $(BINARIES_DIR)/system_top.bit
