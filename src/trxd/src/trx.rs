@@ -1869,6 +1869,9 @@ impl Trx {
                 }
             }
         };
+        // An LNA (or cable) in front of the socket, per band (SET): the
+        // level at its input.
+        let off = off - self.settings.fe_gain.get(&self.cal_band()).copied().unwrap_or(0.0);
         let bw = (hi - lo).max(1.0);
         let noise = dens.is_some_and(|d| 10f64.powf(dbfs / 10.0) < 2.0 * 10f64.powf(d / 10.0) * bw);
         // The scope shows the source its span reads (scope.rs: a full-scale
@@ -2873,6 +2876,7 @@ impl Trx {
             "mute_at_tx": self.settings.mute_at_tx,
             "port": self.radio.port(),
             "ports": self.settings.ports,
+            "fe_gain": self.settings.fe_gain,
             "datv": self.datv_json(),
             "datv_mode": self.datv_mode,
             "datv_rx": match (&self.datv_rx, self.datv_auto) {
@@ -3274,6 +3278,20 @@ impl Trx {
             "port" => {
                 if let Some(p) = num("port") {
                     self.set_port(p as u8);
+                }
+            }
+            "fe_gain_map" => {
+                // A band (label or transverter name) to its front-end gain,
+                // dB; 0 forgets it.
+                let band = m["band"].as_str().unwrap_or("").trim().to_string();
+                if let (false, Some(db)) = (band.is_empty(), num("db")) {
+                    if db.is_finite() && db.abs() > 1e-9 && db.abs() <= 80.0 {
+                        self.settings.fe_gain.insert(band.clone(), (db * 10.0).round() / 10.0);
+                    } else {
+                        self.settings.fe_gain.remove(&band);
+                    }
+                    self.settings.save(&self.settings_dir);
+                    info!(band, db, "RX front-end gain");
                 }
             }
             "port_map" => {
@@ -3701,6 +3719,24 @@ mod tests {
             t.receive(&RxBlock { t0: 0.0, iq });
             i += t.block;
         }
+    }
+
+    #[test]
+    fn a_front_end_gain_per_band_comes_off_the_level() {
+        let (mut t, _log) = trx(144_300_000.0);
+        t.set_mode(Mode::Usb);
+        t.rx_gain_db = 40.0;
+        t.hw_gain_db = 40.0;
+        feed_tone(&mut t, 1e-3, 700.0, 40.0, 1.5);
+        let plain = t.meter.dbm;
+        t.settings.fe_gain.insert("2M".into(), 20.0);
+        feed_tone(&mut t, 1e-3, 700.0, 40.0, 1.5);
+        assert!((t.meter.dbm - (plain - 20.0)).abs() < 0.1, "{} vs {plain}", t.meter.dbm);
+        // (another band's entry does not touch it)
+        t.settings.fe_gain.clear();
+        t.settings.fe_gain.insert("70CM".into(), 20.0);
+        feed_tone(&mut t, 1e-3, 700.0, 40.0, 1.5);
+        assert!((t.meter.dbm - plain).abs() < 0.1);
     }
 
     #[test]

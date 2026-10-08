@@ -179,6 +179,7 @@ fn main() -> ExitCode {
         }
     }
     dvbs2::fpga::set_fs_in(ddc_in.unwrap_or(cfg.radio.adc_rate) as f64);
+    info!(board = calib::board_curve().name, "S-meter: type curve (a measured calib-rx*.json takes precedence)");
     if check {
         println!("{cfg:#?}");
         return ExitCode::SUCCESS;

@@ -74,6 +74,12 @@ pub struct Settings {
     /// wired to, taken whenever the receiver moves into that band.
     #[serde(default)]
     pub ports: std::collections::BTreeMap<String, u8>,
+    /// Per band (band label, or transverter name): gain in front of the
+    /// board's RX socket, dB (an LNA positive, cable or filter negative).
+    /// The level meter takes it off, so it shows the level at the LNA's
+    /// input (the board's calibration table or type curve stays as it is).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fe_gain: std::collections::BTreeMap<String, f64>,
 }
 
 fn one() -> u8 {
@@ -90,6 +96,7 @@ impl Default for Settings {
             smeter: Default::default(),
             port: 1,
             ports: Default::default(),
+            fe_gain: Default::default(),
         }
     }
 }

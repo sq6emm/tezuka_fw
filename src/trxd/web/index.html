@@ -259,6 +259,8 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
     </div>
     <h3>ANTENNA SOCKETS <span class="note">which pair each band (or transverter) is wired to; taken on entering the band. Manual: keep the pair picked by hand</span></h3>
     <div class="row" id="ports-body"></div>
+    <h3>RX FRONT-END GAIN <span class="note">dB in front of the socket, per band (LNA +, cable or filter −): the S-meter then shows the level at the LNA's input; 0 = none</span></h3>
+    <div class="row" id="fe-body"></div>
     <div class="row"><button class="k" id="set-close">CLOSE</button></div>
   </div>
 
@@ -768,6 +770,20 @@ function openSettings() {
   $("xv-body").innerHTML = "";
   (st.xvtrs || []).forEach(addXvRow);
   renderPorts(st);
+  renderFe(st);
+}
+// Band -> front-end gain (dB). Same keys as the sockets.
+function renderFe(st) {
+  const box = $("fe-body");
+  if (box.contains(document.activeElement)) return;   // (not while typing)
+  const keys = BANDS.map(([n]) => n.toUpperCase()).concat((st.xvtrs || []).map((t) => t.name), ["GEN"]);
+  const map = st.fe_gain || {};
+  const sig = JSON.stringify([keys, map]);
+  if (box.dataset.sig === sig) return;
+  box.dataset.sig = sig;
+  box.innerHTML = keys.map((k) => `<label class="note" style="display:inline-flex;gap:4px;align-items:center;margin-right:10px">${k === "GEN" ? "other" : escHtml(k)}
+    <input type="number" step="0.1" min="-80" max="80" style="width:5em" data-fe-band="${escHtml(k)}" value="${map[k] != null ? map[k] : 0}"></label>`).join("");
+  box.querySelectorAll("input").forEach((inp) => inp.onchange = () => send({ cmd: "fe_gain_map", band: inp.dataset.feBand, db: +inp.value || 0 }));
 }
 // Band -> sockets. Keys as the board names bands (upper case) or the transverter's name.
 function renderPorts(st) {

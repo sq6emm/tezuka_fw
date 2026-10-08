@@ -61,7 +61,36 @@ Quality, shown in SET and in the meter:
 | calibrated | inside the measured frequencies (within max(20 MHz, 5 %) of a point, or between two) |
 | extrapolated (`dBm*`) | outside them: the nearest point's K (above 3.2 GHz with the Siglent: the highest points), or a transverter without an offset |
 | legacy (`dBm~`) | no table: the band's old S-meter points (settings.json), if it had any |
-| none (`dBm~`) | no table, no points: K = 12 dB (the old nominal figure) |
+| none (`dBm~`) | no table, no points: the board type's curve (below) |
+
+### Without a table: the board type's curve
+
+`calib::board_curve()` picks a curve by the device tree model (ADALM-Pluto,
+LibreSDR; the PlutoSky R2 and anything else take the LibreSDR's until
+measured): K = 12 dB plus a correction by frequency, less a part by AGC
+gain. The AD936x front end loses gain below a few hundred MHz, mostly in
+its top gain steps, which the reported gain does not show; each board's
+own front end adds its part (the LibreSDR reads 3..6 dB lower than the
+Pluto at every frequency with the same S+N/N). Measured with an HP 8642B
+into RX1, -30..-120 dBm at 50.15, 70.2, 144.3, 435, 1296 and 2100 MHz
+(2026-10-08); between the points by log frequency and gain, held outside.
+After it, the Pluto read within +/-0.4 dB from -40 to -110 dBm at all six
+(before: up to 11.4 dB low on 6 m). `trxd --sim` keeps the constant.
+
+| dB added at the top gain step | 50 | 70 | 144 | 435 | 1296 | 2100 MHz |
+|---|---|---|---|---|---|---|
+| ADALM-Pluto | 11.3 | 7.8 | 3.9 | 2.2 | 0.8 | 0.7 |
+| LibreSDR | 14.1 | 10.5 | 7.2 | 6.2 | 5.5 | 6.7 |
+
+### Front-end gain per band
+
+SET > RX FRONT-END GAIN: dB in front of the socket per band (or
+transverter), an LNA positive, cable or filter negative (`settings.json`
+`fe_gain`, on jffs2). It comes off the conversion whatever gives it (table,
+old points or curve), so the meter and the scope labels show the level at
+the LNA's input.
+
+### Old points
 
 The old per-band S-meter points (SET > S-METER CALIBRATION, removed) still
 load and apply only where there is no table at all; a table, once
