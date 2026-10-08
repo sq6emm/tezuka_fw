@@ -33,6 +33,54 @@ use tracing::warn;
 /// -135 dBm on the LibreSDR), same number as settings::UNCALIBRATED_OFFSET_DB.
 pub const K_DEFAULT_DB: f64 = 12.0;
 
+/// What the reported gain misses on the AD936x below a few hundred MHz
+/// (its front end loses gain there; the AD9363 is specified from 325 MHz):
+/// dB to add to K, measured on an ADALM-Pluto with an HP 8642B into RX1,
+/// S-meter against the generator level in USB, 2026-10-08. Between the
+/// points by log frequency, held outside them.
+const K_CORRECTION: [(f64, f64); 6] = [
+    (50.15e6, 11.3),
+    (70.2e6, 7.8),
+    (144.3e6, 3.9),
+    (435e6, 2.2),
+    (1296e6, 0.8),
+    (2100e6, 0.7),
+];
+
+/// ... but that loss is in the top gain steps: below them the correction
+/// is smaller by this much (dB, by AGC gain), measured the same way at
+/// -30..-90 dBm (2026-10-08). None above 1296 MHz.
+const K_EXCESS: [(f64, &[(f64, f64)]); 5] = [
+    (50.15e6, &[(30.0, 4.6), (50.0, 5.0), (57.0, 5.0), (63.0, 4.3), (70.0, 2.0), (73.0, 0.0)]),
+    (70.2e6, &[(30.0, 4.6), (49.0, 4.5), (55.0, 3.4), (60.0, 3.3), (66.0, 2.5), (73.0, 0.0)]),
+    (144.3e6, &[(30.0, 3.0), (40.0, 3.9), (45.0, 3.9), (53.0, 1.4), (58.0, 1.3), (64.0, 0.9), (69.0, 0.6), (73.0, 0.0)]),
+    (435e6, &[(30.0, 1.5), (46.0, 1.3), (52.0, 0.5), (57.0, 0.6), (63.0, 0.0), (73.0, 0.0)]),
+    (1296e6, &[(30.0, 0.0), (73.0, 0.0)]),
+];
+
+/// Piecewise-linear in x over sorted (x, y) points, held outside them.
+fn lerp(pts: &[(f64, f64)], x: f64) -> f64 {
+    if x <= pts[0].0 {
+        return pts[0].1;
+    }
+    if x >= pts[pts.len() - 1].0 {
+        return pts[pts.len() - 1].1;
+    }
+    let i = pts.iter().position(|p| p.0 >= x).unwrap_or(pts.len() - 1).max(1);
+    let ((xa, ya), (xb, yb)) = (pts[i - 1], pts[i]);
+    ya + (x - xa) / (xb - xa) * (yb - ya)
+}
+
+/// K with no measured table for this board, at RX gain `gain_db`:
+/// K_DEFAULT_DB plus the frequency correction above, less the excess
+/// below the top gain steps.
+pub fn k_default(f: f64, gain_db: f64) -> f64 {
+    let lf = f.max(1.0).ln();
+    let corr: Vec<(f64, f64)> = K_CORRECTION.iter().map(|&(fr, k)| (fr.ln(), k)).collect();
+    let rows: Vec<(f64, f64)> = K_EXCESS.iter().map(|&(fr, row)| (fr.ln(), lerp(row, gain_db))).collect();
+    K_DEFAULT_DB + lerp(&corr, lf) - lerp(&rows, lf)
+}
+
 /// One measured conversion point.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KPoint {
@@ -211,7 +259,7 @@ impl Calib {
     pub fn k_at(&self, f: f64) -> (f64, bool) {
         let p = &self.k;
         match p.len() {
-            0 => (K_DEFAULT_DB, false),
+            0 => (k_default(f, 73.0), false),
             1 => (p[0].k, (p[0].f - f).abs() <= reach(f)),
             _ => {
                 if f <= p[0].f {
@@ -305,6 +353,21 @@ impl Calib {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_k_follows_the_measured_low_band_correction() {
+        // at the top gain step: the whole frequency correction
+        assert!((k_default(50.15e6, 73.0) - (K_DEFAULT_DB + 11.3)).abs() < 1e-9);
+        assert!((k_default(30e6, 73.0) - (K_DEFAULT_DB + 11.3)).abs() < 1e-9);
+        assert!((k_default(144.3e6, 73.0) - (K_DEFAULT_DB + 3.9)).abs() < 1e-9);
+        assert!((k_default(5.7e9, 73.0) - (K_DEFAULT_DB + 0.7)).abs() < 1e-9);
+        let k = k_default(100e6, 73.0) - K_DEFAULT_DB;
+        assert!(k < 7.8 && k > 3.9, "{k}");
+        // lower gain: less (50 MHz at 40 dB: 11.3 - 4.8)
+        assert!((k_default(50.15e6, 40.0) - (K_DEFAULT_DB + 11.3 - 4.8)).abs() < 1e-9);
+        // none of that above 1296 MHz
+        assert!((k_default(2.1e9, 40.0) - (K_DEFAULT_DB + 0.7)).abs() < 1e-9);
+    }
+
     use super::*;
 
     fn table() -> Calib {

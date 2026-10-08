@@ -1860,7 +1860,12 @@ impl Trx {
                 if self.settings.smeter.get(&band).is_some_and(|v| !v.is_empty()) {
                     (self.settings.dbm(&band, self.reading_db) - dbfs, Quality::Legacy)
                 } else {
-                    (-g + crate::calib::K_DEFAULT_DB, Quality::None)
+                    {
+                        // (the AD936x's own low-band loss; the simulated
+                        // radio has none)
+                        let k = if self.cfg.radio.backend == crate::config::Backend::Sim { crate::calib::K_DEFAULT_DB } else { crate::calib::k_default(self.hw_freq(), g) };
+                        (-g + k, Quality::None)
+                    }
                 }
             }
         };
@@ -3720,8 +3725,13 @@ mod tests {
         }
         // The shared channel filter passes the tone at (nearly) unity gain.
         assert!((first - -60.0).abs() < 0.5, "{first}");
-        let dbm: Vec<f64> = seen.iter().map(|x| x.3).collect();
-        assert!(dbm.iter().all(|d| (d - dbm[0]).abs() < 0.1), "{dbm:?}");
+        // dBm: that plus K, which on the AD936x follows frequency and gain
+        // (calib::k_default: its front end loses gain in the top steps below
+        // about 1 GHz).
+        for (mode, gain, v, dbm) in &seen {
+            let want = v + crate::calib::k_default(144_300_000.0, *gain);
+            assert!((dbm - want).abs() < 0.1, "{mode:?} at {gain} dB: {dbm} vs {want}");
+        }
     }
 
     #[test]
