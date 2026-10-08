@@ -181,6 +181,42 @@ mod tests {
         assert!((r.freq_hz - 2000.0).abs() < 50.0);
     }
 
+    /// Diagnostic (2026-10-08, R2 to Libre 2 locked one carrier off with
+    /// the R2 at -9 kHz): which carrier offsets the receiver gets right.
+    /// `cargo test --release t2_offset_sweep -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn t2_offset_sweep() {
+        let p = Params::amateur();
+        let mut m = Modulator::new(p);
+        let mut n = 0u32;
+        let mut next = || {
+            let mut pkt = [0u8; TS_LEN];
+            pkt[0] = 0x47;
+            pkt[1] = 0x01;
+            pkt[4..8].copy_from_slice(&n.to_be_bytes());
+            n += 1;
+            pkt
+        };
+        let mut x = Vec::new();
+        for _ in 0..6 {
+            m.frame(&mut next, &mut x);
+        }
+        let fs = 131e6 / 71.0;
+        for off in [-12000.0, -10500.0, -9000.0, -7500.0, -6000.0, -4500.0, -3000.0, -1500.0, 0.0, 1500.0, 3000.0, 4500.0, 6000.0, 7500.0, 9000.0, 10500.0, 12000.0f64] {
+            let y: Vec<Complex32> = super::resample(&x[150_000..], fs, fs)
+                .iter()
+                .enumerate()
+                .map(|(k, z)| {
+                    let ph = std::f64::consts::TAU * off * k as f64 / fs;
+                    z * Complex32::new(ph.cos() as f32, ph.sin() as f32)
+                })
+                .collect();
+            let r = receive(p, &y, fs);
+            eprintln!("offset {off:+7.0} Hz: frames {}, packets {}, freq {:+7.0} Hz (error {:+6.0}), LDPC failures {}", r.frames, r.packets.len(), r.freq_hz, r.freq_hz as f64 - off, r.ldpc_fail);
+        }
+    }
+
     /// Through the FPGA front end's model, closed loop: raw samples while
     /// searching, then the schedule and NCO the receiver sets (applied
     /// 10 ms late, as through the ring), FFTs of the model, P1 and
@@ -188,6 +224,30 @@ mod tests {
     /// + the LO's 25 kHz off, noise; every packet after acquisition.
     #[test]
     fn t2_through_the_front_end() {
+        let (stats, ldpc_fail, l1, (run, all)) = front_end_loop(2000.0, 8, false);
+        assert_eq!(run, all);
+        assert_eq!(ldpc_fail, 0);
+        assert_eq!(l1, (stats.frames, 0), "{stats:?}");
+        assert!((stats.freq_hz - 2000.0).abs() < 30.0);
+    }
+
+    /// The same 9 kHz below (half of P1's 14.4 kHz ambiguity and more, as
+    /// the R2 to Libre 2 on 2026-10-08): L1 fails at first, the next
+    /// coarse hypothesis locks, every packet after that.
+    #[test]
+    fn t2_through_the_front_end_9_khz_off() {
+        for hw in [false, true] {
+            let (stats, _, _, (run, _)) = front_end_loop(-9000.0, 24, hw);
+            assert!(stats.l1_ok >= 4 && run >= 4 * 190, "reports {hw}: {stats:?}, last {run} packets in order");
+            assert!((stats.freq_hz - -9000.0).abs() < 30.0, "reports {hw}: {stats:?}");
+        }
+    }
+
+    /// The FPGA front end's model closed loop with the carrier `off_hz` from
+    /// the LO's 25 kHz: the demodulator's stats, LDPC failures, (L1 ok, L1
+    /// mismatch), (the last packets in order, data packets). `hw`: with the
+    /// FPGA's P1/GI/MER reports (as on the board).
+    fn front_end_loop(off_hz: f64, nframes: usize, hw: bool) -> (super::super::stream::Stats, u64, (u64, u64), (usize, usize)) {
         use super::super::fe::{model::Model, Ctl};
         let p = Params::amateur();
         let mut m = Modulator::new(p);
@@ -201,7 +261,7 @@ mod tests {
             pkt
         };
         let mut x = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..nframes {
             m.frame(&mut next, &mut x);
         }
         let fs = 131e6 / 71.0;
@@ -216,7 +276,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(k, z)| {
-                let ph = std::f64::consts::TAU * 27_000.0 * k as f64 / fs;
+                let ph = std::f64::consts::TAU * (25_000.0 + off_hz) * k as f64 / fs;
                 let v = z * Complex32::new(ph.cos() as f32, ph.sin() as f32) + Complex32::new(g(), g());
                 [q(v.re), q(v.im)]
             })
@@ -228,7 +288,11 @@ mod tests {
             let (dx, dy) = p.pilots.dxdy();
             fe.enable_eq(super::super::N_P2, dx, dy, p.symbols() - 1);
         }
+        if hw {
+            fe.enable_reports(64);
+        }
         let mut d = super::super::stream::Demod::new(p, fs);
+        d.hw = hw;
         d.set_center(25_000.0);
         let mut fec = crate::dvbs2::rx::Fec::new(crate::dvbs2::FrameSpec::long(crate::dvbs2::fpga_tx::LongMode::Qpsk12));
         let mut stats = crate::dvbs2::rx::Stats::default();
@@ -250,14 +314,10 @@ mod tests {
         }
         eprintln!("frames {}, blocks {}, packets {}, MER {:.1} dB, freq {:.0} Hz, P1 missed {}, LDPC failures {}", d.stats.frames, d.stats.blocks, packets.len(), d.stats.mer_db, d.stats.freq_hz, d.stats.p1_missed, stats.ldpc_fail);
         assert!(d.stats.frames >= 4, "{} frames", d.stats.frames);
-        assert_eq!(stats.ldpc_fail, 0);
-        assert_eq!((d.stats.l1_ok, d.stats.l1_mismatch), (d.stats.frames, 0), "{:?}", d.stats);
-        assert!((d.stats.freq_hz - 2000.0).abs() < 30.0);
         let data: Vec<_> = packets.iter().filter(|p| p[1] == 0x01).collect();
-        let f0 = u32::from_be_bytes(data[0][4..8].try_into().unwrap());
-        for (i, pkt) in data.iter().enumerate() {
-            assert_eq!(u32::from_be_bytes(pkt[4..8].try_into().unwrap()), f0 + i as u32, "packet {i}");
-        }
+        let num = |p: &[u8; TS_LEN]| u32::from_be_bytes(p[4..8].try_into().unwrap());
+        let run = 1 + data.windows(2).rev().take_while(|w| num(w[1]) == num(w[0]) + 1).count();
+        (d.stats, stats.ldpc_fail, (d.stats.l1_ok, d.stats.l1_mismatch), (run, data.len()))
     }
 
     #[test]

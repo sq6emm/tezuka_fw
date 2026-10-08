@@ -77,14 +77,27 @@ pub const LIBRE: Curve = Curve {
     ],
 };
 
-/// The board this runs on, by its device tree model: the Pluto's curve
-/// for an ADALM-Pluto, the LibreSDR's for anything else (the PlutoSky R2
-/// is not measured yet; its front end is closer to the LibreSDR's).
+/// PlutoSky R2 (AD9361, CNC case): reads 6.2..6.9 dB higher than the
+/// LibreSDR at every frequency, with the same shape over gain.
+pub const PLUTOSKY_R2: Curve = Curve {
+    name: "PlutoSky R2",
+    corr: &[(50.15e6, 7.9), (70.2e6, 4.1), (144.3e6, 0.8), (435e6, -0.5), (1296e6, -1.2), (2100e6, -0.2)],
+    excess: LIBRE.excess,
+};
+
+/// The board this runs on, by its device tree model (the LibreSDR's curve
+/// for a board not measured).
 pub fn board_curve() -> &'static Curve {
     static C: std::sync::OnceLock<&'static Curve> = std::sync::OnceLock::new();
     C.get_or_init(|| {
         let model = std::fs::read_to_string("/proc/device-tree/model").unwrap_or_default();
-        if model.contains("PlutoSDR") || model.contains("ADALM-PLUTO") { &PLUTO } else { &LIBRE }
+        if model.contains("PlutoSDR") || model.contains("ADALM-PLUTO") {
+            &PLUTO
+        } else if model.contains("PlutoSky") {
+            &PLUTOSKY_R2
+        } else {
+            &LIBRE
+        }
     })
 }
 
@@ -404,6 +417,9 @@ mod tests {
         // the LibreSDR's own: higher everywhere, 2100 MHz at full gain 6.7
         assert!((LIBRE.k(2.1e9, 71.0) - (K_DEFAULT_DB + 6.7)).abs() < 1e-9);
         assert!(LIBRE.k(144.3e6, 73.0) > PLUTO.k(144.3e6, 73.0) + 3.0);
+        // the R2's: the LibreSDR's shape, 6..7 dB lower
+        assert!((PLUTOSKY_R2.k(435e6, 73.0) - (K_DEFAULT_DB - 0.5)).abs() < 1e-9);
+        assert!((LIBRE.k(144.3e6, 50.0) - PLUTOSKY_R2.k(144.3e6, 50.0) - 6.4).abs() < 1e-9);
     }
     use super::*;
 

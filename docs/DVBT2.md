@@ -383,6 +383,21 @@ cell and a CSI-weighted (per-component for rotated QPSK/16QAM) demapper in
 the LDPC engine's LLR stage all need HDL (t2eq, t2router, ldpc_dma), with
 the software model (`fe.rs`, `stream.rs`) changed to match.
 
+## Capture range (2026-10-08)
+
+P1's coarse frequency (`find_p1_in`: the phase step between 16 coherent
+chunks of 128 samples) wraps at fs/128 = 14.4 kHz, so a carrier more than
+7.2 kHz off locked 8 carriers wrong: P1, GI and the frequency all looked
+fine, but no L1 ever decoded (R2 to Libre 2 at about -9 kHz, 2026-10-08;
+the simulation sweep `t2_offset_sweep` showed it at +/-7.5 kHz). The
+demodulator now treats L1 failing twice in a row, with no L1 decoded since
+the lock, as the wrong multiple and acquires again with the next one
+(0, +1, -1, +2, -2 x 14.4 kHz); a hypothesis that decoded stays until the
+lock is lost. Range about +/-12 kHz (P1 itself fades beyond that: one
+128-sample chunk then turns by a full cycle); the lock takes a few frames
+longer there (`t2_through_the_front_end_9_khz_off`, with and without the
+FPGA reports).
+
 ## Searching and tracking in the FPGA: P1, GI and MER reports (2026-10-03)
 
 Profile of the locked receiver before (Libre, per frame): P1 work 245 ms,

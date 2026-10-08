@@ -66,8 +66,7 @@ Quality, shown in SET and in the meter:
 ### Without a table: the board type's curve
 
 `calib::board_curve()` picks a curve by the device tree model (ADALM-Pluto,
-LibreSDR; the PlutoSky R2 and anything else take the LibreSDR's until
-measured): K = 12 dB plus a correction by frequency, less a part by AGC
+LibreSDR, PlutoSky R2; anything else takes the LibreSDR's): K = 12 dB plus a correction by frequency, less a part by AGC
 gain. The AD936x front end loses gain below a few hundred MHz, mostly in
 its top gain steps, which the reported gain does not show; each board's
 own front end adds its part (the LibreSDR reads 3..6 dB lower than the
@@ -81,6 +80,7 @@ After it, the Pluto read within +/-0.4 dB from -40 to -110 dBm at all six
 |---|---|---|---|---|---|---|
 | ADALM-Pluto | 11.3 | 7.8 | 3.9 | 2.2 | 0.8 | 0.7 |
 | LibreSDR | 14.1 | 10.5 | 7.2 | 6.2 | 5.5 | 6.7 |
+| PlutoSky R2 | 7.9 | 4.1 | 0.8 | -0.5 | -1.2 | -0.2 |
 
 ### Front-end gain per band
 

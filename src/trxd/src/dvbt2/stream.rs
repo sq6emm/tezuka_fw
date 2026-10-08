@@ -88,6 +88,9 @@ const MER_EVERY: usize = 4;
 
 pub const PROF_NAMES: [&str; 6] = ["p1", "fft", "equalize", "deinterleave", "llr", "input"];
 
+/// The coarse frequency hypotheses tried in turn, in units of fs/128.
+const AMB_SEQ: [i32; 5] = [0, 1, -1, 2, -2];
+
 enum State {
     Search,
     /// In a frame whose P1 starts at `start` (absolute sample index);
@@ -250,6 +253,18 @@ pub struct Demod {
     l1_bad: Option<Vec<&'static str>>,
     /// stats.frames when L1 last decoded as expected.
     l1_ok_frame: Option<u64>,
+    /// P1's coarse frequency is ambiguous by fs/128 (8 carriers, 14.4 kHz
+    /// at the amateur rate: the phase step between its 128-sample chunks):
+    /// a carrier further off than half that locked 8 carriers wrong and no
+    /// L1 decoded (R2 to Libre 2 at -9 kHz, 2026-10-08). The hypothesis in
+    /// use, an index into AMB_SEQ: moved on after L1 failed twice running
+    /// with no L1 decoded since the lock (a weak signal once decoded keeps
+    /// its hypothesis).
+    amb_i: usize,
+    amb_ok: bool,
+    l1_fail_run: u32,
+    /// Acquire again (with the next hypothesis) at the next chance.
+    reacquire: bool,
     bins: Vec<usize>,
     /// Per carrier: undoes the FFT window's early start, and the scaling.
     early_rot: Vec<Complex32>,
@@ -403,6 +418,10 @@ impl Demod {
             post_gather,
             l1_bad: None,
             l1_ok_frame: None,
+            amb_i: 0,
+            amb_ok: false,
+            l1_fail_run: 0,
+            reacquire: false,
             bins,
             early_rot,
             early,
@@ -536,6 +555,11 @@ impl Demod {
                         return;
                     }
                     self.finish(out);
+                    if std::mem::take(&mut self.reacquire) {
+                        self.state = State::Search;
+                        self.stats.locked = false;
+                        continue;
+                    }
                     let t0 = std::time::Instant::now();
                     let peak = self.structure_peak(predicted - TRACK as u64, predicted + TRACK as u64);
                     let found = self.p1_near(peak, 4).filter(|f| f.2 >= P1_OK);
@@ -560,6 +584,7 @@ impl Demod {
                         None => {
                             self.state = State::Search;
                             self.stats.locked = false;
+                            self.amb_ok = false;
                             self.release(predicted);
                         }
                     }
@@ -944,12 +969,25 @@ impl Demod {
         };
         match l1 {
             super::l1::PreOutcome::Ok => {
+                self.l1_fail_run = 0;
+                self.amb_ok = true;
                 self.stats.l1_ok += 1;
                 self.l1_bad = None;
                 self.l1_ok_frame = Some(self.stats.frames);
             }
             super::l1::PreOutcome::Unchecked => self.stats.l1_unchecked += 1,
-            super::l1::PreOutcome::Failed => self.stats.l1_failed += 1,
+            super::l1::PreOutcome::Failed => {
+                self.stats.l1_failed += 1;
+                // Twice running: probably the wrong multiple of fs/128 (see
+                // amb_i); the next hypothesis, acquired afresh.
+                self.l1_fail_run += 1;
+                if self.l1_fail_run >= 2 && !self.amb_ok {
+                    self.l1_fail_run = 0;
+                    self.amb_i = (self.amb_i + 1) % AMB_SEQ.len();
+                    self.reacquire = true;
+                    tracing::info!(hz = AMB_SEQ[self.amb_i] as f64 * self.fs / 128.0, "DVB-T2: L1 failed twice, trying the next coarse frequency");
+                }
+            }
             super::l1::PreOutcome::Mismatch(f) => {
                 self.stats.l1_mismatch += 1;
                 if self.l1_bad.as_ref() != Some(&f) {
@@ -1075,7 +1113,8 @@ impl Demod {
     fn p1_near_in(&self, x: &[Complex32], base: u64, at: u64, r: usize) -> Option<(u64, f64, f32)> {
         let a = (at.max(base) - base) as usize;
         let (s, c, q) = find_p1_in(x, &self.p1c, self.p1_energy, a.saturating_sub(r), a + r + 1, self.fs)?;
-        Some((base + s as u64, c + self.center_hz, q))
+        let amb = AMB_SEQ[self.amb_i] as f64 * self.fs / 128.0;
+        Some((base + s as u64, c + amb + self.center_hz, q))
     }
 
     /// Start of the best P1 by structure among `from..=to` (absolute; offset
@@ -1763,6 +1802,19 @@ impl Demod {
         if std::mem::take(&mut fe.p1_skip) {
             return;
         }
+        if std::mem::take(&mut self.reacquire) {
+            // (as after P1 lost: the search again, with the next hypothesis)
+            ctl.push(Ctl::RawAll);
+            fe.raw_all_asked = true;
+            fe.acquiring = true;
+            fe.frame = None;
+            fe.raw_next = None;
+            fe.p1_check = None;
+            fe.fresh_p1 = true;
+            self.stats.locked = false;
+            self.buf.clear();
+            return;
+        }
         match found.filter(|v| v.2 >= P1_TRACK_OK) {
             Some((s, coarse, _)) => {
                 fe.misses = 0;
@@ -1800,6 +1852,7 @@ impl Demod {
                     fe.raw_next = None;
                     fe.p1_check = None;
                     self.stats.locked = false;
+                    self.amb_ok = false;
                     self.buf.clear();
                 }
             }
