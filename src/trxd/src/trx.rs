@@ -2211,8 +2211,15 @@ impl Trx {
         // down and RDS decoded on 0 of 6 stations (6 of 6 at 1 MHz).
         let r = self.scope_radio();
         let rx_need = 2.0 * ((self.rx_eff() - self.center).abs() + 0.5 * self.chan_rate as f64) * 1.1;
+        // While a DATV receiver runs the view does not move the filter:
+        // every change recalibrates the AD936x (about 55 ms without
+        // samples), and each span change cost frames or the lock (R2 to
+        // Libre 2, S2 250k, 2026-10-08: 47 of 668 frames). The wide views
+        // then show the band outside the filter attenuated, the signal in
+        // full.
+        let datv_rx_on = self.datv_rx.is_some() || self.datv_scan.is_some();
         let want = if r.adc_rate >= WIDE_ADC_RATE {
-            let need = if self.scope_watching() {
+            let need = if self.scope_watching() && !datv_rx_on {
                 match self.scope_source() {
                     crate::scopeplan::Source::Maia { rf_bw } | crate::scopeplan::Source::Zoom { rf_bw } => rf_bw,
                     crate::scopeplan::Source::Sweep => 2.0 * r.maia_half(),
@@ -2227,7 +2234,7 @@ impl Trx {
             let need = need.max(rx_need);
             let step = if need <= 1.0e6 { 0.0 } else if need <= 6.0e6 { 6.0e6 } else { 2.0 * r.maia_half() };
             want.max(step as u32)
-        } else if self.scope_watching() {
+        } else if self.scope_watching() && !datv_rx_on {
             let r = self.scope_radio();
             match self.scope_source() {
                 crate::scopeplan::Source::Maia { rf_bw } | crate::scopeplan::Source::Zoom { rf_bw } => want.max(rf_bw as u32),
