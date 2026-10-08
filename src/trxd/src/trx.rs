@@ -224,6 +224,9 @@ pub struct Trx {
     volume: f32,
     muted: bool,
     drive: f32,
+    /// TUNE's own drive, once a TCI client sets one (`tune_drive:`, WSJT-X
+    /// and the like); until then TUNE follows `drive`.
+    tune_drive: Option<f32>,
     center: f64,
     rx_gain_mode: GainMode,
     rx_gain_db: f64,
@@ -509,6 +512,7 @@ impl Trx {
             volume: 0.5,
             muted: false,
             drive: 1.0,
+            tune_drive: None,
             center: 0.0,
             rx_gain_mode: cfg.radio.rx_gain_mode,
             rx_gain_db: cfg.radio.rx_gain_db,
@@ -2016,6 +2020,9 @@ impl Trx {
                 }
             }
             Command::SetTxDrive(d) => self.drive = d.clamp(0.0, 1.0),
+            // (it used to fall through to "not supported": TUNE always
+            // went at the full drive whatever the client asked)
+            Command::SetTuneDrive(d) => self.tune_drive = Some(d.clamp(0.0, 1.0)),
             Command::SetVolume { v, .. } => self.volume = v.clamp(0.0, 1.0),
             Command::SetMute { muted, .. } => self.muted = muted,
             Command::SetAgc { agc, .. } => {
@@ -2023,6 +2030,15 @@ impl Trx {
                 self.agc.set_mode(agc);
             }
             other => debug!(?other, "command not supported here"),
+        }
+    }
+
+    /// The baseband gain of what goes out now: TUNE at its own drive when a
+    /// TCI client set one, everything else at the drive.
+    fn tx_gain(&self) -> f32 {
+        match (self.tx_on, self.tune_drive) {
+            (Some(TxSource::Tune), Some(t)) => t,
+            _ => self.drive,
         }
     }
 
@@ -2146,7 +2162,7 @@ impl Trx {
             ptt: self.tx_on.is_some(),
             tune: self.tx_on == Some(TxSource::Tune),
             drive_pct: (self.drive * 100.0).round() as u32,
-            tune_drive_pct: (self.drive * 100.0).round() as u32,
+            tune_drive_pct: (self.tune_drive.unwrap_or(self.drive) * 100.0).round() as u32,
             muted: self.muted,
             volume_db: TciStateSnapshot::volume_db_from(self.volume),
             iq_rate: if iq_rate == 0 { 48_000 } else { iq_rate },
@@ -2717,7 +2733,7 @@ impl Trx {
         // Up to the stream rate and out to the VFO.
         let mut block = vec![Complex32::default(); self.block];
         if !self.tx_bb.is_empty() {
-            let g = self.drive;
+            let g = self.tx_gain();
             for z in &mut self.tx_bb {
                 *z *= g;
             }
@@ -3574,6 +3590,20 @@ mod tests {
         let l = log.lock().unwrap();
         let i = l.iter().position(|s| s == "rf on").expect("keyed");
         l[i + 1..].to_vec()
+    }
+
+    #[test]
+    fn tune_follows_the_drive_until_tci_sets_its_own() {
+        let (mut t, _log) = trx(144_174_000.0);
+        t.apply(Command::SetTxDrive(0.5));
+        t.tx_on = Some(TxSource::Tune);
+        assert_eq!(t.tx_gain(), 0.5);
+        t.apply(Command::SetTuneDrive(0.1));
+        assert_eq!(t.tx_gain(), 0.1);
+        // (the voice and data modes keep the drive)
+        t.tx_on = Some(TxSource::Ptt);
+        assert_eq!(t.tx_gain(), 0.5);
+        t.tx_on = None;
     }
 
     #[test]
