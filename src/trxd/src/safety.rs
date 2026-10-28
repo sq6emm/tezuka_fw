@@ -23,7 +23,7 @@ pub const ENGINE_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct Hw {
     phy: PathBuf,
-    ptt: Option<PathBuf>,
+    ptt: crate::ptt::PttLines,
 }
 
 static HW: OnceLock<Hw> = OnceLock::new();
@@ -38,7 +38,7 @@ fn now_ms() -> u64 {
 }
 
 /// The hardware to silence (the IIO backend, once opened).
-pub fn register(phy: PathBuf, ptt: Option<PathBuf>) {
+pub fn register(phy: PathBuf, ptt: crate::ptt::PttLines) {
     let _ = HW.set(Hw { phy, ptt });
 }
 
@@ -61,7 +61,7 @@ pub fn take_tripped() -> bool {
     TRIPPED.swap(false, Ordering::SeqCst)
 }
 
-/// Switch RF off now: TX LO down, then the PTT line low. Safe to call from
+/// Switch RF off now: TX LO down, then the PTT lines low (GPO1 inhibit up). Safe to call from
 /// any thread, any number of times; no locks, no allocation beyond the paths.
 pub fn rf_off() {
     if let Some(hw) = HW.get() {
@@ -72,10 +72,10 @@ pub fn rf_off() {
 
 fn silence(hw: &Hw) {
     let _ = std::fs::write(hw.phy.join("out_altvoltage1_TX_LO_powerdown"), "1");
-    if let Some(p) = &hw.ptt {
+    if hw.ptt.any() {
         // The RF is gone before the relay moves.
         std::thread::sleep(Duration::from_millis(10));
-        let _ = std::fs::write(p, "0");
+        hw.ptt.off();
     }
 }
 
@@ -150,9 +150,12 @@ mod tests {
         let ptt = dir.join("ptt");
         std::fs::write(&ptt, "1").unwrap();
         std::fs::write(dir.join("out_altvoltage1_TX_LO_powerdown"), "0").unwrap();
-        silence(&Hw { phy: dir.clone(), ptt: Some(ptt.clone()) });
+        let gpo = dir.join("gpo_set");
+        let lines = crate::ptt::PttLines { gpio: Some(ptt.clone()), gpo: Some(gpo.clone()) };
+        silence(&Hw { phy: dir.clone(), ptt: lines });
         assert_eq!(std::fs::read_to_string(dir.join("out_altvoltage1_TX_LO_powerdown")).unwrap(), "1");
         assert_eq!(std::fs::read_to_string(&ptt).unwrap(), "0");
+        assert_eq!(std::fs::read_to_string(&gpo).unwrap(), "1 1");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

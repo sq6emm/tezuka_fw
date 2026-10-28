@@ -149,8 +149,8 @@ build_board() {
     # the daemon built hours before a change to src/trxd. Its stamps go
     # when the sources are newer than its last build.
     local trxd_build="${output_dir}/build/trxd-0.1.0"
-    if [ -f "${trxd_build}/.stamp_built" ] && [ -n "$(find "${SCRIPT_DIR}/src/trxd/src" "${SCRIPT_DIR}/src/trxd/web" "${SCRIPT_DIR}/src/trxd/Cargo.toml" "${SCRIPT_DIR}/src/trxd/Cargo.lock" -newer "${trxd_build}/.stamp_built" -print -quit 2>/dev/null)" ]; then
-        echo "    src/trxd changed since its last build: rebuilding trxd"
+    if [ -f "${trxd_build}/.stamp_built" ] && [ -n "$(find "${SCRIPT_DIR}/src/trxd/src" "${SCRIPT_DIR}/src/trxd/web" "${SCRIPT_DIR}/src/trxd/Cargo.toml" "${SCRIPT_DIR}/src/trxd/Cargo.lock" "${SCRIPT_DIR}/package/trxd" -newer "${trxd_build}/.stamp_built" -print -quit 2>/dev/null)" ]; then
+        echo "    src/trxd or package/trxd changed since its last build: rebuilding trxd"
         rm -f "${trxd_build}"/.stamp_built "${trxd_build}"/.stamp_installed "${trxd_build}"/.stamp_target_installed "${trxd_build}"/.stamp_staging_installed
     fi
     # The same for the bitstreams (package/board-fpga takes them from the

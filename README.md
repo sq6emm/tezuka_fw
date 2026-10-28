@@ -113,6 +113,20 @@ freq_hz = 144174000
 decoders = ["q65"]       # q65 | pi4
 ```
 
+### PTT output
+
+A PA or T/R relay follows the transmitter: the line goes up, `ptt_delay_ms`
+later the TX LO and the first sample follow; on unkey the RF stops first and
+the line drops after the same delay. Two outputs:
+
+* `ptt_gpio`: any sysfs GPIO value file (every board).
+* ADALM-Pluto: the AD9361's GPO0 and GPO1 pins on the board, wired as in the
+  AMSAT-DL / BATC PTT circuit (F5OEO firmware): GPO0 high keys the relay
+  through a transistor, GPO1 high inhibits it. GPO1 is high from the driver
+  probe until trxd runs, and again when trxd stops or crashes, so the relay
+  never energizes while the board boots. On by default on the Pluto
+  (`ptt_gpo = false` turns it off); the GPOs are 1.3 V logic, a few mA.
+
 ## Use
 
 | Service | Where |

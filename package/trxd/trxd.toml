@@ -15,6 +15,11 @@ rx_gain_db = 40
 tx_attenuation_db = 20
 # Optional PA / T-R relay line held high while transmitting:
 # ptt_gpio = "/sys/class/gpio/gpio960/value"
+# ADALM-Pluto: the AD9361 GPO0 (high = PTT) and GPO1 (high = relay inhibit,
+# from power-on until trxd runs), the AMSAT-DL / BATC circuit. Unset = on
+# for the Pluto only; false turns it off.
+# ptt_gpo = true
+# Lines up, this delay, then RF; RF off, this delay, lines down.
 ptt_delay_ms = 20
 
 [trx]

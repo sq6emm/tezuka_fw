@@ -461,11 +461,14 @@
 		en_agc-gpios = <&gpio0 66 0>;
 		reset-gpios = <&gpio0 67 0>;
 
-		/* Low state GPO */
-		adi,gpo0-inactive-state-high-enable = <0>;
-		adi,gpo1-inactive-state-high-enable = <0>;
-		adi,gpo2-inactive-state-high-enable = <0>;
-		adi,gpo3-inactive-state-high-enable = <0>;
+		/* GPO0/GPO1 are trxd's PTT output (src/trxd/src/ptt.rs, the
+		 * AMSAT-DL / BATC relay circuit): manual mode, driven through
+		 * debugfs gpo_set. GPO1 (the relay inhibit) is high from the
+		 * driver probe until trxd runs. The former
+		 * adi,gpoN-inactive-state-high-enable = <0> lines are gone: the
+		 * driver reads them as booleans, present meant high. */
+		adi,gpo-manual-mode-enable;
+		adi,gpo-manual-mode-enable-mask = <2>;
 
 	};
 };

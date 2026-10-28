@@ -85,13 +85,25 @@ pub const PLUTOSKY_R2: Curve = Curve {
     excess: LIBRE.excess,
 };
 
+/// The device tree model string ("" off a board).
+pub fn model() -> &'static str {
+    static M: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    M.get_or_init(|| std::fs::read_to_string("/proc/device-tree/model").unwrap_or_default())
+}
+
+/// The plain ADALM-Pluto (not the PlutoSky).
+pub fn is_adalm_pluto() -> bool {
+    let m = model();
+    m.contains("PlutoSDR") || m.contains("ADALM-PLUTO")
+}
+
 /// The board this runs on, by its device tree model (the LibreSDR's curve
 /// for a board not measured).
 pub fn board_curve() -> &'static Curve {
     static C: std::sync::OnceLock<&'static Curve> = std::sync::OnceLock::new();
     C.get_or_init(|| {
-        let model = std::fs::read_to_string("/proc/device-tree/model").unwrap_or_default();
-        if model.contains("PlutoSDR") || model.contains("ADALM-PLUTO") {
+        let model = model();
+        if is_adalm_pluto() {
             &PLUTO
         } else if model.contains("PlutoSky") {
             &PLUTOSKY_R2

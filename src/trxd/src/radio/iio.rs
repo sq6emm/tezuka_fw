@@ -62,8 +62,8 @@ fn char_dev(dev_root: &Path, sysfs: &Path) -> PathBuf {
 
 pub struct IioControl {
     phy: PathBuf,
-    ptt_gpio: Option<PathBuf>,
-    /// PTT line up -> RF, and RF gone -> PTT line down (relay settling).
+    ptt: crate::ptt::PttLines,
+    /// PTT lines up -> RF, and RF gone -> PTT lines down (relay settling).
     ptt_delay: std::time::Duration,
     stream_rate: f64,
     tx_rf: Option<bool>,
@@ -240,18 +240,18 @@ impl RadioControl for IioControl {
         if on {
             crate::safety::set_rf(true);
             self.tx_rf = None;
-            self.set_ptt_line(true)?;
-            if self.ptt_gpio.is_some() {
+            self.ptt.key(true)?;
+            if self.ptt.any() {
                 std::thread::sleep(self.ptt_delay);
             }
             write_attr(&self.phy, "out_altvoltage1_TX_LO_powerdown", "0")?;
         } else {
             self.tx_rf = None;
             let lo = write_attr(&self.phy, "out_altvoltage1_TX_LO_powerdown", "1");
-            if self.ptt_gpio.is_some() {
+            if self.ptt.any() {
                 std::thread::sleep(self.ptt_delay);
             }
-            let line = self.set_ptt_line(false);
+            let line = self.ptt.key(false);
             if lo.is_ok() && line.is_ok() {
                 crate::safety::set_rf(false);
             }
@@ -287,13 +287,6 @@ impl IioControl {
         }
     }
 
-    fn set_ptt_line(&self, on: bool) -> Result<(), String> {
-        match &self.ptt_gpio {
-            Some(p) => fs::write(p, if on { "1" } else { "0" })
-                .map_err(|e| format!("PTT GPIO {}: {e}", p.display())),
-            None => Ok(()),
-        }
-    }
 }
 
 /// Enable exactly the listed scan elements of a buffered device, size and
@@ -445,12 +438,32 @@ pub fn open(cfg: &RadioConfig) -> Result<Radio, String> {
         .open(char_dev(dev_root, &tx_dev))
         .map_err(|e| format!("TX buffer: {e}"))?;
 
-    let ptt_gpio = (!cfg.ptt_gpio.is_empty()).then(|| PathBuf::from(&cfg.ptt_gpio));
-    crate::safety::register(phy.clone(), ptt_gpio.clone());
+    let phy_debug = phy.file_name().map(|n| Path::new(&cfg.debugfs_root).join(n));
+    // The AD9361 GPOs as PTT output: only with the driver's manual mode
+    // (the device tree), else the write is refused anyway.
+    let gpo = phy_debug
+        .as_ref()
+        .filter(|_| cfg.ptt_gpo())
+        .filter(|d| {
+            let manual = read_attr(d, "adi,gpo-manual-mode-enable").map_or(false, |v| v == "1");
+            if !manual {
+                warn!("ptt_gpo: the AD9361 GPOs are not in manual mode (device tree); GPO PTT off");
+            }
+            manual
+        })
+        .map(|d| d.join("gpo_set"));
+    let ptt = crate::ptt::PttLines { gpio: (!cfg.ptt_gpio.is_empty()).then(|| PathBuf::from(&cfg.ptt_gpio)), gpo };
+    crate::safety::register(phy.clone(), ptt.clone());
+    // Keyed off; the GPO1 relay inhibit held since the driver probed is
+    // released now that trxd runs (and is back the moment it stops).
+    if let Err(e) = ptt.key(false).and_then(|_| ptt.inhibit(false)) {
+        warn!("PTT line at start: {e}");
+    }
+    if ptt.gpo.is_some() {
+        info!("PTT on the AD9361 GPOs: GPO0 keys, GPO1 inhibit released");
+    }
     // Port switching needs 1R1T and the driver's debugfs knobs.
-    let debug = phy
-        .file_name()
-        .map(|n| Path::new(&cfg.debugfs_root).join(n))
+    let debug = phy_debug
         .filter(|d| d.join("adi,1rx-1tx-mode-use-rx-num").exists())
         .filter(|d| read_attr(d, "adi,2rx-2tx-mode-enable").map_or(true, |v| v == "0"));
     let port = debug
@@ -463,7 +476,7 @@ pub fn open(cfg: &RadioConfig) -> Result<Radio, String> {
     Ok(Radio {
         control: Box::new(IioControl {
             phy,
-            ptt_gpio,
+            ptt,
             ptt_delay: std::time::Duration::from_millis(cfg.ptt_delay_ms as u64),
             stream_rate: cfg.stream_rate(),
             tx_rf: None,

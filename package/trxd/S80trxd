@@ -27,6 +27,13 @@ rf_off() {
 	done
 	G=$(sed -n 's/^[[:space:]]*ptt_gpio[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${1:-$(pick_config)}" 2>/dev/null | head -n 1)
 	[ -n "$G" ] && [ -w "$G" ] && echo 0 > "$G"
+	# AD9361 GPO PTT (ADALM-Pluto, GPOs in manual mode): GPO0 off, the GPO1
+	# relay inhibit on until trxd releases it.
+	for d in /sys/kernel/debug/iio/iio:device*; do
+		[ "$(cat "$d/adi,gpo-manual-mode-enable" 2>/dev/null)" = 1 ] || continue
+		echo "0 0" > "$d/gpo_set" 2>/dev/null
+		echo "1 1" > "$d/gpo_set" 2>/dev/null
+	done
 	return 0
 }
 
@@ -37,12 +44,13 @@ start() {
 		echo "config error, see $LOG"
 		return 1
 	fi
-	# Keep restarting on a crash, but not in a tight loop. trxd asks for
+	# Keep restarting on a crash, but not in a tight loop; RF off the moment
+	# trxd is gone (a kill -9 while keyed), again before the start. trxd asks for
 	# another FPGA bitstream by writing /run/fpga-mode.want and exiting:
 	# load it (fpga-mode: the PL reloaded, the drivers bound again) and
 	# start trxd again at once (docs/FPGA-MODES.md).
 	start-stop-daemon -S -b -m -p "$PIDFILE" -x /bin/sh -- -c \
-		"while :; do /etc/init.d/S80trxd rf-off '$CONF'; if [ -f /run/fpga-mode.want ]; then /usr/sbin/fpga-mode \$(cat /run/fpga-mode.want) >>$LOG 2>&1; rm -f /run/fpga-mode.want; fi; RUST_LOG=\${RUST_LOG:-info} $DAEMON --config '$CONF' >>$LOG 2>&1; [ -f /run/fpga-mode.want ] || sleep 5; done"
+		"while :; do /etc/init.d/S80trxd rf-off '$CONF'; if [ -f /run/fpga-mode.want ]; then /usr/sbin/fpga-mode \$(cat /run/fpga-mode.want) >>$LOG 2>&1; rm -f /run/fpga-mode.want; fi; RUST_LOG=\${RUST_LOG:-info} $DAEMON --config '$CONF' >>$LOG 2>&1; /etc/init.d/S80trxd rf-off '$CONF'; [ -f /run/fpga-mode.want ] || sleep 5; done"
 	echo "OK"
 }
 

@@ -116,8 +116,13 @@ pub struct RadioConfig {
     /// Optional sysfs GPIO value file driven high while transmitting (PA
     /// enable / T/R relay), e.g. `/sys/class/gpio/gpio960/value`.
     pub ptt_gpio: String,
-    /// Time between raising the PTT line and the first RF sample, for a relay
-    /// to settle. Also held after the last sample before the line drops.
+    /// The AD9361's GPO pins as the PTT output (src/ptt.rs): GPO0 high
+    /// while transmitting, GPO1 high inhibits the relay until trxd runs.
+    /// Unset: on the ADALM-Pluto (its device tree puts the GPOs in manual
+    /// mode), off elsewhere.
+    pub ptt_gpo: Option<bool>,
+    /// Time between raising the PTT line(s) and the first RF sample, for a
+    /// relay to settle. Also held after the last sample before the line drops.
     pub ptt_delay_ms: u32,
     /// Driver-level IIO context root, for tests (`/sys/bus/iio/devices`).
     pub iio_root: String,
@@ -147,6 +152,7 @@ impl Default for RadioConfig {
             freq_min_hz: 47e6,
             freq_max_hz: 6e9,
             ptt_gpio: String::new(),
+            ptt_gpo: None,
             ptt_delay_ms: 20,
             iio_root: "/sys/bus/iio/devices".into(),
             dev_root: "/dev".into(),
@@ -158,6 +164,12 @@ impl Default for RadioConfig {
 }
 
 impl RadioConfig {
+    /// Drive the AD9361 GPOs as the PTT output (`ptt_gpo`; the ADALM-Pluto
+    /// when unset).
+    pub fn ptt_gpo(&self) -> bool {
+        self.ptt_gpo.unwrap_or_else(crate::calib::is_adalm_pluto)
+    }
+
     /// Sample rate the ARM sees.
     pub fn stream_rate(&self) -> f64 {
         if self.fpga_decimation { self.adc_rate as f64 / self.fpga_decim.max(1) as f64 } else { self.adc_rate as f64 }
