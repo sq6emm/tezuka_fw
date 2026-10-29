@@ -106,6 +106,10 @@ const WIDE_ADC_RATE: f64 = 10e6;
 /// Maia's rows a second normally, and while sweeping (shorter looks, so a
 /// sweep line over the FM band takes about half a second).
 const MAIA_ROWS_PER_S: f64 = 15.0;
+/// Rows this long after an observation starts are left out: the pinned
+/// gain and the LO still settling (a row at the AGC's gain, 20 dB hotter,
+/// would be its first sample).
+const RA_SETTLE: Duration = Duration::from_millis(1500);
 const SWEEP_ROWS_PER_S: f64 = 60.0;
 /// Room between the edge of the view and the LO.
 const DC_GUARD_HZ: f64 = 5_000.0;
@@ -379,6 +383,17 @@ pub struct Trx {
     maia: Option<crate::maia::Maia>,
     /// A view wider than one Maia look, being swept (scopeplan).
     sweep: Option<SweepRun>,
+    /// A radio-astronomy observation (src/radiometer.rs): every Maia row
+    /// goes into it; the LO, the gain and the filter stay put meanwhile.
+    ra: Option<crate::radiometer::Radiometer>,
+    /// The gain mode, gain and RX filter to put back after it.
+    ra_saved: Option<(GainMode, f64, u32)>,
+    /// The newest full-rate row of this block, for the scope and the meter.
+    ra_row: Option<crate::maia::Row>,
+    /// Rows before this are not the observation's (the gain and the LO
+    /// were still settling).
+    ra_from: Instant,
+    ra_sent_at: Instant,
     web_span: f64,
     /// Centre of the web scope: fixed while the VFO moves inside the view,
     /// recentred on the VFO when it leaves (0 = recentre on the next row).
@@ -536,6 +551,11 @@ impl Trx {
             stream_meter_until: Instant::now(),
             maia_last: None,
             sweep: None,
+            ra: None,
+            ra_saved: None,
+            ra_row: None,
+            ra_from: Instant::now(),
+            ra_sent_at: Instant::now(),
             stream_peak: 0.0,
             meter_at: (0.0, 0.0, 0),
             calib: crate::calib::Calib::load_both(&std::path::PathBuf::from(&cfg.web.state_dir)),
@@ -749,6 +769,17 @@ impl Trx {
         if self.sweep.is_some() && !force {
             return;
         }
+        // An observation has the LO (its band placed beside DC), the gain
+        // and the filter: the receiver follows the dial inside the stream
+        // only; a forced move ends it first.
+        if self.ra.is_some() {
+            if force {
+                self.ra_stop("the LO had to move");
+            } else {
+                self.apply_offsets();
+                return;
+            }
+        }
         if self.rf_live {
             if let Err(e) = self.tx_check(self.tx_eff(), self.tx_half_bw()) {
                 warn!("transmission ended: {e}");
@@ -920,6 +951,9 @@ impl Trx {
     /// May the transmitter send at `f` (Hz on the air), `half` either side?
     /// trx.allow_tx, a transverter's own TX flag, else trx.tx_ranges.
     fn tx_check(&self, f: f64, half: f64) -> Result<(), String> {
+        if self.ra.is_some() {
+            return Err("observing (radiometer): the transmitter is off".into());
+        }
         if !self.cfg.trx.allow_tx {
             return Err("trx.allow_tx = false".into());
         }
@@ -983,6 +1017,10 @@ impl Trx {
         }
         if self.tx_on.is_some() {
             warn!(port = p, "port switch refused while transmitting");
+            return;
+        }
+        if self.ra.is_some() {
+            warn!(port = p, "port switch refused: observing (radiometer)");
             return;
         }
         match self.radio.set_port(p) {
@@ -1221,14 +1259,15 @@ impl Trx {
             maia: self.maia.is_some(),
             // A sweep moves the LO: not while sending, receiving DATV, with
             // the LOs split, or through a transverter (its IF range).
-            sweep_ok: self.tx_on.is_none() && !self.rf_live && !self.datv_mode && self.datv_rx.is_none() && self.lo_split.is_none() && self.xvtr.is_none(),
+            // (nor while an observation runs: its LO stays put)
+            sweep_ok: self.tx_on.is_none() && !self.rf_live && !self.datv_mode && self.datv_rx.is_none() && self.lo_split.is_none() && self.xvtr.is_none() && self.ra.is_none(),
             // the zoom input: the first x8 stage (wide image only)
             // (only the wide images feed the zoom input: on the others the
             // core has it, unconnected, and its rows would be empty)
             zoom_rate: self
                 .maia
                 .as_ref()
-                .filter(|m| m.zoom_capable && self.cfg.radio.adc_rate as f64 >= WIDE_ADC_RATE)
+                .filter(|m| m.zoom_capable && self.cfg.radio.adc_rate as f64 >= WIDE_ADC_RATE && self.ra.is_none())
                 .map(|_| self.cfg.radio.adc_rate as f64 / 8.0),
         }
     }
@@ -1252,7 +1291,7 @@ impl Trx {
     /// while sending, without a browser, and for DATV (its LO goes beside
     /// the signal, and the scope takes Maia instead).
     fn scope_lo_window(&self) -> Option<(f64, f64)> {
-        if self.rf_live || !self.scope_watching() || self.datv_mode || self.datv_lo_offset().is_some() {
+        if self.rf_live || !self.scope_watching() || self.datv_mode || self.datv_lo_offset().is_some() || self.ra.is_some() {
             return None;
         }
         let (c, span) = self.scope_view();
@@ -1324,7 +1363,7 @@ impl Trx {
         let watching = self.web.as_ref().is_some_and(|w| w.clients() > 0);
         // (Wide FM fills more than the narrow views; its channel has to stay
         // near the LO, so the spike stays where it falls.)
-        if !watching || self.web_span > DC_AVOID_SPAN_MAX || self.datv_lo_offset().is_some() || self.mode == Mode::Wfm {
+        if !watching || self.web_span > DC_AVOID_SPAN_MAX || self.datv_lo_offset().is_some() || self.mode == Mode::Wfm || self.ra.is_some() {
             return None;
         }
         let c = if self.web_center == 0.0 { self.rx_vfo() } else { self.web_center };
@@ -1809,9 +1848,9 @@ impl Trx {
             if !scope_reads {
                 if let Some(m) = &self.maia {
                     m.set_zoom(false);
-                    if let Some(r) = m.rows.try_iter().filter(|r| !r.zoom).last() {
-                        self.maia_last = Some((r.bins, self.cfg.radio.adc_rate as f64));
-                    }
+                }
+                if let Some(r) = self.maia_newest(false) {
+                    self.maia_last = Some((r.bins, self.cfg.radio.adc_rate as f64));
                 }
             }
             if let Some((row, row_rate)) = &self.maia_last {
@@ -1827,6 +1866,207 @@ impl Trx {
             }
         }
         [chan, stream, maia]
+    }
+
+    // ---- Radio astronomy (src/radiometer.rs) ----
+
+    /// Every full-rate Maia row of this block into the observation; the
+    /// newest one kept for the scope and the meter.
+    fn ra_intake(&mut self) {
+        let (Some(ra), Some(m)) = (&mut self.ra, &self.maia) else { return };
+        let temps = *self.temps.lock().unwrap();
+        let gain = self.hw_gain_db;
+        let now = crate::stream::unix_now();
+        let at = Instant::now();
+        let mut last = None;
+        for r in m.rows.try_iter() {
+            if r.zoom {
+                continue;
+            }
+            if r.at >= self.ra_from {
+                let t = now - at.saturating_duration_since(r.at).as_secs_f64();
+                ra.push_row(&r.bins, r.secs, gain, (temps.ad936x, temps.fpga), t);
+            }
+            last = Some(r);
+        }
+        if let Some(r) = last {
+            self.maia_last = Some((r.bins.clone(), self.cfg.radio.adc_rate as f64));
+            self.ra_row = Some(r);
+        }
+    }
+
+    /// The newest Maia row (the full rate's, or the zoom input's): this
+    /// block's while an observation drains them all, else the channel's last.
+    fn maia_newest(&mut self, zoom: bool) -> Option<crate::maia::Row> {
+        if self.ra.is_some() {
+            return if zoom { None } else { self.ra_row.take() };
+        }
+        self.maia.as_ref().and_then(|m| m.rows.try_iter().filter(|r| r.zoom == zoom).last())
+    }
+
+    fn ra_refuse(&self, client: u64, why: &str) {
+        warn!("radiometer: {why}");
+        if let Some(w) = &self.web {
+            w.send_json_to(client, &serde_json::json!({"type": "ra_error", "msg": why}));
+        }
+    }
+
+    /// Start an observation: the band (RF centre and width) placed beside
+    /// DC in one Maia look where it fits (across it otherwise, the DC bins
+    /// masked), through whatever transverter covers it; the gain pinned
+    /// (manual), the analog filter opened over the band.
+    fn ra_start(&mut self, client: u64, m: &serde_json::Value) {
+        use crate::radiometer::{Radiometer, Setup};
+        let num = |k: &str| m[k].as_f64().filter(|v| v.is_finite());
+        if self.maia.is_none() {
+            return self.ra_refuse(client, "this bitstream has no spectrometer");
+        }
+        if self.tx_on.is_some() || self.datv_mode || self.datv_rx.is_some() || self.datv_scan.is_some() {
+            return self.ra_refuse(client, "not while transmitting or in DATV");
+        }
+        self.ra_stop("restarted");
+        self.sweep_end();
+        let adc = self.cfg.radio.adc_rate as f64;
+        let lim = adc * 0.45;
+        let center = num("center_hz").unwrap_or_else(|| self.rx_vfo());
+        let width = num("width_hz").unwrap_or(1e6).clamp(10e3, 2.0 * lim);
+        let dc_ex = num("dc_exclude_hz").unwrap_or(50e3).clamp(0.0, lim / 2.0);
+        let half = width / 2.0;
+        // Beside DC (the band from dc_ex + margin up) where it fits, else
+        // across it.
+        let margin = 20e3;
+        let lo_air = if width + dc_ex + margin <= lim { center - (half + dc_ex + margin) } else { center };
+        let xvtr = self.settings.transverter(center).cloned();
+        let (min, max) = (self.cfg.radio.freq_min_hz, self.cfg.radio.freq_max_hz);
+        let hw = match &xvtr {
+            Some(t) => t.to_if(lo_air),
+            None => lo_air,
+        }
+        .clamp(min, max);
+        let lo_air = match &xvtr {
+            Some(t) => {
+                if t.inverted { t.lo_hz - hw } else { hw + t.lo_hz }
+            }
+            None => hw,
+        };
+        let inverted = xvtr.as_ref().is_some_and(|t| t.inverted);
+        let (a, b) = (center - half - lo_air, center + half - lo_air);
+        let band = if inverted { (-b, -a) } else { (a, b) };
+        if band.0 < -lim || band.1 > lim {
+            return self.ra_refuse(client, "the band does not fit the spectrometer's window around the LO");
+        }
+        let gain = num("gain_db")
+            .unwrap_or(if self.rx_gain_mode == GainMode::Manual { self.rx_gain_db } else { self.hw_gain_db.round() })
+            .clamp(0.0, 73.0);
+        self.ra_saved = Some((self.rx_gain_mode, self.rx_gain_db, self.rx_bw));
+        if let Err(e) = self.radio.set_rx_gain(GainMode::Manual, gain) {
+            warn!("radiometer gain: {e}");
+        }
+        self.rx_gain_mode = GainMode::Manual;
+        self.rx_gain_db = gain;
+        self.hw_gain_db = gain;
+        if let Some(g) = &self.hw_gain {
+            g.store(gain.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+        self.lo_split = None;
+        if let Err(e) = self.radio.set_lo(hw) {
+            warn!("radiometer LO {hw}: {e}");
+            self.ra_restore();
+            return self.ra_refuse(client, "the LO could not be set");
+        }
+        self.hw_tx_lo = Some(hw);
+        if xvtr != self.xvtr {
+            info!(xvtr = xvtr.as_ref().map(|t| t.name.as_str()), "transverter");
+            self.xvtr = xvtr;
+        }
+        self.center = lo_air;
+        self.scope_wide.reset();
+        self.apply_offsets();
+        let reach = band.0.abs().max(band.1.abs());
+        let bw = ((2.0 * reach * 1.05 / 100e3).ceil() * 100e3).min(2.0 * lim).max(self.cfg.radio.rf_bandwidth as f64) as u32;
+        if bw != self.rx_bw {
+            match self.radio.set_rx_bandwidth(bw) {
+                Ok(()) => info!(hz = bw, "RX bandwidth"),
+                Err(e) => warn!("RX bandwidth: {e}"),
+            }
+            self.rx_bw = bw;
+        }
+        if let Some(mm) = &self.maia {
+            mm.set_zoom(false);
+        }
+        let integration_s = num("integration_s").unwrap_or(1.0).clamp(0.1, 60.0);
+        let setup = Setup {
+            adc_rate: adc,
+            band,
+            dc_exclude_hz: dc_ex,
+            integration_s,
+            t_hot: num("t_hot").unwrap_or(290.0).clamp(1.0, 1000.0),
+            t_cold: num("t_cold").unwrap_or(10.0).clamp(0.0, 1000.0),
+            gain_db: gain,
+            rfi_row_sigma: num("rfi_row_sigma").unwrap_or(8.0).max(0.0),
+            rfi_bin_sigma: num("rfi_bin_sigma").unwrap_or(6.0).max(0.0),
+            a_eff_m2: num("a_eff_m2").unwrap_or(0.0).max(0.0),
+        };
+        let cap = ((4.0 * 3600.0 / integration_s) as usize).clamp(600, 20_000);
+        info!(center, width, lo = lo_air, hw, band_if = ?band, gain, bw, integration_s, "radiometer on");
+        self.ra = Some(Radiometer::new(setup, cap));
+        self.ra_row = None;
+        // (the gain and the LO take effect, the first rows after are mixed)
+        self.ra_from = Instant::now() + RA_SETTLE;
+        self.ra_sent_at = Instant::now() - Duration::from_secs(1);
+        // The dial onto the band (the scope shows it, the receiver listens
+        // in it where the channel reaches); the LO stays where it is.
+        let v = self.active;
+        self.set_vfo(v, center);
+    }
+
+    /// Put the gain and the filter back (the LO is the caller's: retune).
+    fn ra_restore(&mut self) {
+        if let Some((mode, db, bw)) = self.ra_saved.take() {
+            if let Err(e) = self.radio.set_rx_gain(mode, db) {
+                warn!("{e}");
+            }
+            self.rx_gain_mode = mode;
+            self.rx_gain_db = db;
+            if bw != self.rx_bw {
+                if let Err(e) = self.radio.set_rx_bandwidth(bw) {
+                    warn!("RX bandwidth: {e}");
+                }
+                self.rx_bw = bw;
+            }
+        }
+    }
+
+    /// End the observation (its figures go with it: export first); the
+    /// LO is left where it is for the caller to retune.
+    fn ra_stop(&mut self, why: &str) {
+        if self.ra.take().is_none() {
+            return;
+        }
+        self.ra_row = None;
+        info!(why, "radiometer off");
+        self.ra_restore();
+    }
+
+    /// The observation as the page's state shows it (the band on the air).
+    fn ra_json(&self) -> serde_json::Value {
+        let Some(r) = &self.ra else { return serde_json::Value::Null };
+        let s = &r.setup;
+        let inv = self.xvtr.as_ref().is_some_and(|t| t.inverted);
+        let (a, b) = if inv { (-s.band.1, -s.band.0) } else { s.band };
+        serde_json::json!({
+            "phase": r.phase().name(), "band_rf": [self.center + a, self.center + b], "lo": self.center,
+            "gain_db": s.gain_db, "integration_s": s.integration_s, "t_hot": s.t_hot, "t_cold": s.t_cold,
+            "a_eff_m2": s.a_eff_m2, "xvtr": self.xvtr.as_ref().map(|t| t.name.clone()),
+        })
+    }
+
+    /// The observation's figures to every page.
+    fn ra_send(&self) {
+        if let (Some(ra), Some(w)) = (&self.ra, &self.web) {
+            let r = serde_json::to_value(ra.results()).unwrap_or_default();
+            w.send_json(&serde_json::json!({"type": "ra", "r": r}));
+        }
     }
 
     /// The RX socket pair in use (1 or 2).
@@ -2064,6 +2304,9 @@ impl Trx {
                 }
             }
             ("rxgain", _) => {
+                if self.ra.is_some() {
+                    return warn!("rxgain refused: observing (radiometer), the gain is pinned");
+                }
                 let (mode, db) = match payload {
                     "auto" | "slow" => (GainMode::SlowAttack, self.rx_gain_db),
                     "fast" => (GainMode::FastAttack, self.rx_gain_db),
@@ -2274,7 +2517,7 @@ impl Trx {
         // and it was a stream view again: 22 then 1 MHz, two AD936x
         // recalibrations per tune, seen at every band change.)
         let lo_moving = self.scope_lo_window().is_some_and(|(w, m)| (self.center - w).abs() > m);
-        if want != self.rx_bw && !lo_moving {
+        if want != self.rx_bw && !lo_moving && self.ra.is_none() {
             match self.radio.set_rx_bandwidth(want) {
                 Ok(()) => info!(hz = want, "RX bandwidth"),
                 Err(e) => warn!("RX bandwidth: {e}"),
@@ -2332,6 +2575,7 @@ impl Trx {
             Some(g) => f64::from_bits(g.load(std::sync::atomic::Ordering::Relaxed)),
             None => self.rx_gain_db,
         };
+        self.ra_intake();
         // MUTE AT TX: our own signal is not received; the S-meter and the
         // AGC hold what they had, so the other station comes back at once.
         let quiet = self.rx_quiet();
@@ -2449,10 +2693,10 @@ impl Trx {
                     // the zoom input's rows at its own rate (750 Hz bins)
                     let zoom = matches!(src, Source::Zoom { .. });
                     let adc = if zoom { self.cfg.radio.adc_rate as f64 / 8.0 } else { self.cfg.radio.adc_rate as f64 };
-                    let got = self.maia.as_ref().and_then(|m| {
+                    if let Some(m) = &self.maia {
                         m.set_zoom(zoom);
-                        m.rows.try_iter().filter(|r| r.zoom == zoom).last()
-                    }).map(|r| r.bins);
+                    }
+                    let got = self.maia_newest(zoom).map(|r| r.bins);
                     // (The level meter measures wide bands on it too.)
                     if let Some(r) = &got {
                         self.maia_last = Some((r.clone(), adc));
@@ -2887,6 +3131,8 @@ impl Trx {
             "xvtr": self.xvtr.as_ref().map(|t| t.name.clone()),
             "xvtrs": self.settings.transverters,
             "cal_band": self.cal_band(),
+            "ra_ok": self.maia.is_some(),
+            "ra": self.ra_json(),
             // What this firmware can do (docs/FLAVOURS.md): the page hides
             // what is not there.
             "features": {"datv": crate::fpgamode::datv_available(), "flavour": crate::fpgamode::flavour()},
@@ -2949,6 +3195,10 @@ impl Trx {
         }
         if w.clients() == 0 {
             return;
+        }
+        if self.ra.is_some() && self.ra_sent_at.elapsed() >= Duration::from_secs(1) {
+            self.ra_sent_at = Instant::now();
+            self.ra_send();
         }
         if self.web_meter_at.elapsed() >= Duration::from_millis(100) {
             self.web_meter_at = Instant::now();
@@ -3036,6 +3286,9 @@ impl Trx {
         let cmd = m["cmd"].as_str().unwrap_or("");
         let num = |k: &str| m[k].as_f64();
         let on = m["on"].as_bool().unwrap_or(false);
+        if self.ra.is_some() && cmd.starts_with("datv") {
+            return self.ra_refuse(client, "stop the radiometer first");
+        }
         // A feature on a part of the FPGA the loaded bitstream lacks: load
         // one that has it (trxd restarts and takes this command up again).
         let part = match cmd {
@@ -3362,6 +3615,46 @@ impl Trx {
                         self.retune(true);
                     } else {
                         warn!("transverter list refused: a name is empty or not plain (letters, digits, space . _ -, 24 at most), or a range is backwards");
+                    }
+                }
+            }
+            "ra_start" => self.ra_start(client, m),
+            "ra_stop" => {
+                self.ra_stop("stopped");
+                self.retune(true);
+            }
+            "ra_phase" => match m["phase"].as_str().and_then(crate::radiometer::Phase::parse) {
+                Some(p) => {
+                    if let Some(ra) = &mut self.ra {
+                        ra.set_phase(p);
+                        info!(phase = p.name(), "radiometer");
+                    }
+                }
+                None => warn!("ra_phase: unknown phase"),
+            },
+            "ra_clear" => {
+                let p = m["phase"].as_str().and_then(crate::radiometer::Phase::parse);
+                if let Some(ra) = &mut self.ra {
+                    ra.clear(p);
+                    info!(phase = p.map(|p| p.name()), "radiometer cleared");
+                }
+            }
+            "ra_csv" => {
+                if let Some(ra) = &self.ra {
+                    let spectra = m["what"].as_str() == Some("spectra");
+                    let text = if spectra { ra.spectra_csv() } else { ra.csv() };
+                    if let Some(w) = &self.web {
+                        w.send_json_to(client, &serde_json::json!({"type": "ra_csv", "what": if spectra { "spectra" } else { "series" }, "text": text}));
+                    }
+                }
+            }
+            "ra_get" => {
+                if let Some(ra) = &self.ra {
+                    let mut series: Vec<serde_json::Value> =
+                        ra.samples().rev().take(900).map(|s| serde_json::json!([s.t, s.phase.name(), s.p, s.k])).collect();
+                    series.reverse();
+                    if let Some(w) = &self.web {
+                        w.send_json_to(client, &serde_json::json!({"type": "ra_series", "series": series}));
                     }
                 }
             }

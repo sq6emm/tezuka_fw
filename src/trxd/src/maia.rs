@@ -116,6 +116,8 @@ pub fn decode_bin(x: u64) -> f32 {
 pub struct Row {
     pub at: Instant,
     pub bins: Vec<f32>,
+    /// How long it integrated (the FFTs averaged over the input's rate).
+    pub secs: f64,
     /// From the zoom input (the first x8 decimation stage) rather than the
     /// converter's full rate.
     pub zoom: bool,
@@ -278,11 +280,12 @@ pub fn start(adc_rate: f64, rows_per_s: f64) -> Option<Maia> {
                 let base = newest * BINS * 8;
                 let mut row = Vec::with_capacity(BINS);
                 let g = norm(cur);
+                let secs = cur as f64 * BINS as f64 / input_rate(adc_rate, cur_zoom);
                 for k in 0..BINS {
                     row.push(if k == 0 { 0.0 } else { decode_bin(ring.rd64(base + k * 8)) * g });
                 }
                 fill_bin0(&mut row);
-                if let Err(crossbeam_channel::TrySendError::Disconnected(_)) = tx.try_send(Row { at: Instant::now(), bins: row, zoom: cur_zoom }) {
+                if let Err(crossbeam_channel::TrySendError::Disconnected(_)) = tx.try_send(Row { at: Instant::now(), bins: row, secs, zoom: cur_zoom }) {
                     break; // engine gone
                 }
             }

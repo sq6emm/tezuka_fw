@@ -127,6 +127,33 @@ the line drops after the same delay. Two outputs:
   never energizes while the board boots. On by default on the Pluto
   (`ptt_gpo = false` turns it off); the GPOs are 1.3 V logic, a few mA.
 
+### Radiometer (radio astronomy)
+
+The RADIOMETER card in the web UI turns the receiver into a total-power
+radiometer on the FPGA spectrometer: the Sun and the Moon with a small dish
+or a yagi, the strong continuum sources and the galactic hydrogen line with
+a dish and an LNA (the board's own noise figure is far too high on its own).
+A transverter in front of the board (10 GHz, 5.7 GHz, 1296 MHz ...) is used
+as for everything else: set it up in SET, give the band on the air.
+
+START places the LO so the band sits beside DC in one spectrometer look
+(across it where it is too wide, the DC bins masked), pins the RF gain
+(the AGC is off meanwhile) and opens the analog filter over the band; no
+transmitting, DATV or sweep meanwhile, and the dial moves only inside the
+stream. Then mark what the feed looks at: HOT (an absorber at ambient
+temperature over the feed), COLD (empty sky), ON (the object in the beam),
+OFF (the sky beside it, same elevation). Kelvin come from the hot/cold pair
+alone (the Y factor at the feed, so an LNA or a transverter and its drift
+are inside the scale); ON minus OFF is the object's antenna temperature,
+with the effective aperture given also a flux density in Jy. Gain drift,
+not the radiometer equation, limits a long integration: re-mark OFF (or HOT)
+every few minutes, and watch the Allan deviation the card shows for where
+drift takes over. Interference is left out per row (a burst) and per bin (a
+carrier; a bin flagged again and again is masked for the session). The
+figures live in RAM only: export the CSV (the sample log, and the
+accumulated spectra per bin) before STOP. docs/RADIOMETER.md has the
+method and the bench checks.
+
 ## Use
 
 | Service | Where |

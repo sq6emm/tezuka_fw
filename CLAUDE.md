@@ -16,6 +16,8 @@ for its FPGA front end (Maia DDC + ring DMA, maia-sdr branch `datv-ddc`); `docs/
 Maia with the analog filter opened, the sweep up to +/-12.5 MHz).
 `docs/RADE.md`: RADE V2 digital voice, run in the browser (rade_c built to
 WASM in `src/rade-web/`, the module in the `model` flash partition).
+`docs/RADIOMETER.md`: radio astronomy (total-power radiometer on the Maia
+rows, hot/cold kelvin, `src/trxd/src/radiometer.rs`).
 
 Boards: `plutoskyr2`, `libre` (both xc7z020). `boards.json` is the single
 source of truth for `build.sh` and CI.

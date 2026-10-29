@@ -26,6 +26,7 @@ mod pi4;
 mod rade;
 mod power;
 mod ptt;
+mod radiometer;
 mod radio;
 mod refclock;
 mod safety;

@@ -444,6 +444,31 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
         </div>
       </div>
     </div>
+    <div class="card wide hidden" id="ra-card">
+      <h3>RADIOMETER <span class="note">radio astronomy: total power on the FPGA spectrometer, kelvin from a hot/cold pair at the feed</span></h3>
+      <div class="row">
+        <label class="note">centre MHz <input id="ra-center" type="number" step="0.001" style="width:9em" title="Band centre on the air (blank: the dial); through a transverter where one covers it"></label>
+        <label class="note">width kHz <input id="ra-width" type="number" step="10" min="10" value="1000" style="width:6em" title="The band's width; up to 90 % of the converter rate (then across DC, the DC bins masked)"></label>
+        <label class="note">gain dB <input id="ra-gain" type="number" step="1" min="0" max="73" style="width:4em" title="Front-end gain pinned for the observation (blank: the current one); the AGC is off meanwhile"></label>
+        <label class="note">integ. s <input id="ra-int" type="number" step="0.1" min="0.1" max="60" value="1" style="width:4em" title="Seconds per sample"></label>
+        <button class="k" id="ra-go" title="Start: the LO goes beside the band, the gain is pinned, the analog filter opened over the band; no transmitting, DATV or sweep meanwhile">START</button>
+      </div>
+      <div class="row">
+        <label class="note">T hot K <input id="ra-thot" type="number" step="1" value="290" style="width:4.5em" title="The absorber's temperature (ambient)"></label>
+        <label class="note">T cold K <input id="ra-tcold" type="number" step="1" value="10" style="width:4.5em" title="The cold sky: 3-10 K at 1.4 GHz and above, far more at VHF (the galaxy)"></label>
+        <label class="note">A eff m² <input id="ra-aeff" type="number" step="0.01" min="0" value="0" style="width:5em" title="Effective aperture (dish area x efficiency) for the flux density; 0: none"></label>
+        <span class="note">phase:</span>
+        <button class="k" data-ra-phase="idle" title="Rows measured (chart, Allan deviation), not accumulated">IDLE</button>
+        <button class="k" data-ra-phase="hot" title="Absorber at ambient temperature over the feed">HOT</button>
+        <button class="k" data-ra-phase="cold" title="Empty sky, away from the Sun and the galactic plane">COLD</button>
+        <button class="k" data-ra-phase="on" title="The object in the beam">ON</button>
+        <button class="k" data-ra-phase="off" title="The sky beside the object, at the same elevation">OFF</button>
+        <button class="k" id="ra-clear" title="Forget everything accumulated (the interference masks too)">CLEAR</button>
+      </div>
+      <div class="note" id="ra-out">—</div>
+      <canvas id="ra-chart" width="800" height="90" style="width:100%;height:90px;border-radius:6px"></canvas>
+      <div class="row"><button class="k" id="ra-csv" title="The sample log: time, phase, power, kelvin, flags, gain, temperatures">CSV series</button><button class="k" id="ra-csv2" title="The accumulated spectra per bin: hot, cold, on, off, counts per kelvin, ON minus OFF in kelvin">CSV spectra</button><span class="note" id="ra-note"></span></div>
+    </div>
   </section>
 </div>
 
@@ -594,6 +619,10 @@ function onJson(m) {
   else if (m.type === "datv_key") DATV.keyframe();
   else if (m.type === "datv_error") DATV.refused(m.msg);
   else if (m.type === "fpga_switch") FPGA.start(m.mode);
+  else if (m.type === "ra") RA.update(m.r);
+  else if (m.type === "ra_series") RA.series(m.series);
+  else if (m.type === "ra_csv") RA.download(m);
+  else if (m.type === "ra_error") RA.error(m.msg);
   // back from a bitstream switch: settings picked meanwhile were lost
   if (m.type === "state" && FPGA.state()) DATV.resync(m);
 }
@@ -938,6 +967,7 @@ function renderState() {
   $("scopeinfo").textContent = `SPAN ±${fmtHz(st.span / 2)}  REF ${S.refAuto ? "AUTO" + (S.refOffset ? (S.refOffset > 0 ? "+" : "") + S.refOffset : "") : S.refDb + " dBFS"}` +
     (st.scope_src === "sweep" ? "  SWEPT (this FPGA image sees less in one look): no audio meanwhile" : "");
   drawSpectrum();
+  RA.state(st);
 }
 function setSlider(id, v) {
   const el = $(id);
@@ -2381,6 +2411,115 @@ const DATV = (() => {
   };
 })();
 DATV.init();
+// ============================================================ radiometer
+// Radio astronomy on the FPGA spectrometer (trxd src/radiometer.rs): the
+// board sends its figures once a second while an observation runs; the
+// chart holds the latest samples (power, or kelvin once hot/cold are in).
+const RA = (() => {
+  let hist = [];
+  let on = false, r = null;
+  const MAXH = 900;
+  const COLOR = { idle: "#8a97a5", hot: "#ff6b6b", cold: "#5bc0ff", on: "#ffd166", off: "#7ed37e" };
+  const FIELDS = ["center", "width", "gain", "int", "thot", "tcold", "aeff"];
+  const fmt = (v, d = 2) => (v == null || !isFinite(v)) ? "—" : v.toFixed(d);
+  function start() {
+    const v = (id) => { const s = $("ra-" + id).value; return s === "" ? undefined : +s; };
+    const c = v("center");
+    send({ cmd: "ra_start", center_hz: c == null ? undefined : c * 1e6, width_hz: (v("width") || 1000) * 1e3, gain_db: v("gain"),
+      integration_s: v("int") || 1, t_hot: v("thot"), t_cold: v("tcold"), a_eff_m2: v("aeff") || 0 });
+    hist = [];
+    store.set("ra", Object.fromEntries(FIELDS.map((f) => [f, $("ra-" + f).value])));
+  }
+  function state(st) {
+    $("ra-card").classList.toggle("hidden", !st.ra_ok);
+    const was = on;
+    on = !!st.ra;
+    const phase = on ? st.ra.phase : "idle";
+    $("ra-go").textContent = on ? "STOP" : "START";
+    $("ra-go").classList.toggle("on", on);
+    document.querySelectorAll("[data-ra-phase]").forEach((b) => { b.classList.toggle("on", on && b.dataset.raPhase === phase); b.disabled = !on; });
+    FIELDS.forEach((f) => { $("ra-" + f).disabled = on; });
+    if (on && !was) send({ cmd: "ra_get" });
+    if (!on && was) { r = null; render(); }
+    if (on) {
+      const a = st.ra;
+      $("ra-note").textContent = `band ${(a.band_rf[0] / 1e6).toFixed(4)}–${(a.band_rf[1] / 1e6).toFixed(4)} MHz, LO ${(a.lo / 1e6).toFixed(4)} MHz${a.xvtr ? " via " + a.xvtr : ""}, gain ${a.gain_db} dB`;
+    } else if (!was) {
+      $("ra-note").textContent = "";
+    }
+    if (!on && $("ra-center").value === "" && st.ra_ok && curFreq()) $("ra-center").placeholder = (curFreq() / 1e6).toFixed(3);
+  }
+  function update(res) {
+    r = res;
+    if (res.t_last != null && (!hist.length || hist[hist.length - 1][0] !== res.t_last)) {
+      hist.push([res.t_last, res.phase, res.p_last, res.k_last]);
+      if (hist.length > MAXH) hist.shift();
+    }
+    render();
+  }
+  function series(list) { hist = list.slice(-MAXH); render(); }
+  function render() {
+    const o = $("ra-out");
+    if (!r) {
+      o.textContent = on ? "waiting for the first integration…"
+        : "Off. Set the band, a gain (blank: the current one), START; then mark HOT with the absorber on the feed, COLD on empty sky, and ON / OFF as the dish moves. Export before STOP.";
+      draw();
+      return;
+    }
+    const s = r.secs;
+    const sig = r.sigma_exp != null ? ` ± ${fmt(r.sigma_exp, 3)} K expected${r.sigma_meas != null ? `, OFF scatter ${fmt(r.sigma_meas, 3)} K` : ""}` : "";
+    const allan = r.allan && r.allan.length ? "<br>Allan deviation (this phase): " + r.allan.map(([t, a]) => `${t} s ${(a * 1e3).toFixed(2)}‰`).join(" · ") : "";
+    o.innerHTML = `<b>${escapeHtml(r.phase.toUpperCase())}</b> · ${r.samples} samples · hot ${s.hot.toFixed(0)} s, cold ${s.cold.toFixed(0)} s, on ${s.on.toFixed(0)} s, off ${s.off.toFixed(0)} s` +
+      ` · band ${(r.band_hz / 1e3).toFixed(0)} kHz in ${r.band_bins} bins (${r.bins_masked} masked) · rows flagged ${r.rows_flagged}${r.rows_dropped_gain ? `, dropped (gain) ${r.rows_dropped_gain}` : ""}<br>` +
+      (r.calibrated
+        ? `T_rx <b>${fmt(r.t_rx, 1)} K</b> · T_sys <b>${fmt(r.t_sys, 1)} K</b> · sky (OFF) <b>${fmt(r.t_off, 2)} K</b> · ON <b>${fmt(r.t_on, 2)} K</b> · object T_a <b>${fmt(r.t_a, 3)} K</b>${sig}${r.jy != null ? ` · <b>${fmt(r.jy, 0)} Jy</b>` : ""} · now ${fmt(r.k_last, 2)} K`
+        : `${r.note ? escapeHtml(r.note) : "not calibrated yet (mark HOT and COLD)"} · power now ${r.p_last != null ? r.p_last.toExponential(3) : "—"}`) + allan;
+    draw();
+  }
+  function draw() {
+    const c = $("ra-chart"), g = c.getContext("2d"), W = c.width, H = c.height;
+    g.fillStyle = "#0b0f14";
+    g.fillRect(0, 0, W, H);
+    const useK = !!(r && r.calibrated) && hist.some((h) => h[3] != null);
+    const pts = hist.map((h) => [h[0], h[1], useK ? h[3] : h[2]]).filter((h) => h[2] != null && isFinite(h[2]));
+    if (pts.length < 2) return;
+    let lo = Infinity, hi = -Infinity;
+    for (const p of pts) { if (p[2] < lo) lo = p[2]; if (p[2] > hi) hi = p[2]; }
+    if (hi <= lo) hi = lo + Math.abs(lo) * 1e-6 + 1e-12;
+    const pad = (hi - lo) * 0.1;
+    lo -= pad; hi += pad;
+    const t0 = pts[0][0], t1 = Math.max(pts[pts.length - 1][0], t0 + 1);
+    const x = (t) => (t - t0) / (t1 - t0) * (W - 2) + 1;
+    const y = (v) => H - 1 - (v - lo) / (hi - lo) * (H - 2);
+    for (const p of pts) {
+      g.fillStyle = COLOR[p[1]] || COLOR.idle;
+      g.fillRect(x(p[0]) - 1, y(p[2]) - 1, 2, 2);
+    }
+    g.fillStyle = "#9ab";
+    g.font = "11px monospace";
+    g.fillText(useK ? `${hi.toFixed(2)} K` : hi.toExponential(2), 4, 11);
+    g.fillText(useK ? `${lo.toFixed(2)} K` : lo.toExponential(2), 4, H - 3);
+    g.fillText(`${((t1 - t0) / 60).toFixed(1)} min`, W - 64, H - 3);
+  }
+  function download(m) {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([m.text], { type: "text/csv" }));
+    a.download = `radiometer-${m.what}-${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }
+  function init() {
+    const saved = store.get("ra", {});
+    FIELDS.forEach((f) => { if (saved[f] != null && saved[f] !== "") $("ra-" + f).value = saved[f]; });
+    $("ra-go").onclick = () => { if (on) send({ cmd: "ra_stop" }); else start(); };
+    document.querySelectorAll("[data-ra-phase]").forEach((b) => { b.onclick = () => send({ cmd: "ra_phase", phase: b.dataset.raPhase }); });
+    $("ra-clear").onclick = () => { if (confirm("Forget everything the radiometer accumulated?")) { send({ cmd: "ra_clear" }); hist = []; } };
+    $("ra-csv").onclick = () => send({ cmd: "ra_csv", what: "series" });
+    $("ra-csv2").onclick = () => send({ cmd: "ra_csv", what: "spectra" });
+  }
+  return { init, state, update, series, download, error(msg) { $("ra-note").textContent = "refused: " + msg; } };
+})();
+RA.init();
 
 boot();
 })();
