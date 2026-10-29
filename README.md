@@ -129,12 +129,14 @@ the line drops after the same delay. Two outputs:
 
 ### Radiometer (radio astronomy)
 
-The RADIOMETER card in the web UI turns the receiver into a total-power
-radiometer on the FPGA spectrometer: the Sun and the Moon with a small dish
+ASTRO, a mode next to DATV in the web UI, turns the receiver into a
+total-power radiometer on the FPGA spectrometer: the Sun and the Moon with a small dish
 or a yagi, the strong continuum sources and the galactic hydrogen line with
 a dish and an LNA (the board's own noise figure is far too high on its own).
 A transverter in front of the board (10 GHz, 5.7 GHz, 1296 MHz ...) is used
-as for everything else: set it up in SET, give the band on the air.
+as for everything else: set it up in SET, give the band on the air. In
+ASTRO mode the RX band row offers HI (1420.405 MHz) and 10.7G (10.7 GHz,
+through a transverter) as the dial's targets.
 
 START places the LO so the band sits beside DC in one spectrometer look
 (across it where it is too wide, the DC bins masked), pins the RF gain
@@ -151,7 +153,7 @@ every few minutes, and watch the Allan deviation the card shows for where
 drift takes over. Interference is left out per row (a burst) and per bin (a
 carrier; a bin flagged again and again is masked for the session). The
 figures live in RAM only: export the CSV (the sample log, and the
-accumulated spectra per bin) before STOP. docs/RADIOMETER.md has the
+accumulated spectra per bin) before STOP or leaving the mode. docs/RADIOMETER.md has the
 method and the bench checks.
 
 ## Use

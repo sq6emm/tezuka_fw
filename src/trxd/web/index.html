@@ -155,6 +155,13 @@ body:not(.datv-mode) .datv-only { display: none !important; }
 body.no-datv [data-mode=DATV] { display: none !important; }
 body.no-rade [data-mode=RADE] { display: none !important; }
 body.datv-mode .voice-only { display: none !important; }
+/* ASTRO mode (the radiometer): likewise; no spectrometer, no ASTRO button */
+body:not(.ra-mode) .ra-only { display: none !important; }
+body.ra-mode .voice-only, body.ra-mode .datv-only, body.ra-mode .no-ra { display: none !important; }
+body.no-ra [data-mode=ASTRO] { display: none !important; }
+/* the radiometer card across the deck: a wide strip chart */
+body.ra-mode #ra-card { grid-column: 1 / -1; }
+#ra-card canvas { height: 140px !important; }
 body:not(.cw-mode) .cw-only, body:not(.ssb-mode) .ssb-only, body:not(.data-mode) .data-only, body.cw-mode .no-cw { display: none !important; }
 .txm { display: grid; grid-template-columns: auto 1fr auto; gap: 6px; align-items: center; font-size: 12px; color: var(--dim); }
 .txm .bar { height: 8px; }
@@ -339,6 +346,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
         <button class="k" data-mode="CW">CW</button><button class="k" data-mode="PKTUSB" title="USB data: the USB passband without the compressor (CESSB), for digital modes; rigctld and TCI call it PKTUSB / digu">USB-D</button><button class="k" data-mode="RADE" title="FreeDV RADE V2 digital voice (pre-release waveform, not for regular on-air use yet): decoded and encoded in this browser; USB-D with a 250-2750 Hz filter">RADE</button>
         <button class="k" data-mode="AM">AM</button><button class="k" data-mode="FM">FM</button><button class="k" data-mode="WFM" title="Wide FM (broadcast, 87.5-108 MHz): mono, 24 kHz audio to this browser, RDS station name and text">WFM</button>
         <button class="k" data-mode="DATV" title="Digital TV: DVB-S2 from this browser's camera, and received pictures">DATV</button>
+        <button class="k" data-mode="ASTRO" title="Radiometer: radio astronomy on the FPGA spectrometer (the Sun, the Moon, the hydrogen line); no transmitting while observing">ASTRO</button>
       </div>
       <div class="row voice-only" id="fils">
         <button class="k" data-fil="0">FIL1</button><button class="k" data-fil="1">FIL2</button><button class="k" data-fil="2">FIL3</button>
@@ -390,7 +398,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <div class="slider" title="Where this browser plays the receive audio (remembered in this browser)">OUT<select id="aout" class="adev"><option value="">Default</option></select></div>
     </div>
 
-    <div class="card wide">
+    <div class="card wide no-ra">
       <h3><span class="voice-only">TRANSMIT</span><span class="datv-only">DATV</span></h3>
       <div class="row">
         <button class="k voice-only" id="ptt" title="Hold, or Space; Shift-click latches. In CW it is a straight key: carrier at the pitch while held.">PTT</button>
@@ -444,7 +452,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
         </div>
       </div>
     </div>
-    <div class="card wide hidden" id="ra-card">
+    <div class="card wide ra-only" id="ra-card">
       <h3>RADIOMETER <span class="note">radio astronomy: total power on the FPGA spectrometer, kelvin from a hot/cold pair at the feed</span></h3>
       <div class="row">
         <label class="note">centre MHz <input id="ra-center" type="number" step="0.001" style="width:9em" title="Band centre on the air (blank: the dial); through a transverter where one covers it"></label>
@@ -466,7 +474,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
         <button class="k" id="ra-clear" title="Forget everything accumulated (the interference masks too)">CLEAR</button>
       </div>
       <div class="note" id="ra-out">—</div>
-      <canvas id="ra-chart" width="800" height="90" style="width:100%;height:90px;border-radius:6px"></canvas>
+      <canvas id="ra-chart" width="1200" height="140" style="width:100%;border-radius:6px"></canvas>
       <div class="row"><button class="k" id="ra-csv" title="The sample log: time, phase, power, kelvin, flags, gain, temperatures">CSV series</button><button class="k" id="ra-csv2" title="The accumulated spectra per bin: hot, cold, on, off, counts per kelvin, ON minus OFF in kelvin">CSV spectra</button><span class="note" id="ra-note"></span></div>
     </div>
   </section>
@@ -528,9 +536,17 @@ const RX_BANDS = [
   ["SATCOM", 255_550_000, "FM", 243.6e6, 270e6, 5000], ["MIL AIR", 243_000_000, "AM", 225e6, 400e6, 25000],
   ["LPD", 433_075_000, "FM", 433.05e6, 434.79e6, 25000], ["PMR", 446_006_250, "FM", 446.0e6, 446.2e6, 12500],
 ];
+// Radio astronomy bands, in the RX row in ASTRO mode only:
+// [name, first tune, from, to, step]. A click moves the dial (and so the
+// radiometer's centre) without leaving the mode.
+const ASTRO_BANDS = [
+  ["HI", 1_420_405_752, 1400e6, 1427e6, 10000],
+  ["10.7G", 10_700_000_000, 10.6e9, 10.8e9, 100000],
+];
 // The band button for a frequency: a transverter's range first, then the
 // receive-only bands (LPD lies inside 70cm), then the amateur bands.
 function bandOf(f, xvtrs) {
+  if (S.st && S.st.ra_mode) { const a = ASTRO_BANDS.find(([, , lo, hi]) => f >= lo && f <= hi); if (a) return a[0]; }
   const xv = (xvtrs || []).find((t) => f >= t.rf_min && f <= t.rf_max);
   if (xv) return xv.name;
   const b = RX_BANDS.find(([, , , lo, hi]) => f >= lo && f <= hi) || BANDS.find(([, , , lo, hi]) => f >= lo && f <= hi);
@@ -748,7 +764,9 @@ function renderFilter(st) {
 function buildBands(xvtrs) {
   if (!$("rxbands").childElementCount) {
     $("rxbands").innerHTML = `<span class="note">RX</span>` + RX_BANDS.map(([n, f, m, lo, hi, step]) =>
-      `<button class="k" data-f="${f}" data-m="${m}" data-step="${step}" title="${n}: ${lo / 1e6}-${hi / 1e6} MHz, ${m}, ${fmtHz(step)} channels">${n}</button>`).join("");
+      `<button class="k" data-f="${f}" data-m="${m}" data-step="${step}" title="${n}: ${lo / 1e6}-${hi / 1e6} MHz, ${m}, ${fmtHz(step)} channels">${n}</button>`).join("") +
+      ASTRO_BANDS.map(([n, f, lo, hi, step]) =>
+        `<button class="k ra-only" data-f="${f}" data-step="${step}" data-astro="1" title="${n}: ${lo / 1e6}-${hi / 1e6} MHz, the dial to ${f / 1e6} MHz for the radiometer${f > 6e9 ? " (through a transverter)" : ""}">${n}</button>`).join("");
   }
   const key = JSON.stringify(xvtrs);
   if (S.bandsKey === key) return; S.bandsKey = key;
@@ -848,7 +866,7 @@ function renderCalib(m) {
 // still: they scroll inside that height rather than shrink the waterfall
 // everywhere. Measured once per window size, with each mode's classes set
 // in turn.
-const DECK_MODES = ["ssb-mode", "cw-mode", "data-mode", "datv-mode"];
+const DECK_MODES = ["ssb-mode", "cw-mode", "data-mode", "datv-mode", "ra-mode"];
 let deckKey = "";
 function pinDeck() {
   const b = document.body.classList, d = $("deck");
@@ -896,10 +914,10 @@ function renderState() {
   $("callsign").textContent = [st.call, st.loc].filter(Boolean).join(" / ");
   renderFreq();
   $("t-vfo").textContent = "VFO " + st.active;
-  document.body.classList.toggle("cw-mode", !st.datv_mode && st.mode === "CW");
-  document.body.classList.toggle("data-mode", !st.datv_mode && st.mode === "PKTUSB");
-  document.body.classList.toggle("ssb-mode", !st.datv_mode && (st.mode === "USB" || st.mode === "LSB"));
-  $("t-mode").textContent = st.datv_mode ? "DATV" : st.rade ? "RADE" : st.mode === "PKTUSB" ? "USB-D" : st.mode;
+  document.body.classList.toggle("cw-mode", !st.datv_mode && !st.ra_mode && st.mode === "CW");
+  document.body.classList.toggle("data-mode", !st.datv_mode && !st.ra_mode && st.mode === "PKTUSB");
+  document.body.classList.toggle("ssb-mode", !st.datv_mode && !st.ra_mode && (st.mode === "USB" || st.mode === "LSB"));
+  $("t-mode").textContent = st.datv_mode ? "DATV" : st.ra_mode ? "ASTRO" : st.rade ? "RADE" : st.mode === "PKTUSB" ? "USB-D" : st.mode;
   pinDeck();
   $("t-mode").className = "tag on";
   renderRds();
@@ -914,7 +932,7 @@ function renderState() {
   $("freq-b").textContent = fmtFreq(st.active === "B" ? st.vfo_a : st.vfo_b);
   const txf = (st.split ? (st.active === "B" ? st.vfo_a : st.vfo_b) : curFreq()) + (st.xit && st.xit[0] ? st.xit[1] : 0);
   $("freq-tx").textContent = fmtFreq(txf);
-  const shown = st.datv_mode ? "DATV" : st.rade ? "RADE" : st.mode;
+  const shown = st.datv_mode ? "DATV" : st.ra_mode ? "ASTRO" : st.rade ? "RADE" : st.mode;
   document.querySelectorAll("#modes .k").forEach((b) => b.classList.toggle("on", b.dataset.mode === shown));
   document.querySelectorAll("#agcs .k").forEach((b) => b.classList.toggle("on", b.dataset.agc === st.agc));
   $("split").classList.toggle("on", st.split);
@@ -922,6 +940,8 @@ function renderState() {
   buildBands(st.xvtrs || []);
   const bnow = bandOf(curFreq(), st.xvtrs);
   document.querySelectorAll("#bands .k, #rxbands .k").forEach((b) => b.classList.toggle("on", b.textContent === bnow));
+  // An astronomy band out of the board's reach (10 GHz without a transverter) is greyed.
+  document.querySelectorAll("#rxbands .k[data-astro]").forEach((b) => { b.disabled = +b.dataset.f < st.freq_min || +b.dataset.f > st.freq_max; });
   for (const k of ["nb", "nr", "notch"]) $(k).classList.toggle("on", !!st[k]);
   $("rit").classList.toggle("on", !!(st.rit && st.rit[0])); $("xit").classList.toggle("on", !!(st.xit && st.xit[0]));
   const ro = st.rit ? (st.rit[0] || !st.xit[0] ? st.rit[1] : st.xit[1]) : 0;
@@ -1602,7 +1622,16 @@ function buildStatic() {
   $("m-scale").innerHTML = S_SCALE.map((x, i) => `<span class="${i > 4 ? "hi" : ""}">${x}</span>`).join("");
   buildBands([]);
   $("bands").onclick = $("rxbands").onclick = (e) => {
-    const b = e.target.closest("[data-f]"); if (!b) return;
+    const b = e.target.closest("[data-f]"); if (!b || b.disabled) return;
+    // In ASTRO mode a band only moves the dial, which is the radiometer's
+    // centre (a mode change would leave ASTRO); while an observation runs
+    // the move waits for the next START.
+    if (S.st && S.st.ra_mode) {
+      if (S.stepBeforeRx == null) S.stepBeforeRx = S.step;
+      setStep(+b.dataset.step || S.step);
+      RA.center(+b.dataset.f);
+      return;
+    }
     const last = store.get("band." + b.textContent, null);
     // A receive-only band brings its channel step; back on an amateur band,
     // the step from before comes back.
@@ -1629,6 +1658,7 @@ function buildStatic() {
     const b = e.target.closest("[data-mode]"); if (!b) return;
     const m = b.dataset.mode;
     if (m === "DATV") { if (!audioUserOff) audioStart().catch(() => {}); DATV.enter(); return; }
+    if (m === "ASTRO") { send({ cmd: "ra_mode", on: true }); return; }
     // RADE: USB-D (no compressor on TX), the browsers' decoder on
     // (src/rade.rs), and a filter wide enough for its 1060-1940 Hz signal up
     // to 600 Hz off frequency with flat noise beside it: the worker's coarse
@@ -2431,7 +2461,8 @@ const RA = (() => {
     store.set("ra", Object.fromEntries(FIELDS.map((f) => [f, $("ra-" + f).value])));
   }
   function state(st) {
-    $("ra-card").classList.toggle("hidden", !st.ra_ok);
+    document.body.classList.toggle("no-ra", !st.ra_ok);
+    document.body.classList.toggle("ra-mode", !!st.ra_mode);
     const was = on;
     on = !!st.ra;
     const phase = on ? st.ra.phase : "idle";
@@ -2517,7 +2548,15 @@ const RA = (() => {
     $("ra-csv").onclick = () => send({ cmd: "ra_csv", what: "series" });
     $("ra-csv2").onclick = () => send({ cmd: "ra_csv", what: "spectra" });
   }
-  return { init, state, update, series, download, error(msg) { $("ra-note").textContent = "refused: " + msg; } };
+  // A band button in ASTRO mode: the centre field follows it (the next START
+  // when an observation runs); the dial too when none does.
+  function center(hz) {
+    $("ra-center").value = (hz / 1e6).toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+    store.set("ra", Object.fromEntries(FIELDS.map((f) => [f, $("ra-" + f).value])));
+    if (on) $("ra-note").textContent = `centre ${(hz / 1e6).toFixed(3)} MHz from the next START`;
+    else tuneTo(hz);
+  }
+  return { init, state, update, series, download, center, error(msg) { $("ra-note").textContent = "refused: " + msg; } };
 })();
 RA.init();
 

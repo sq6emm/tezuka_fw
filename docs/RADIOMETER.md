@@ -51,6 +51,20 @@ double-sideband one, a source in one sideband reads half its `t_a`. At
 does not matter. The hydrogen line (1420.405 MHz) is a direct AD936x band;
 the reference correction from the 1PPS keeps it within a bin.
 
+## ASTRO mode
+
+The radiometer is a mode of the web UI, next to DATV: the ASTRO button
+(`ra_mode` on) hides the voice controls and shows the card; any voice
+mode or DATV leaves it, which ends a running observation (export first).
+START enters the mode by itself. The board keeps `ra_mode` in its state,
+so every page shows the same.
+
+In ASTRO mode the RX band row gains two astronomy bands: HI (the dial to
+1420.405752 MHz, the hydrogen line; 1400-1427 MHz) and 10.7G (10.7 GHz,
+the 3 cm continuum band; greyed unless a transverter covers it). A band
+click there moves the dial and the card's centre without a mode change;
+while an observation runs it only sets the centre for the next START.
+
 ## The engine while observing (`src/trx.rs`)
 
 * `ra_start` puts the LO beside the band (`band + dc_exclude + 20 kHz`

@@ -383,6 +383,9 @@ pub struct Trx {
     maia: Option<crate::maia::Maia>,
     /// A view wider than one Maia look, being swept (scopeplan).
     sweep: Option<SweepRun>,
+    /// ASTRO mode (the web UI's radiometer): the voice controls give way
+    /// to the observation's; any voice mode or DATV leaves it.
+    ra_mode: bool,
     /// A radio-astronomy observation (src/radiometer.rs): every Maia row
     /// goes into it; the LO, the gain and the filter stay put meanwhile.
     ra: Option<crate::radiometer::Radiometer>,
@@ -551,6 +554,7 @@ impl Trx {
             stream_meter_until: Instant::now(),
             maia_last: None,
             sweep: None,
+            ra_mode: false,
             ra: None,
             ra_saved: None,
             ra_row: None,
@@ -1926,6 +1930,7 @@ impl Trx {
         }
         self.ra_stop("restarted");
         self.sweep_end();
+        self.ra_mode = true;
         let adc = self.cfg.radio.adc_rate as f64;
         let lim = adc * 0.45;
         let center = num("center_hz").unwrap_or_else(|| self.rx_vfo());
@@ -2046,6 +2051,18 @@ impl Trx {
         self.ra_row = None;
         info!(why, "radiometer off");
         self.ra_restore();
+    }
+
+    /// Leave ASTRO mode: the observation ends (its figures with it), the
+    /// gain, the filter and the LO come back.
+    fn ra_leave(&mut self) {
+        if !self.ra_mode {
+            return;
+        }
+        self.ra_stop("mode left");
+        self.ra_mode = false;
+        self.retune(true);
+        info!("ASTRO mode off");
     }
 
     /// The observation as the page's state shows it (the band on the air).
@@ -3132,6 +3149,7 @@ impl Trx {
             "xvtrs": self.settings.transverters,
             "cal_band": self.cal_band(),
             "ra_ok": self.maia.is_some(),
+            "ra_mode": self.ra_mode,
             "ra": self.ra_json(),
             // What this firmware can do (docs/FLAVOURS.md): the page hides
             // what is not there.
@@ -3286,9 +3304,6 @@ impl Trx {
         let cmd = m["cmd"].as_str().unwrap_or("");
         let num = |k: &str| m[k].as_f64();
         let on = m["on"].as_bool().unwrap_or(false);
-        if self.ra.is_some() && cmd.starts_with("datv") {
-            return self.ra_refuse(client, "stop the radiometer first");
-        }
         // A feature on a part of the FPGA the loaded bitstream lacks: load
         // one that has it (trxd restarts and takes this command up again).
         let part = match cmd {
@@ -3348,8 +3363,9 @@ impl Trx {
                 }
             }
             "mode" => {
-                // Any voice mode leaves DATV mode.
+                // Any voice mode leaves DATV mode, and ASTRO mode.
                 self.datv_leave();
+                self.ra_leave();
                 if let Some(md) = m["mode"].as_str().and_then(sdroxide_rigctld::from_hamlib_mode) {
                     self.set_mode(md);
                 }
@@ -3395,6 +3411,7 @@ impl Trx {
             }
             "datv_mode" => {
                 if on {
+                    self.ra_leave();
                     self.datv_mode = true;
                     self.datv_rx_start(num("sr").unwrap_or(64_000.0), m["rate"].as_str().unwrap_or("L-QPSK-1/2"));
                 } else {
@@ -3616,6 +3633,20 @@ impl Trx {
                     } else {
                         warn!("transverter list refused: a name is empty or not plain (letters, digits, space . _ -, 24 at most), or a range is backwards");
                     }
+                }
+            }
+            "ra_mode" => {
+                if on {
+                    if self.tx_on.is_some() {
+                        self.ra_refuse(client, "not while transmitting");
+                    } else if !self.ra_mode {
+                        self.datv_leave();
+                        self.sweep_end();
+                        self.ra_mode = true;
+                        info!("ASTRO mode");
+                    }
+                } else {
+                    self.ra_leave();
                 }
             }
             "ra_start" => self.ra_start(client, m),
