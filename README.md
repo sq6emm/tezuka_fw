@@ -151,6 +151,28 @@ tunnel, the boards have no RTC and WireGuard needs the time. Behind NAT, put
 on (`fw_setenv enable_ipv6 yes`). The web UI, SSH, TCI and rigctld answer on the VPN
 address as on the LAN. Delete the file and restart the service to turn it off.
 
+### Noise canceller (two antennas)
+
+RX1 is the antenna, RX2 a second antenna that hears mostly the local noise
+source; trxd subtracts what of RX2 matches RX1 (adaptive, in front of the
+demodulator, scope, TCI IQ and decoders). It needs the AD936x in 2R2T, set
+once in U-Boot and applied at the next boot:
+
+```sh
+fw_setenv mode 2r2t
+# ADALM-Pluto only: its device tree names an AD9364 (one channel)
+fw_setenv attr_name compatible
+fw_setenv attr_val ad9361
+reboot
+```
+
+The NC, FRZ and REF keys then appear on the page (REF listens to RX2 alone;
+NC turns red when RX2 is too weak to help). In 2R2T, RX/TX port switching
+is off and TX2 is held at full attenuation. The LibreSDR and PlutoSky R2 trx
+bitstreams filter RX2 exactly as RX1; the Pluto's has no DSP slice left for
+that and uses a CIC: in-band level matched, but signals just outside the
+384 kHz channel fold into RX2 only 15-40 dB down instead of fully rejected.
+
 ### PTT output
 
 A PA or T/R relay follows the transmitter: the line goes up, `ptt_delay_ms`
