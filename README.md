@@ -129,6 +129,28 @@ freq_hz = 144174000
 decoders = ["q65"]       # q65 | pi4
 ```
 
+### WireGuard VPN
+
+The kernel has WireGuard built in and the images carry `wg`. Put a standard wg-quick
+file (the one your WireGuard server hands out) on the board and restart the service;
+it comes up at every boot from then on and survives firmware updates:
+
+```sh
+mkdir -p /mnt/jffs2/etc/wireguard
+cat > /mnt/jffs2/etc/wireguard/wg0.conf     # paste, then Ctrl-D
+/etc/init.d/S51wireguard restart
+wg show
+```
+
+There is no bash on the board, so `S51wireguard` does wg-quick's job itself: `Address`
+and `MTU` (default 1420) are applied, each peer's `AllowedIPs` becomes a route through
+wg0, and `DNS`, `PostUp` and the other wg-quick-only keys are ignored with a note. A
+default route (`0.0.0.0/0`) is not taken: NTP has to reach the internet outside the
+tunnel, the boards have no RTC and WireGuard needs the time. Behind NAT, put
+`PersistentKeepalive = 25` in the `[Peer]` section. IPv6 addresses need IPv6 switched
+on (`fw_setenv enable_ipv6 yes`). The web UI, SSH, TCI and rigctld answer on the VPN
+address as on the LAN. Delete the file and restart the service to turn it off.
+
 ### PTT output
 
 A PA or T/R relay follows the transmitter: the line goes up, `ptt_delay_ms`

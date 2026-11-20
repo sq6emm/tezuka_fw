@@ -1,52 +1,108 @@
 #!/bin/sh
+#
+# WireGuard VPN (wg0) from a standard wg-quick file, without wg-quick:
+# the images have no bash, so this does wg-quick's job in plain sh with
+# `wg` and `ip`.
+#
+#   /mnt/jffs2/etc/wireguard/wg0.conf   (kept across firmware updates)
+#
+# Present -> the tunnel comes up at boot; absent -> nothing happens.
+# Understood from [Interface]: Address (one or more, comma separated, IPv4
+# and IPv6; IPv6 only with the U-Boot env enable_ipv6), MTU (default 1420).
+# Ignored with a note: DNS, Table, PreUp, PostUp, PreDown, PostDown,
+# SaveConfig. Everything else (PrivateKey,
+# ListenPort, FwMark and the [Peer] sections) goes to `wg setconf` as is.
+# Each peer's AllowedIPs becomes a route through wg0, except a default
+# route (0.0.0.0/0, ::/0): NTP must keep reaching the internet outside the
+# tunnel, the boards have no RTC and WireGuard handshakes need the time.
+# Boards behind NAT: put PersistentKeepalive = 25 in the [Peer] section.
 
-WG_CONF="/mnt/jffs2/etc/wireguard/wg0.conf"
+IF=wg0
+WG_CONF=/mnt/jffs2/etc/wireguard/$IF.conf
+LOG=/tmp/wireguard.log
+
+# Values of one key in one section, comma lists split, one per line.
+conf_values() { # section key
+	awk -v sec="$1" -v key="$2" '
+		/^[ \t]*\[/ { s = tolower($0); gsub(/[][ \t]/, "", s); next }
+		{
+			line = $0; sub(/#.*/, "", line)
+			n = index(line, "="); if (!n) next
+			k = tolower(substr(line, 1, n - 1)); gsub(/[ \t]/, "", k)
+			if (s != sec || k != key) next
+			v = substr(line, n + 1); gsub(/[ \t]/, "", v)
+			c = split(v, a, ","); for (i = 1; i <= c; i++) if (a[i] != "") print a[i]
+		}' "$WG_CONF"
+}
+
+# The file without the wg-quick-only keys: what `wg setconf` accepts.
+setconf_file() {
+	awk '
+		{
+			line = $0; sub(/#.*/, "", line)
+			n = index(line, "=")
+			if (n) {
+				k = tolower(substr(line, 1, n - 1)); gsub(/[ \t]/, "", k)
+				if (k ~ /^(address|dns|mtu|table|preup|postup|predown|postdown|saveconfig)$/) {
+					if (k !~ /^(address|mtu)$/) print "wireguard: ignoring " k " (wg-quick only)" > "/dev/stderr"
+					next
+				}
+			}
+			print line
+		}' "$WG_CONF"
+}
 
 start() {
 	printf "Starting wireguard: "
-	# fw_printenv can block if the U-Boot env backing device isn't ready
-	# yet at this point in boot (observed: a ~34s hang here took down the
-	# whole sequential boot chain until the hardware watchdog reset the
-	# board). Bound it so a slow/unavailable env device degrades to
-	# "disabled" instead of hanging boot.
-	if [ "$(timeout 3 fw_printenv -n wireguard_enabled 2>/dev/null)" != "1" ]; then
-		echo "disabled"
-		return 0
-	fi
 	if [ ! -f "$WG_CONF" ]; then
 		echo "no config"
 		return 0
 	fi
-	# Invoked as "bash /usr/bin/wg-quick" rather than "wg-quick" (letting
-	# its own #!/usr/bin/env bash shebang start the interpreter):
-	# confirmed on real hardware, repeatedly, that letting the shebang
-	# start bash reliably fails at the "ip address add" step right after
-	# "wg setconf" with "RTNETLINK answers: Network is unreachable" —
-	# whether invoked directly, via timeout(1) (see the now-reverted
-	# theory in pull/8), or from this script — while explicitly invoking
-	# bash on the script succeeds cleanly every time. Not wrapped in
-	# timeout(1) either way; that was a red herring, not the cause. See
-	# github.com/mbehn1976/tezuka_fw pull/9.
-	if bash /usr/bin/wg-quick up "$WG_CONF" 2>/tmp/wireguard.log; then
-		echo "OK"
-	else
+	chmod 600 "$WG_CONF"
+	: > "$LOG"
+	ip link del "$IF" 2>/dev/null
+	umask 077
+	tmp=/tmp/$IF.setconf
+	if ! setconf_file > "$tmp" 2>>"$LOG" ||
+	   ! ip link add "$IF" type wireguard 2>>"$LOG" ||
+	   ! wg setconf "$IF" "$tmp" 2>>"$LOG"; then
+		rm -f "$tmp"
+		ip link del "$IF" 2>/dev/null
 		echo "FAIL"
-		cat /tmp/wireguard.log
+		cat "$LOG"
 		return 1
 	fi
+	rm -f "$tmp"
+	# IPv6 is off unless the U-Boot env says enable_ipv6 (S40network).
+	v6=1
+	[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = 1 ] && v6=0
+	for a in $(conf_values interface address); do
+		case "$a" in
+			*:*) [ $v6 = 1 ] || { echo "wireguard: IPv6 is off (fw_setenv enable_ipv6 yes), skipping $a" >> "$LOG"; continue; };;
+		esac
+		ip address add "$a" dev "$IF" 2>>"$LOG" || echo "wireguard: address $a refused" >> "$LOG"
+	done
+	mtu=$(conf_values interface mtu | head -n 1)
+	ip link set "$IF" mtu "${mtu:-1420}" up 2>>"$LOG"
+	for r in $(conf_values peer allowedips); do
+		case "$r" in
+			0.0.0.0/0|::/0)
+				echo "wireguard: not routing $r through $IF (NTP and the LAN stay outside)" >> "$LOG";;
+			*:*)
+				[ $v6 = 1 ] && ip -6 route replace "$r" dev "$IF" 2>>"$LOG";;
+			*)
+				ip route replace "$r" dev "$IF" 2>>"$LOG";;
+		esac
+	done
+	echo "OK"
+	[ -s "$LOG" ] && cat "$LOG"
+	return 0
 }
 
 stop() {
 	printf "Stopping wireguard: "
-	if ip link show wg0 >/dev/null 2>&1; then
-		bash /usr/bin/wg-quick down "$WG_CONF" 2>/tmp/wireguard.log
-	fi
+	ip link del "$IF" 2>/dev/null
 	echo "OK"
-}
-
-restart() {
-	stop
-	start
 }
 
 case "$1" in
@@ -54,8 +110,9 @@ case "$1" in
 		start;;
 	stop)
 		stop;;
-	restart)
-		restart;;
+	restart|reload)
+		stop
+		start;;
 	*)
 		echo "Usage: $0 {start|stop|restart}"
 		exit 1
