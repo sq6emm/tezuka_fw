@@ -80,6 +80,22 @@ The layout follows an IC-9700 front panel:
 - **LCD:** a large VFO display (scroll or drag a digit to tune it), VFO A/B, split, the mode/filter/AGC tags, and an S-meter that switches to Po on TX.
 - **Scope:** spectrum over waterfall, with click, drag and wheel tuning and automatic reference level. Spans from ±2.5 kHz to ±1.25 MHz in one look (the wide ones straight from Maia's FPGA spectrometer, the analog filter opened over the view), and swept views up to ±12.5 MHz (the whole FM band; no audio while sweeping). docs/SCOPE.md.
 - **Touch keys:** band, mode, FIL1-3, AGC, tuning step, RF/AF/drive/TX-attenuator, and 8 memories.
+  Transverters (SET: name, RF range, LO, inverted, TX allowed) get band keys of
+  their own. A transverter's key picks it, and it stays in use outside its RF
+  range as long as its IF lands on the board: the key and the XVTR tag turn
+  red there as a warning. Any other band key drops it.
+- **QO-100 beacon tracking:** with a transverter that brings the narrowband
+  transponder (10489.5 to 10490 MHz) a BEACON key appears next to LOCK. On,
+  the engine measures a transponder beacon in the stream (the PSK beacon on
+  10489.750 MHz by squaring, or a CW beacon on 10489.500 / 10490.000 MHz,
+  whichever the stream holds) every 2 s and moves the transverter's LO by the
+  error, so the dial reads true downlink frequencies while the LNB drifts.
+  Nothing known yet (a DRO LNB can sit hundreds of kHz off), it first looks
+  for the beacons' pattern across the whole stream, two or more beacons at
+  once; past the stream's reach, shift-click the beacon's trace on the scope
+  once and it tracks from there. Amber while searching, green when locked,
+  the correction on the key (it is kept in settings and survives a restart;
+  right-click forgets it).
 - **Transmit:** PTT (hold, Space, or Shift-click to latch) with your microphone, TUNE, a CW keyboard with macros, and the Q65/PI4 decode list (click to tune).
 
 Audio is 12 kHz µ-law over the same WebSocket, 96 kbit/s each way.

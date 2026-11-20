@@ -245,6 +245,13 @@ pub struct Trx {
     settings_dir: std::path::PathBuf,
     /// The transverter the LO is currently tuned through (None: direct).
     xvtr: Option<Transverter>,
+    /// The QO-100 beacon lock while it runs (qo100.rs).
+    bcn: Option<crate::qo100::Lock>,
+    /// The newest spectrometer row the lock's wide search drained, kept
+    /// for the scope.
+    bcn_row: Option<crate::maia::Row>,
+    /// When the lock's correction was last written to settings.
+    bcn_saved: Instant,
 
     // Receive DSP
     ddc: Ddc,
@@ -541,6 +548,9 @@ impl Trx {
             settings,
             settings_dir,
             xvtr: None,
+            bcn: None,
+            bcn_row: None,
+            bcn_saved: Instant::now(),
             nb: None,
             notch: None,
             nr: None,
@@ -739,22 +749,60 @@ impl Trx {
         self.tx_vfo() + if self.xit.0 { self.xit.1 } else { 0.0 }
     }
 
+    /// The transverter for a frequency on the air: the one whose RF range
+    /// covers it, else the one in use (its band button, or the range tuned
+    /// into before) as long as its IF lands on the AD936x. So the edge of
+    /// the range warns (the page shows it) instead of dropping the dial
+    /// onto the bare board; a plain band button or a frequency the
+    /// transverter cannot reach leaves it.
+    fn xvtr_at(&self, hz: f64) -> Option<&Transverter> {
+        if let Some(t) = self.settings.transverter(hz) {
+            return Some(t);
+        }
+        let sel = self.settings.xvtr_sel.as_ref()?;
+        let t = self.settings.transverters.iter().find(|t| &t.name == sel)?;
+        let i = t.to_if(hz);
+        (i >= self.cfg.radio.freq_min_hz && i <= self.cfg.radio.freq_max_hz).then_some(t)
+    }
+
     /// Clamp a frequency to what can be reached: the AD936x itself or a
-    /// transverter's band.
+    /// transverter.
     fn reachable(&self, hz: f64) -> f64 {
-        if self.settings.transverter(hz).is_some() {
+        if self.xvtr_at(hz).is_some() {
             hz
         } else {
             hz.clamp(self.cfg.radio.freq_min_hz, self.cfg.radio.freq_max_hz)
         }
     }
 
-    /// Lowest and highest frequency the operator can tune (the transverter
-    /// bands included).
+    /// Lowest and highest frequency the operator can tune: the transverter
+    /// bands, and wherever the transverter in use reaches.
     fn freq_range(&self) -> (f64, f64) {
-        self.settings.transverters.iter().fold((self.cfg.radio.freq_min_hz, self.cfg.radio.freq_max_hz), |(a, b), t| {
-            (a.min(t.rf_min), b.max(t.rf_max))
-        })
+        let (min, max) = (self.cfg.radio.freq_min_hz, self.cfg.radio.freq_max_hz);
+        let r = self.settings.transverters.iter().fold((min, max), |(a, b), t| (a.min(t.rf_min), b.max(t.rf_max)));
+        match &self.xvtr {
+            Some(t) if t.inverted => (r.0.min(t.lo_hz - max), r.1.max(t.lo_hz - min)),
+            Some(t) => (r.0.min(t.lo_hz + min), r.1.max(t.lo_hz + max)),
+            None => r,
+        }
+    }
+
+    /// The transverter for a frequency with its LO corrected by what the
+    /// beacon lock found (settings.xvtr_corr): what the engine works with.
+    fn xvtr_corrected(&self, hz: f64) -> Option<Transverter> {
+        let mut t = self.xvtr_at(hz).cloned()?;
+        t.lo_hz += self.settings.xvtr_corr.get(&t.name).copied().unwrap_or(0.0);
+        Some(t)
+    }
+
+    /// Remember the transverter in use (settings.xvtr_sel), so it stays in
+    /// use outside its range and across a restart.
+    fn xvtr_remember(&mut self) {
+        let sel = self.xvtr.as_ref().map(|t| t.name.clone());
+        if sel != self.settings.xvtr_sel {
+            self.settings.xvtr_sel = sel;
+            self.settings.save(&self.settings_dir);
+        }
     }
 
     /// Keep the LO so both VFOs sit inside the usable stream, clear of DC.
@@ -843,8 +891,8 @@ impl Trx {
             && matches!(self.tx_on, Some(TxSource::Datv(_)))
             && self.datv_rx.is_some()
             && !fits(rx, tx)
-            && self.settings.transverter(rx).is_none()
-            && self.settings.transverter(tx).is_none()
+            && self.xvtr_at(rx).is_none()
+            && self.xvtr_at(tx).is_none()
         {
             let rx_off = if self.datv_rx.as_ref().is_some_and(|r| r.t2_bw.is_some()) { 0.0 } else { self.cfg.radio.lo_offset_hz };
             let (min, max) = (self.cfg.radio.freq_min_hz, self.cfg.radio.freq_max_hz);
@@ -869,13 +917,14 @@ impl Trx {
             info!(rx_lo, tx_lo, "LOs apart (cross band)");
             self.lo_split = Some((rx_lo, tx_lo));
             self.xvtr = None;
+            self.xvtr_remember();
             self.center = rx_lo;
             self.scope_wide.reset();
             self.apply_offsets();
             return;
         }
         let had_split = self.lo_split.take().is_some();
-        let xvtr = self.settings.transverter(anchor).cloned();
+        let xvtr = self.xvtr_corrected(anchor);
         // The LO sits `lo_offset` below the signal on the air, which through an
         // inverting transverter is above it on the AD936x.
         let mut lo = match datv {
@@ -935,7 +984,11 @@ impl Trx {
         self.hw_tx_lo = Some(hw);
         if xvtr != self.xvtr {
             info!(xvtr = xvtr.as_ref().map(|t| t.name.as_str()), "transverter");
+            if xvtr.as_ref().map(|t| &t.name) != self.xvtr.as_ref().map(|t| &t.name) {
+                self.bcn = None;
+            }
             self.xvtr = xvtr;
+            self.xvtr_remember();
         }
         debug!(lo, hw, "LO retuned");
         self.center = lo;
@@ -961,7 +1014,7 @@ impl Trx {
         if !self.cfg.trx.allow_tx {
             return Err("trx.allow_tx = false".into());
         }
-        if let Some(t) = self.settings.transverter(f) {
+        if let Some(t) = self.xvtr_at(f) {
             return if t.tx { Ok(()) } else { Err(format!("transverter {} is receive-only", t.name)) };
         }
         if self.cfg.trx.tx_range_ok(f - half, f + half) {
@@ -1246,7 +1299,7 @@ impl Trx {
     /// The S-meter calibration table in force: the transverter's name, or the band.
     fn cal_band(&self) -> String {
         let f = self.rx_eff();
-        match self.settings.transverter(f) {
+        match self.xvtr_at(f) {
             Some(t) => t.name.clone(),
             None => Band::containing(f).label().to_string(),
         }
@@ -1460,7 +1513,7 @@ impl Trx {
         // transverter they would go out mirrored (only the software path
         // can conjugate them).
         let fpga_path = crate::dvbt2::tx::Mode::parse(rate).is_some() || LongMode::parse(rate).is_some();
-        if fpga_path && self.settings.transverter(self.tx_eff()).is_some_and(|t| t.inverted) {
+        if fpga_path && self.xvtr_at(self.tx_eff()).is_some_and(|t| t.inverted) {
             warn!("DATV: the FPGA transmitter cannot send through an inverting transverter");
             self.datv_refuse(client, "DATV is generated in the FPGA and would go out mirrored through an inverting transverter");
             return;
@@ -1876,6 +1929,132 @@ impl Trx {
 
     /// Every full-rate Maia row of this block into the observation; the
     /// newest one kept for the scope and the meter.
+    // ---- QO-100 beacon lock (qo100.rs) ----
+
+    /// The lock still looking for the beacons: the spectrometer's full
+    /// width is wanted (no zoom, the analog filter open).
+    fn bcn_acquiring(&self) -> bool {
+        self.bcn.as_ref().is_some_and(|b| !b.acquired)
+    }
+
+    /// Whether the transverter in use brings the narrowband transponder.
+    fn bcn_avail(&self) -> bool {
+        self.xvtr.as_ref().is_some_and(crate::qo100::covers_nb)
+    }
+
+    /// The lock on (settings.beacon_lock, so it resumes after a restart);
+    /// it starts when the transponder's transverter is in use.
+    fn bcn_set(&mut self, on: bool) {
+        if self.settings.beacon_lock != on {
+            self.settings.beacon_lock = on;
+            self.settings.save(&self.settings_dir);
+        }
+        if !on {
+            if self.bcn.take().is_some() {
+                info!("QO-100 beacon lock off");
+            }
+        }
+    }
+
+    /// Stream samples to the lock: a reading moves the transverter's LO by
+    /// half the error (the next reading, 2 s on, takes the rest); the
+    /// stream's centre on the air moves with it and the channel follows
+    /// inside the stream (no LO move on the AD936x).
+    fn bcn_intake(&mut self, iq: &[Complex32]) {
+        if !self.settings.beacon_lock || !self.bcn_avail() || self.tx_on.is_some() {
+            return;
+        }
+        if self.bcn.as_ref().is_none_or(|b| b.rate() != self.rate) {
+            info!(rate = self.rate, "QO-100 beacon lock on");
+            self.bcn = Some(crate::qo100::Lock::new(self.rate));
+        }
+        let center = self.center;
+        // Nothing known yet: the spectrometer's rows for the pattern, the
+        // zoom input's where there is one (750 Hz cells over +/-1.5 MHz;
+        // the scope block keeps it switched on and the filter planner opens
+        // the analog filter meanwhile), else the full rate's.
+        let mut found = None;
+        if self.bcn.as_ref().is_some_and(|b| !b.acquired) {
+            if let (Some(b), Some(m)) = (&mut self.bcn, &self.maia) {
+                let inverted = self.xvtr.as_ref().is_some_and(|t| t.inverted);
+                let zoom = m.zoom_capable && self.cfg.radio.adc_rate as f64 >= WIDE_ADC_RATE;
+                let span = if zoom { self.cfg.radio.adc_rate as f64 / 8.0 } else { self.cfg.radio.adc_rate as f64 };
+                let mut last = None;
+                for r in m.rows.try_iter() {
+                    if r.zoom == zoom && found.is_none() {
+                        let bins: Vec<f32> = if inverted { r.bins.iter().rev().cloned().collect() } else { r.bins.clone() };
+                        found = b.push_wide(&bins, span, center);
+                    }
+                    last = Some(r);
+                }
+                self.bcn_row = last;
+            }
+        }
+        let fine = self.bcn.as_mut().and_then(|b| b.push(iq, center));
+        let Some(r) = found.or(fine) else { return };
+        if r.coarse {
+            info!(beacon = r.beacon.name(), err = r.err_hz, db = r.snr_db, "beacon pattern found");
+        } else {
+            debug!(beacon = r.beacon.name(), err = r.err_hz, snr = r.snr_db, "beacon lock");
+        }
+        // The pattern's answer whole; a tracking reading by half (the next
+        // one, 2 s on, takes the rest).
+        self.bcn_shift(if r.coarse { -r.err_hz } else { -0.5 * r.err_hz });
+        // The correction outlives a restart; written now and then.
+        if self.bcn_saved.elapsed() > Duration::from_secs(120) {
+            self.bcn_saved = Instant::now();
+            self.settings.save(&self.settings_dir);
+        }
+    }
+
+    /// Move the transverter's LO correction by `delta` Hz: the stream's
+    /// centre on the air moves with it and the channel follows inside the
+    /// stream.
+    fn bcn_shift(&mut self, delta: f64) {
+        if delta.abs() < 0.5 {
+            return;
+        }
+        let Some(t) = &mut self.xvtr else { return };
+        t.lo_hz += delta;
+        let name = t.name.clone();
+        *self.settings.xvtr_corr.entry(name).or_insert(0.0) += delta;
+        self.center += delta;
+        self.apply_offsets();
+    }
+
+    /// The operator clicked the beacon on the scope: the nearest beacon's
+    /// nominal goes there, and the lock tracks it from there (as SDR
+    /// Console's beacon window: click the trace once, then it follows).
+    fn bcn_mark(&mut self, hz: f64) {
+        if !self.bcn_avail() {
+            return;
+        }
+        let b = crate::qo100::nearest(hz);
+        info!(hz, beacon = b.name(), "beacon marked");
+        self.bcn_set(true);
+        self.bcn_shift(b.hz() - hz);
+        if self.bcn.as_ref().is_none_or(|l| l.rate() != self.rate) {
+            self.bcn = Some(crate::qo100::Lock::new(self.rate));
+        }
+        if let Some(l) = &mut self.bcn {
+            l.mark(b);
+        }
+        self.bcn_saved = Instant::now();
+        self.settings.save(&self.settings_dir);
+    }
+
+    fn bcn_json(&self) -> serde_json::Value {
+        let corr = self.xvtr.as_ref().and_then(|t| self.settings.xvtr_corr.get(&t.name)).copied().unwrap_or(0.0);
+        match &self.bcn {
+            Some(b) => serde_json::json!({
+                "on": true, "corr_hz": corr, "locked": b.locked,
+                "beacon": b.beacon.map(|x| x.name()),
+                "err_hz": b.last.map(|r| r.err_hz), "snr_db": b.last.map(|r| r.snr_db), "updates": b.updates,
+            }),
+            None => serde_json::json!({ "on": self.settings.beacon_lock, "corr_hz": corr, "locked": false }),
+        }
+    }
+
     fn ra_intake(&mut self) {
         let (Some(ra), Some(m)) = (&mut self.ra, &self.maia) else { return };
         let temps = *self.temps.lock().unwrap();
@@ -1904,6 +2083,11 @@ impl Trx {
     fn maia_newest(&mut self, zoom: bool) -> Option<crate::maia::Row> {
         if self.ra.is_some() {
             return if zoom { None } else { self.ra_row.take() };
+        }
+        if let Some(r) = self.bcn_row.take() {
+            if r.zoom == zoom {
+                return Some(r);
+            }
         }
         self.maia.as_ref().and_then(|m| m.rows.try_iter().filter(|r| r.zoom == zoom).last())
     }
@@ -1941,7 +2125,7 @@ impl Trx {
         // across it.
         let margin = 20e3;
         let lo_air = if width + dc_ex + margin <= lim { center - (half + dc_ex + margin) } else { center };
-        let xvtr = self.settings.transverter(center).cloned();
+        let xvtr = self.xvtr_corrected(center);
         let (min, max) = (self.cfg.radio.freq_min_hz, self.cfg.radio.freq_max_hz);
         let hw = match &xvtr {
             Some(t) => t.to_if(lo_air),
@@ -1982,7 +2166,11 @@ impl Trx {
         self.hw_tx_lo = Some(hw);
         if xvtr != self.xvtr {
             info!(xvtr = xvtr.as_ref().map(|t| t.name.as_str()), "transverter");
+            if xvtr.as_ref().map(|t| &t.name) != self.xvtr.as_ref().map(|t| &t.name) {
+                self.bcn = None;
+            }
             self.xvtr = xvtr;
+            self.xvtr_remember();
         }
         self.center = lo_air;
         self.scope_wide.reset();
@@ -2495,6 +2683,13 @@ impl Trx {
         // down and RDS decoded on 0 of 6 stations (6 of 6 at 1 MHz).
         let r = self.scope_radio();
         let rx_need = 2.0 * ((self.rx_eff() - self.center).abs() + 0.5 * self.chan_rate as f64) * 1.1;
+        // The beacon lock's wide search wants its look (the zoom input's
+        // +/-1.4 MHz, or the whole width without one) in the filter.
+        let rx_need = if self.bcn_acquiring() {
+            rx_need.max(if r.zoom_rate.is_some() { 2.0 * r.zoom_half() } else { 2.0 * r.maia_half() })
+        } else {
+            rx_need
+        };
         // While a DATV receiver runs the view does not move the filter:
         // every change recalibrates the AD936x (about 55 ms without
         // samples), and each span change cost frames or the lock (R2 to
@@ -2593,6 +2788,7 @@ impl Trx {
             None => self.rx_gain_db,
         };
         self.ra_intake();
+        self.bcn_intake(iq);
         // MUTE AT TX: our own signal is not received; the S-meter and the
         // AGC hold what they had, so the other station comes back at once.
         let quiet = self.rx_quiet();
@@ -2687,10 +2883,11 @@ impl Trx {
             }
             let src = self.scope_source();
             let lo = self.center;
-            // (the zoom input only while a zoom view shows it)
+            // (the zoom input only while a zoom view shows it, or while the
+            // beacon lock searches its 750 Hz cells)
             if let Some(m) = &self.maia {
                 if !matches!(src, Source::Zoom { .. }) {
-                    m.set_zoom(false);
+                    m.set_zoom(self.bcn_acquiring());
                 }
             }
             let row = match src {
@@ -2711,7 +2908,7 @@ impl Trx {
                     let zoom = matches!(src, Source::Zoom { .. });
                     let adc = if zoom { self.cfg.radio.adc_rate as f64 / 8.0 } else { self.cfg.radio.adc_rate as f64 };
                     if let Some(m) = &self.maia {
-                        m.set_zoom(zoom);
+                        m.set_zoom(zoom || self.bcn_acquiring());
                     }
                     let got = self.maia_newest(zoom).map(|r| r.bins);
                     // (The level meter measures wide bands on it too.)
@@ -3146,6 +3343,9 @@ impl Trx {
                 (None, false) => None,
             },
             "xvtr": self.xvtr.as_ref().map(|t| t.name.clone()),
+            "xvtr_out": self.xvtr.as_ref().is_some_and(|t| !t.covers(self.rx_vfo())),
+            "bcn_avail": self.bcn_avail(),
+            "bcn": self.bcn_json(),
             "xvtrs": self.settings.transverters,
             "cal_band": self.cal_band(),
             "ra_ok": self.maia.is_some(),
@@ -3615,6 +3815,47 @@ impl Trx {
                 self.settings.save(&self.settings_dir);
                 info!(loc = %self.locator(), "locator set");
             }
+            // A band button: a transverter's picks it (it stays in use past its
+            // range), a plain band's drops the one in use.
+            // QO-100 beacon lock on / off; "reset" forgets the correction.
+            "beacon" => {
+                if m["dump"].as_bool() == Some(true) {
+                    // The wide search's last look, for a look from outside.
+                    let d = self.bcn.as_ref().and_then(|b| b.last_wide.as_ref()).map(|(cells, cell_hz, best)| {
+                        serde_json::json!({"cells": cells, "cell_hz": cell_hz, "center": self.center, "best": best.map(|(e, s, r)| [e, s, r])})
+                    });
+                    if let Some(w) = &self.web {
+                        w.send_json_to(client, &serde_json::json!({"type": "bcn_dump", "d": d}));
+                    }
+                } else if let Some(hz) = m["mark_hz"].as_f64().filter(|v| v.is_finite()) {
+                    self.bcn_mark(hz);
+                } else if m["reset"].as_bool() == Some(true) {
+                    if let Some(t) = &mut self.xvtr {
+                        if let Some(c) = self.settings.xvtr_corr.remove(&t.name) {
+                            t.lo_hz -= c;
+                            self.center -= c;
+                            self.apply_offsets();
+                        }
+                    }
+                    self.bcn = None;
+                    self.settings.save(&self.settings_dir);
+                } else {
+                    self.bcn_set(on);
+                }
+            }
+            "xvtr_select" => {
+                let name = m["name"].as_str().map(str::to_string).filter(|n| self.settings.transverters.iter().any(|t| &t.name == n));
+                if name != self.settings.xvtr_sel {
+                    self.settings.xvtr_sel = name;
+                    self.settings.save(&self.settings_dir);
+                    // The band's own tune follows; a dial the board cannot
+                    // reach on its own waits for it (no jump to the edge).
+                    let f = self.rx_vfo();
+                    if self.reachable(f) == f && self.xvtr.as_ref().map(|t| &t.name) != self.xvtr_at(f).map(|t| &t.name) {
+                        self.retune(true);
+                    }
+                }
+            }
             "xvtr_set" => {
                 if let Ok(list) = serde_json::from_value::<Vec<Transverter>>(m["list"].clone()) {
                     // Names go into the page and the S-meter tables: plain ones only.
@@ -3625,6 +3866,9 @@ impl Trx {
                     let ok = list.iter().all(|t| t.rf_max > t.rf_min && name_ok(&t.name));
                     if ok {
                         self.settings.transverters = list;
+                        if self.settings.xvtr_sel.as_ref().is_some_and(|n| !self.settings.transverters.iter().any(|t| &t.name == n)) {
+                            self.settings.xvtr_sel = None;
+                        }
                         self.settings.save(&self.settings_dir);
                         info!(n = self.settings.transverters.len(), "transverters saved");
                         let f = self.reachable(self.rx_vfo());

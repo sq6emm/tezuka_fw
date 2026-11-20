@@ -64,6 +64,18 @@ pub struct Settings {
     pub mute_at_tx: bool,
     #[serde(default)]
     pub transverters: Vec<Transverter>,
+    /// The transverter in use, by name: picked by its band button or entered
+    /// by tuning into its range, it stays in use outside the range (the page
+    /// warns) as long as its IF lands on the AD936x.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xvtr_sel: Option<String>,
+    /// Per transverter name: the correction of its LO found by the QO-100
+    /// beacon lock, Hz (added to `lo_hz`; the LNB's drift).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub xvtr_corr: std::collections::BTreeMap<String, f64>,
+    /// The QO-100 beacon lock is on (resumes after a restart).
+    #[serde(default)]
+    pub beacon_lock: bool,
     /// Per band (band label, or transverter name): points sorted by reading.
     #[serde(default)]
     pub smeter: std::collections::BTreeMap<String, Vec<CalPoint>>,
@@ -93,6 +105,9 @@ impl Default for Settings {
             locator: None,
             mute_at_tx: true,
             transverters: Vec::new(),
+            xvtr_sel: None,
+            xvtr_corr: Default::default(),
+            beacon_lock: false,
             smeter: Default::default(),
             port: 1,
             ports: Default::default(),

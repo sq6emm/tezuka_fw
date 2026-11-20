@@ -94,6 +94,10 @@ header a { color: var(--dim); }
 #bands .k { flex: 1 0 auto; padding: 5px 8px; }
 #bands .k.on { box-shadow: 0 0 10px rgba(29, 134, 194, .6); }
 #bands .k.warn.on { background: var(--amber); border-color: var(--amber); color: var(--bezel); box-shadow: 0 0 10px rgba(255, 181, 71, .5); }
+#bands .k.warn.on.out { background: var(--red); border-color: var(--red); color: #fff; box-shadow: 0 0 12px rgba(255, 80, 80, .7); }
+.tag.out { color: #fff; background: var(--red); border-color: var(--red); }
+#bcn.on.locked { background: var(--green); border-color: var(--green); color: var(--bezel); box-shadow: 0 0 10px rgba(80, 200, 120, .5); }
+#bcn.on:not(.locked) { background: var(--amber); border-color: var(--amber); color: var(--bezel); }
 #fentry { flex: 0 0 150px; text-align: right; }
 #fentry.bad { border-color: var(--red); }
 
@@ -378,7 +382,7 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <h3>VFO · STEP · LEVELS</h3>
       <div class="row">
         <button class="k" id="vfo-ab">A/B</button><button class="k" id="vfo-eq">A=B</button>
-        <button class="k" id="split">SPLIT</button><button class="k" id="lock" title="Lock the tuning">LOCK</button>
+        <button class="k" id="split">SPLIT</button><button class="k" id="lock" title="Lock the tuning">LOCK</button><button class="k hidden" id="bcn" title="QO-100 beacon tracking: the transponder's beacon as the frequency reference; the transverter's LO follows the LNB drift so the dial reads true downlink frequencies. Shift-click the beacon's trace on the scope to mark it (right-click here: forget the correction)">BEACON</button>
       </div>
       <div class="row">
         <button class="k" id="rit">RIT</button><button class="k" id="xit">XIT</button>
@@ -761,6 +765,19 @@ function renderFilter(st) {
   document.querySelectorAll("#fils .k").forEach((b) => b.classList.toggle("on", +b.dataset.fil === i));
   $("fil-show").textContent = `${Math.round(st.filter[0])} .. ${Math.round(st.filter[1])} Hz`;
 }
+// The QO-100 beacon lock button: shown with the transponder's transverter;
+// amber while it looks for a beacon, green once locked, the correction on it.
+function renderBeacon(st) {
+  const b = $("bcn"), k = st.bcn || {};
+  b.classList.toggle("hidden", !st.bcn_avail);
+  if (!st.bcn_avail) return;
+  b.classList.toggle("on", !!k.on); b.classList.toggle("locked", !!k.locked);
+  const corr = Math.round(k.corr_hz || 0);
+  b.textContent = corr ? `BEACON ${corr > 0 ? "+" : ""}${corr} Hz` : "BEACON";
+  b.title = (k.on ? `QO-100 beacon tracking on: ${k.beacon || "no beacon in the stream"}${k.locked ? ", locked" : ", searching"}` +
+    (k.err_hz != null ? `, last error ${k.err_hz.toFixed(1)} Hz, S/N ${k.snr_db.toFixed(0)} dB` : "") : "QO-100 beacon tracking off") +
+    `; LO correction ${corr} Hz (shift-click the beacon on the scope to mark it; right-click here: forget it)`;
+}
 function buildBands(xvtrs) {
   if (!$("rxbands").childElementCount) {
     $("rxbands").innerHTML = `<span class="note">RX</span>` + RX_BANDS.map(([n, f, m, lo, hi, step]) =>
@@ -771,7 +788,7 @@ function buildBands(xvtrs) {
   const key = JSON.stringify(xvtrs);
   if (S.bandsKey === key) return; S.bandsKey = key;
   $("bands").innerHTML = BANDS.map(([n, f, m]) => `<button class="k" data-f="${f}" data-m="${m}">${n}</button>`).join("") +
-    xvtrs.map((t) => `<button class="k warn" data-f="${Math.round((t.rf_min + Math.min(t.rf_max, t.rf_min + 200e3)) / 2 / 1e3) * 1e3}" data-m="USB" title="Transverter: ${t.rf_min / 1e6} MHz on IF ${(t.inverted ? t.lo_hz - t.rf_min : t.rf_min - t.lo_hz) / 1e6} MHz${t.inverted ? " (LO above)" : ""}">${escapeHtml(t.name)}</button>`).join("");
+    xvtrs.map((t) => `<button class="k warn" data-xvtr="${escapeHtml(t.name)}" data-f="${Math.round((t.rf_min + Math.min(t.rf_max, t.rf_min + 200e3)) / 2 / 1e3) * 1e3}" data-m="USB" title="Transverter: ${t.rf_min / 1e6} MHz on IF ${(t.inverted ? t.lo_hz - t.rf_min : t.rf_min - t.lo_hz) / 1e6} MHz${t.inverted ? " (LO above)" : ""}">${escapeHtml(t.name)}</button>`).join("");
 }
 function setupSettings() {
   $("setbtn").onclick = () => { const m = $("setmenu"); m.classList.toggle("hidden"); if (!m.classList.contains("hidden")) openSettings(); };
@@ -938,8 +955,8 @@ function renderState() {
   $("split").classList.toggle("on", st.split);
   renderFilter(st);
   buildBands(st.xvtrs || []);
-  const bnow = bandOf(curFreq(), st.xvtrs);
-  document.querySelectorAll("#bands .k, #rxbands .k").forEach((b) => b.classList.toggle("on", b.textContent === bnow));
+  const bnow = st.xvtr || bandOf(curFreq(), st.xvtrs);
+  document.querySelectorAll("#bands .k, #rxbands .k").forEach((b) => { b.classList.toggle("on", b.textContent === bnow); b.classList.toggle("out", !!st.xvtr_out && b.textContent === bnow); });
   // An astronomy band out of the board's reach (10 GHz without a transverter) is greyed.
   document.querySelectorAll("#rxbands .k[data-astro]").forEach((b) => { b.disabled = +b.dataset.f < st.freq_min || +b.dataset.f > st.freq_max; });
   for (const k of ["nb", "nr", "notch"]) $(k).classList.toggle("on", !!st[k]);
@@ -949,7 +966,10 @@ function renderState() {
   const ritOn = st.rit && (st.rit[0] || st.xit[0]);
   $("rit-line").classList.toggle("hidden", !ritOn);
   if (ritOn) { $("rit-name").textContent = [st.rit[0] && "RIT", st.xit[0] && "XIT"].filter(Boolean).join("/"); $("rit-show").textContent = (ro >= 0 ? "+" : "") + ro; }
-  $("t-xvtr").classList.toggle("hidden", !st.xvtr); $("t-xvtr").textContent = st.xvtr ? "XVTR " + st.xvtr : "";
+  $("t-xvtr").classList.toggle("hidden", !st.xvtr); $("t-xvtr").classList.toggle("out", !!st.xvtr_out);
+  $("t-xvtr").textContent = st.xvtr ? "XVTR " + st.xvtr + (st.xvtr_out ? " OUTSIDE" : "") : "";
+  $("t-xvtr").title = st.xvtr_out ? "Outside the transverter's RF range (still through it: the band button leaves it)" : "";
+  renderBeacon(st);
   if (document.activeElement !== $("sql")) { $("sql").value = st.squelch === null ? 0 : st.squelch + 140; $("sql-v").textContent = st.squelch === null ? "OFF" : st.squelch + " dB"; }
   $("comp").classList.toggle("on", st.comp !== null);
   if (document.activeElement !== $("micg")) { $("micg").value = Math.round(st.mic_gain * 100); $("micg-v").textContent = $("micg").value + "%"; }
@@ -1243,6 +1263,8 @@ function setupScope() {
       if (S.dragged) return;
       const r = c.getBoundingClientRect();
       const f = freqAtX(e.clientX - r.left, r.width);
+      // Shift-click with the beacon lock on: that trace is the beacon.
+      if (e.shiftKey && S.st && S.st.bcn_avail) { send({ cmd: "beacon", mark_hz: Math.round(f) }); return; }
       // CW: put the clicked signal on the sidetone; SSB: on the carrier.
       const off = S.st && S.st.mode === "CW" ? -700 : 0;
       tuneTo(Math.round((f + off) / 10) * 10);
@@ -1623,6 +1645,10 @@ function buildStatic() {
   buildBands([]);
   $("bands").onclick = $("rxbands").onclick = (e) => {
     const b = e.target.closest("[data-f]"); if (!b || b.disabled) return;
+    // A transverter's button picks it (it then stays in use past its RF
+    // range, shown red); any other band's button drops the one in use.
+    if (b.dataset.xvtr) send({ cmd: "xvtr_select", name: b.dataset.xvtr });
+    else if (S.st && S.st.xvtr) send({ cmd: "xvtr_select", name: null });
     // In ASTRO mode a band only moves the dial, which is the radiometer's
     // centre (a mode change would leave ASTRO); while an observation runs
     // the move waits for the next START.
@@ -1650,7 +1676,7 @@ function buildStatic() {
   setInterval(() => {
     const st = S.st; if (!st) return;
     const f = curFreq();
-    const band = bandOf(f, st.xvtrs);
+    const band = st.xvtr || bandOf(f, st.xvtrs);
     if (band) store.set("band." + band, { f, mode: st.mode });
   }, 3000);
   // A mode comes back with the FIL it was last used with (edited widths included).
@@ -1709,6 +1735,8 @@ function buildStatic() {
     send({ cmd: "rit", on: st.rit[0], hz }); send({ cmd: "xit", on: st.xit[0], hz });
   };
   $("rit").onclick = () => S.st && send({ cmd: "rit", on: !S.st.rit[0], hz: S.st.rit[1] || S.st.xit[1] });
+  $("bcn").onclick = () => S.st && send({ cmd: "beacon", on: !(S.st.bcn && S.st.bcn.on) });
+  $("bcn").oncontextmenu = (e) => { e.preventDefault(); if (confirm("Forget the beacon lock's LO correction?")) send({ cmd: "beacon", reset: true }); };
   $("xit").onclick = () => S.st && send({ cmd: "xit", on: !S.st.xit[0], hz: S.st.xit[1] || S.st.rit[1] });
   $("ritclr").onclick = () => offs(0);
   $("ritv").addEventListener("wheel", (e) => { e.preventDefault(); if (S.st) offs(S.st.rit[1] + (e.deltaY < 0 ? 10 : -10) * (e.shiftKey ? 10 : 1)); }, { passive: false });
