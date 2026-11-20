@@ -26,6 +26,7 @@ mod pi4;
 mod rade;
 mod power;
 mod ptt;
+mod nc;
 mod qo100;
 mod radiometer;
 mod radio;

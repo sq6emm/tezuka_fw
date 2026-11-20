@@ -76,6 +76,13 @@ pub struct Settings {
     /// The QO-100 beacon lock is on (resumes after a restart).
     #[serde(default)]
     pub beacon_lock: bool,
+    /// Two-antenna noise canceller (2R2T): on, taps, step size.
+    #[serde(default)]
+    pub nc_on: bool,
+    #[serde(default = "nc_taps_default")]
+    pub nc_taps: usize,
+    #[serde(default = "nc_mu_default")]
+    pub nc_mu: f32,
     /// Per band (band label, or transverter name): points sorted by reading.
     #[serde(default)]
     pub smeter: std::collections::BTreeMap<String, Vec<CalPoint>>,
@@ -108,6 +115,9 @@ impl Default for Settings {
             xvtr_sel: None,
             xvtr_corr: Default::default(),
             beacon_lock: false,
+            nc_on: false,
+            nc_taps: crate::nc::TAPS_DEFAULT,
+            nc_mu: crate::nc::MU_DEFAULT,
             smeter: Default::default(),
             port: 1,
             ports: Default::default(),
@@ -289,4 +299,12 @@ mod tests {
         // Files from before MUTE AT TX existed mute at TX.
         assert!(serde_json::from_str::<Settings>("{}").unwrap().mute_at_tx);
     }
+}
+
+fn nc_taps_default() -> usize {
+    crate::nc::TAPS_DEFAULT
+}
+
+fn nc_mu_default() -> f32 {
+    crate::nc::MU_DEFAULT
 }

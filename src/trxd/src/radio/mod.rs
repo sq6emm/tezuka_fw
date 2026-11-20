@@ -70,6 +70,15 @@ pub trait RadioControl: Send {
 pub trait RxStream: Send {
     /// Fill `out` completely, blocking until the samples exist.
     fn read(&mut self, out: &mut [Complex32]) -> Result<(), String>;
+    /// Whether a second receiver comes along (AD936x in 2R2T).
+    fn dual(&self) -> bool {
+        false
+    }
+    /// Fill `out` (RX1) and `aux` (RX2, same length) from one buffer.
+    fn read_pair(&mut self, out: &mut [Complex32], aux: &mut [Complex32]) -> Result<(), String> {
+        aux.iter_mut().for_each(|z| *z = Complex32::default());
+        self.read(out)
+    }
 }
 
 pub trait TxStream: Send {

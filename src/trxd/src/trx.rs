@@ -252,6 +252,15 @@ pub struct Trx {
     bcn_row: Option<crate::maia::Row>,
     /// When the lock's correction was last written to settings.
     bcn_saved: Instant,
+    /// Two-antenna noise canceller (crate::nc), made when RX2 arrives.
+    nc: Option<crate::nc::Canceller>,
+    nc_buf: Vec<Complex32>,
+    /// RX2 seen in the stream (2R2T): the NC key is offered.
+    nc_dual: bool,
+    /// The RF frequency the weights were learnt at.
+    nc_center: f64,
+    /// Listen to the noise antenna alone (placing it).
+    nc_listen: bool,
 
     // Receive DSP
     ddc: Ddc,
@@ -551,6 +560,11 @@ impl Trx {
             bcn: None,
             bcn_row: None,
             bcn_saved: Instant::now(),
+            nc: None,
+            nc_buf: Vec::new(),
+            nc_dual: false,
+            nc_center: 0.0,
+            nc_listen: false,
             nb: None,
             notch: None,
             nr: None,
@@ -2636,7 +2650,62 @@ impl Trx {
 
     // ---- The per-block work ----
 
+    /// The noise canceller in front of everything (crate::nc): RX1 cleaned
+    /// with RX2 when on, or RX2 alone to listen to the noise antenna.
     fn receive(&mut self, b: &RxBlock) {
+        let Some(aux) = &b.aux else {
+            self.nc_dual = false;
+            return self.receive_main(b);
+        };
+        self.nc_dual = true;
+        if self.nc_listen {
+            let blk = RxBlock { t0: b.t0, iq: aux.clone(), aux: None };
+            return self.receive_main(&blk);
+        }
+        if !self.settings.nc_on {
+            self.nc = None;
+            return self.receive_main(b);
+        }
+        let (taps, mu) = (self.settings.nc_taps, self.settings.nc_mu);
+        if self.nc.as_ref().is_none_or(|c| c.taps() != taps.clamp(1, crate::nc::TAPS_MAX).div_ceil(4) * 4) {
+            self.nc = Some(crate::nc::Canceller::new(taps, mu));
+            self.nc_center = self.center;
+        }
+        let transmitting = self.tx_on.is_some() || self.rf_live;
+        let center = self.center;
+        let mut buf = std::mem::take(&mut self.nc_buf);
+        buf.clear();
+        buf.extend_from_slice(&b.iq);
+        if let Some(c) = &mut self.nc {
+            // The path difference is per frequency: a retune starts over.
+            if center != self.nc_center {
+                c.reset();
+                self.nc_center = center;
+            }
+            c.set_mu(mu);
+            c.process(&mut buf, aux, !transmitting);
+        }
+        let blk = RxBlock { t0: b.t0, iq: buf, aux: None };
+        self.receive_main(&blk);
+        self.nc_buf = blk.iq;
+    }
+
+    fn nc_json(&self) -> serde_json::Value {
+        let c = self.nc.as_ref();
+        serde_json::json!({
+            "avail": self.nc_dual,
+            "on": self.settings.nc_on,
+            "listen": self.nc_listen,
+            "freeze": c.is_some_and(|c| c.freeze),
+            "taps": self.settings.nc_taps,
+            "mu": self.settings.nc_mu,
+            "depth_db": c.map(|c| (c.depth_db() * 10.0).round() / 10.0),
+            "ref_db": c.map(|c| (c.ref_db() * 10.0).round() / 10.0),
+            "weight_db": c.map(|c| (c.weight_db() * 10.0).round() / 10.0),
+        })
+    }
+
+    fn receive_main(&mut self, b: &RxBlock) {
         // Through an inverting transverter the IF spectrum is mirrored.
         let inverted = self.xvtr.as_ref().is_some_and(|t| t.inverted);
         let mirrored: Vec<Complex32>;
@@ -3344,6 +3413,7 @@ impl Trx {
             },
             "xvtr": self.xvtr.as_ref().map(|t| t.name.clone()),
             "xvtr_out": self.xvtr.as_ref().is_some_and(|t| !t.covers(self.rx_vfo())),
+            "nc": self.nc_json(),
             "bcn_avail": self.bcn_avail(),
             "bcn": self.bcn_json(),
             "xvtrs": self.settings.transverters,
@@ -3843,6 +3913,41 @@ impl Trx {
                     self.bcn_set(on);
                 }
             }
+            "nc" => {
+                // {on}, {freeze}, {listen}, {reset}, {taps}, {mu}
+                let mut save = false;
+                if let Some(on) = m["on"].as_bool() {
+                    self.settings.nc_on = on;
+                    if !on {
+                        self.nc = None;
+                    }
+                    save = true;
+                }
+                if let Some(t) = m["taps"].as_u64() {
+                    self.settings.nc_taps = (t as usize).clamp(1, crate::nc::TAPS_MAX);
+                    save = true;
+                }
+                if let Some(mu) = m["mu"].as_f64().filter(|v| v.is_finite()) {
+                    self.settings.nc_mu = (mu as f32).clamp(crate::nc::MU_MIN, crate::nc::MU_MAX);
+                    save = true;
+                }
+                if let Some(f) = m["freeze"].as_bool() {
+                    if let Some(c) = &mut self.nc {
+                        c.freeze = f;
+                    }
+                }
+                if let Some(l) = m["listen"].as_bool() {
+                    self.nc_listen = l;
+                }
+                if m["reset"].as_bool() == Some(true) {
+                    if let Some(c) = &mut self.nc {
+                        c.reset();
+                    }
+                }
+                if save {
+                    self.settings.save(&self.settings_dir);
+                }
+            }
             "xvtr_select" => {
                 let name = m["name"].as_str().map(str::to_string).filter(|n| self.settings.transverters.iter().any(|t| &t.name == n));
                 if name != self.settings.xvtr_sel {
@@ -4284,7 +4389,7 @@ mod tests {
                     Complex32::new((a * p.cos()) as f32, (a * p.sin()) as f32)
                 })
                 .collect();
-            t.receive(&RxBlock { t0: 0.0, iq });
+            t.receive(&RxBlock { t0: 0.0, iq, aux: None });
             i += t.block;
         }
     }

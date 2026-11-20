@@ -61,6 +61,8 @@ pub struct RxBlock {
     /// UTC (Unix seconds) of `iq[0]`.
     pub t0: f64,
     pub iq: Vec<Complex32>,
+    /// RX2 alongside (2R2T: the noise canceller's reference).
+    pub aux: Option<Vec<Complex32>>,
 }
 
 /// Maps the converter's sample count onto UTC. The sample clock is the
@@ -116,15 +118,21 @@ pub fn spawn_rx(mut rx: Box<dyn RxStream>, rate: f64, block: usize) -> Receiver<
             realtime_thread();
             let mut clock = SampleClock::new(rate);
             let mut dropped = 0u64;
+            let dual = rx.dual();
             loop {
                 let mut iq = vec![Complex32::default(); block];
-                if let Err(e) = rx.read(&mut iq) {
+                let mut aux = dual.then(|| vec![Complex32::default(); block]);
+                let r = match &mut aux {
+                    Some(a) => rx.read_pair(&mut iq, a),
+                    None => rx.read(&mut iq),
+                };
+                if let Err(e) = r {
                     error!("{e}");
                     std::thread::sleep(Duration::from_millis(100));
                     continue;
                 }
                 let t0 = clock.stamp(block, unix_now());
-                match tx.try_send(RxBlock { t0, iq }) {
+                match tx.try_send(RxBlock { t0, iq, aux }) {
                     Ok(()) => {}
                     Err(crossbeam_channel::TrySendError::Full(_)) => {
                         dropped += 1;

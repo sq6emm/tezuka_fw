@@ -97,6 +97,8 @@ header a { color: var(--dim); }
 #bands .k.warn.on.out { background: var(--red); border-color: var(--red); color: #fff; box-shadow: 0 0 12px rgba(255, 80, 80, .7); }
 .tag.out { color: #fff; background: var(--red); border-color: var(--red); }
 #bcn.on.locked { background: var(--green); border-color: var(--green); color: var(--bezel); box-shadow: 0 0 10px rgba(80, 200, 120, .5); }
+#nc.on.weak { background: var(--red); border-color: var(--red); color: var(--bezel); }
+#ncl.on { background: var(--amber); border-color: var(--amber); color: var(--bezel); }
 #bcn.on:not(.locked) { background: var(--amber); border-color: var(--amber); color: var(--bezel); }
 #fentry { flex: 0 0 150px; text-align: right; }
 #fentry.bad { border-color: var(--red); }
@@ -270,6 +272,9 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
     </div>
     <h3>ANTENNA SOCKETS <span class="note">which pair each band (or transverter) is wired to; taken on entering the band. Manual: keep the pair picked by hand</span></h3>
     <div class="row" id="ports-body"></div>
+    <h3>NOISE CANCELLER <span class="note">2R2T only: RX1 the antenna, RX2 a noise antenna near the noise source; taps follow a delay between the two, speed trades tracking for residual</span></h3>
+    <div class="row"><label>taps <select id="set-nctaps"><option>4</option><option>8</option><option>16</option><option>32</option></select></label>
+      <label>speed <select id="set-ncmu"><option value="0.002">slow</option><option value="0.01">normal</option><option value="0.05">fast</option><option value="0.2">very fast</option></select></label></div>
     <h3>RX FRONT-END GAIN <span class="note">dB in front of the socket, per band (LNA +, cable or filter −): the S-meter then shows the level at the LNA's input; 0 = none</span></h3>
     <div class="row" id="fe-body"></div>
     <div class="row"><button class="k" id="set-close">CLOSE</button></div>
@@ -365,6 +370,9 @@ select { background: var(--lcd); color: var(--text); border: 1px solid var(--lcd
       <div class="row voice-only">
         <button class="k" id="nb" title="Noise blanker (impulse noise)">NB</button>
         <button class="k" id="nr" title="Noise reduction">NR</button>
+        <button class="k hidden" id="nc" title="Noise canceller: RX2's noise antenna subtracted from RX1 (AD936x in 2R2T)">NC</button>
+        <button class="k hidden" id="ncf" title="Freeze the canceller's weights (a strong wanted station that also reaches the noise antenna)">FRZ</button>
+        <button class="k hidden" id="ncl" title="Listen to the noise antenna (RX2) alone, to place it">REF</button>
         <button class="k" id="notch" title="Automatic notch (steady tones)">NOTCH</button>
       </div>
       <div class="slider voice-only">SQL<input type="range" id="sql" min="0" max="100" value="0"><b id="sql-v">OFF</b></div>
@@ -767,6 +775,27 @@ function renderFilter(st) {
 }
 // The QO-100 beacon lock button: shown with the transponder's transverter;
 // amber while it looks for a beacon, green once locked, the correction on it.
+function renderNc(st) {
+  const k = st.nc || {}, avail = !!k.avail;
+  for (const id of ["nc", "ncf", "ncl"]) $(id).classList.toggle("hidden", !avail);
+  if (!avail) return;
+  // Weights above +6 dB: the noise antenna hears the noise weaker than RX1
+  // does, and the canceller amplifies RX2's own noise into the output.
+  const weak = !!k.on && k.weight_db != null && k.weight_db > 6;
+  $("nc").classList.toggle("on", !!k.on); $("nc").classList.toggle("weak", weak);
+  $("nc").textContent = k.on && k.depth_db != null ? `NC ${k.depth_db.toFixed(0)} dB${weak ? " !" : ""}` : "NC";
+  $("nc").title = (k.on ? `Noise canceller on: ${k.depth_db != null ? k.depth_db.toFixed(1) : "?"} dB removed, noise antenna ${k.ref_db != null ? k.ref_db.toFixed(1) : "?"} dB against RX1, ${k.taps} taps` : "Noise canceller off") +
+    (weak ? `. WARNING: the noise antenna is too weak (RX2 amplified ${k.weight_db.toFixed(0)} dB): its own noise raises the floor; move it closer to the noise source` : "") +
+    " (RX2's noise antenna subtracted from RX1; right-click: start over)";
+  $("ncf").classList.toggle("on", !!k.freeze); $("ncf").classList.toggle("hidden", !k.on);
+  $("ncl").classList.toggle("on", !!k.listen);
+  const t = $("set-nctaps"), m = $("set-ncmu");
+  if (document.activeElement !== t) t.value = String(k.taps);
+  if (document.activeElement !== m) {
+    const opts = [...m.options].map(o => +o.value);
+    m.value = String(opts.reduce((a, b) => Math.abs(b - k.mu) < Math.abs(a - k.mu) ? b : a, opts[0]));
+  }
+}
 function renderBeacon(st) {
   const b = $("bcn"), k = st.bcn || {};
   b.classList.toggle("hidden", !st.bcn_avail);
@@ -970,6 +999,7 @@ function renderState() {
   $("t-xvtr").textContent = st.xvtr ? "XVTR " + st.xvtr + (st.xvtr_out ? " OUTSIDE" : "") : "";
   $("t-xvtr").title = st.xvtr_out ? "Outside the transverter's RF range (still through it: the band button leaves it)" : "";
   renderBeacon(st);
+  renderNc(st);
   if (document.activeElement !== $("sql")) { $("sql").value = st.squelch === null ? 0 : st.squelch + 140; $("sql-v").textContent = st.squelch === null ? "OFF" : st.squelch + " dB"; }
   $("comp").classList.toggle("on", st.comp !== null);
   if (document.activeElement !== $("micg")) { $("micg").value = Math.round(st.mic_gain * 100); $("micg-v").textContent = $("micg").value + "%"; }
@@ -1735,6 +1765,12 @@ function buildStatic() {
     send({ cmd: "rit", on: st.rit[0], hz }); send({ cmd: "xit", on: st.xit[0], hz });
   };
   $("rit").onclick = () => S.st && send({ cmd: "rit", on: !S.st.rit[0], hz: S.st.rit[1] || S.st.xit[1] });
+  $("nc").onclick = () => S.st && send({ cmd: "nc", on: !(S.st.nc && S.st.nc.on) });
+  $("nc").oncontextmenu = (e) => { e.preventDefault(); send({ cmd: "nc", reset: true }); };
+  $("ncf").onclick = () => S.st && send({ cmd: "nc", freeze: !(S.st.nc && S.st.nc.freeze) });
+  $("ncl").onclick = () => S.st && send({ cmd: "nc", listen: !(S.st.nc && S.st.nc.listen) });
+  $("set-nctaps").onchange = (e) => send({ cmd: "nc", taps: +e.target.value });
+  $("set-ncmu").onchange = (e) => send({ cmd: "nc", mu: +e.target.value });
   $("bcn").onclick = () => S.st && send({ cmd: "beacon", on: !(S.st.bcn && S.st.bcn.on) });
   $("bcn").oncontextmenu = (e) => { e.preventDefault(); if (confirm("Forget the beacon lock's LO correction?")) send({ cmd: "beacon", reset: true }); };
   $("xit").onclick = () => S.st && send({ cmd: "xit", on: !S.st.xit[0], hz: S.st.xit[1] || S.st.rit[1] });

@@ -80,6 +80,10 @@ pub struct IioControl {
     tx_lo: Option<String>,
     gain: Option<(GainMode, f64)>,
     atten: Option<String>,
+    /// The chip runs 2R2T (U-Boot `mode=2r2t`): RX2 gets RX1's gain so
+    /// both receivers stay matched, and TX2 is held at full attenuation
+    /// (its DAC channels carry nothing trxd sends).
+    two_rx: bool,
 }
 
 impl RadioControl for IioControl {
@@ -133,16 +137,19 @@ impl RadioControl for IioControl {
     }
 
     fn set_rx_gain(&mut self, mode: GainMode, db: f64) -> Result<(), String> {
-        write_attr(&self.phy, "in_voltage0_gain_control_mode", mode.iio_name())?;
-        if mode == GainMode::Manual {
-            // The top of the range depends on the frequency (71 dB between
-            // 1.3 and 4 GHz, less above): take the highest the chip accepts.
-            let mut g = db.round();
-            loop {
-                match write_attr(&self.phy, "in_voltage0_hardwaregain", &format!("{g:.0}")) {
-                    Ok(()) => break,
-                    Err(_) if g > db.round() - 16.0 && g > 0.0 => g -= 1.0,
-                    Err(e) => return Err(e),
+        let chans: &[u8] = if self.two_rx { &[0, 1] } else { &[0] };
+        for ch in chans {
+            write_attr(&self.phy, &format!("in_voltage{ch}_gain_control_mode"), mode.iio_name())?;
+            if mode == GainMode::Manual {
+                // The top of the range depends on the frequency (71 dB between
+                // 1.3 and 4 GHz, less above): take the highest the chip accepts.
+                let mut g = db.round();
+                loop {
+                    match write_attr(&self.phy, &format!("in_voltage{ch}_hardwaregain"), &format!("{g:.0}")) {
+                        Ok(()) => break,
+                        Err(_) if g > db.round() - 16.0 && g > 0.0 => g -= 1.0,
+                        Err(e) => return Err(e),
+                    }
                 }
             }
         }
@@ -156,6 +163,7 @@ impl RadioControl for IioControl {
         let v = format!("{:.2}", -q);
         write_attr(&self.phy, "out_voltage0_hardwaregain", &v)?;
         self.atten = Some(v);
+        self.mute_tx2();
         Ok(())
     }
 
@@ -223,6 +231,7 @@ impl RadioControl for IioControl {
         if let Some(v) = self.atten.clone() {
             write_attr(&self.phy, "out_voltage0_hardwaregain", &v)?;
         }
+        self.mute_tx2();
         // Once more after the LO writes, which may power it up again.
         write_attr(&self.phy, "out_altvoltage1_TX_LO_powerdown", if rf { "0" } else { "1" })?;
         self.tx_rf = Some(rf);
@@ -244,6 +253,7 @@ impl RadioControl for IioControl {
             if self.ptt.any() {
                 std::thread::sleep(self.ptt_delay);
             }
+            self.mute_tx2();
             write_attr(&self.phy, "out_altvoltage1_TX_LO_powerdown", "0")?;
         } else {
             self.tx_rf = None;
@@ -284,6 +294,17 @@ impl IioControl {
     fn keep_tx_lo_down(&self) {
         if self.tx_rf != Some(true) {
             let _ = write_attr(&self.phy, "out_altvoltage1_TX_LO_powerdown", "1");
+        }
+    }
+
+    /// 2R2T: TX2 shares the TX LO with TX1, so it would radiate whatever
+    /// its DAC channels hold whenever TX1 keys. Full attenuation, re-written
+    /// before every key-down (a re-initialisation restores the default).
+    fn mute_tx2(&self) {
+        if self.two_rx {
+            if let Err(e) = write_attr(&self.phy, "out_voltage1_hardwaregain", "-89.75") {
+                warn!("TX2 attenuation: {e}");
+            }
         }
     }
 
@@ -354,10 +375,51 @@ fn set_fpga_filters(on: bool) -> Result<(), String> {
 pub struct IioRx {
     dev: File,
     raw: Vec<i16>,
+    /// 2R2T: four lanes per sample (RX1 I/Q, RX2 I/Q).
+    two: bool,
+    scratch: Vec<Complex32>,
+}
+
+impl IioRx {
+    fn read_lanes(&mut self, n: usize) -> Result<(), String> {
+        let lanes = if self.two { 4 } else { 2 };
+        let want = n * lanes;
+        if self.raw.len() != want {
+            self.raw.resize(want, 0);
+        }
+        // SAFETY: viewing an i16 buffer as its bytes; u8 has no alignment
+        // requirement and the length is exactly the buffer's size in bytes.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(self.raw.as_mut_ptr().cast::<u8>(), want * 2) };
+        self.dev.read_exact(bytes).map_err(|e| format!("RX read: {e}"))
+    }
 }
 
 impl RxStream for IioRx {
+    fn dual(&self) -> bool {
+        self.two
+    }
+
+    fn read_pair(&mut self, out: &mut [Complex32], aux: &mut [Complex32]) -> Result<(), String> {
+        if !self.two {
+            aux.iter_mut().for_each(|z| *z = Complex32::default());
+            return self.read(out);
+        }
+        self.read_lanes(out.len())?;
+        for ((z, a), s) in out.iter_mut().zip(aux.iter_mut()).zip(self.raw.chunks_exact(4)) {
+            *z = Complex32::new(i16::from_le(s[0]) as f32 * RX_SCALE, i16::from_le(s[1]) as f32 * RX_SCALE);
+            *a = Complex32::new(i16::from_le(s[2]) as f32 * RX_SCALE, i16::from_le(s[3]) as f32 * RX_SCALE);
+        }
+        Ok(())
+    }
+
     fn read(&mut self, out: &mut [Complex32]) -> Result<(), String> {
+        if self.two {
+            let mut aux = std::mem::take(&mut self.scratch);
+            aux.resize(out.len(), Complex32::default());
+            let r = self.read_pair(out, &mut aux);
+            self.scratch = aux;
+            return r;
+        }
         let want = out.len() * 2;
         if self.raw.len() != want {
             self.raw.resize(want, 0);
@@ -430,7 +492,14 @@ pub fn open(cfg: &RadioConfig) -> Result<Radio, String> {
         }
     }
 
-    start_buffer(&rx_dev, "in_voltage", &[0, 1], cfg.buffer_samples)?;
+    // 2R2T: both receivers in the one buffer (RX2 for the noise canceller).
+    let two_rx_buf = phy
+        .file_name()
+        .map(|n| Path::new(&cfg.debugfs_root).join(n))
+        .and_then(|d| read_attr(&d, "adi,2rx-2tx-mode-enable").ok())
+        .is_some_and(|v| v == "1")
+        && rx_dev.join("scan_elements/in_voltage3_en").exists();
+    start_buffer(&rx_dev, "in_voltage", if two_rx_buf { &[0, 1, 2, 3] } else { &[0, 1] }, cfg.buffer_samples)?;
     start_buffer(&tx_dev, "out_voltage", &[0, 1], cfg.buffer_samples)?;
     let rx = File::open(char_dev(dev_root, &rx_dev)).map_err(|e| format!("RX buffer: {e}"))?;
     let tx = OpenOptions::new()
@@ -462,6 +531,10 @@ pub fn open(cfg: &RadioConfig) -> Result<Radio, String> {
     if ptt.gpo.is_some() {
         info!("PTT on the AD9361 GPOs: GPO0 keys, GPO1 inhibit released");
     }
+    let two_rx = phy_debug
+        .as_ref()
+        .and_then(|d| read_attr(d, "adi,2rx-2tx-mode-enable").ok())
+        .is_some_and(|v| v == "1");
     // Port switching needs 1R1T and the driver's debugfs knobs.
     let debug = phy_debug
         .filter(|d| d.join("adi,1rx-1tx-mode-use-rx-num").exists())
@@ -472,6 +545,9 @@ pub fn open(cfg: &RadioConfig) -> Result<Radio, String> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
     let switchable = debug.is_some();
+    if two_rx {
+        info!("AD936x in 2R2T: RX2 follows RX1's gain, TX2 held at full attenuation");
+    }
     info!(phy = %phy.display(), rate = cfg.stream_rate(), port, switchable, "AD936x ready");
     Ok(Radio {
         control: Box::new(IioControl {
@@ -489,8 +565,9 @@ pub fn open(cfg: &RadioConfig) -> Result<Radio, String> {
             tx_lo: None,
             gain: None,
             atten: None,
+            two_rx,
         }),
-        rx: Box::new(IioRx { dev: rx, raw: Vec::new() }),
+        rx: Box::new(IioRx { dev: rx, raw: Vec::new(), two: two_rx_buf, scratch: Vec::new() }),
         tx: Box::new(IioTx { dev: tx, raw: Vec::new() }),
     })
 }
@@ -573,6 +650,34 @@ mod tests {
         assert_eq!(w(1), (-0.8 * TX_SCALE) as i16);
         assert_eq!(w(2), (std::f32::consts::FRAC_1_SQRT_2 * TX_SCALE) as i16);
         assert_eq!(w(3), (-std::f32::consts::FRAC_1_SQRT_2 * TX_SCALE) as i16);
+    }
+
+    #[test]
+    fn two_rx_matches_the_receivers_and_mutes_tx2() {
+        let (t, mut cfg) = fake_tree();
+        let dbg = t.path().join("debug/iio:device0");
+        fs::create_dir_all(&dbg).unwrap();
+        for (a, v) in [("adi,1rx-1tx-mode-use-rx-num", "1"), ("adi,1rx-1tx-mode-use-tx-num", "1"), ("adi,2rx-2tx-mode-enable", "1")] {
+            fs::write(dbg.join(a), v).unwrap();
+        }
+        cfg.debugfs_root = t.path().join("debug").to_string_lossy().into();
+        let mut radio = open(&cfg).unwrap();
+        // 2R2T: no 1R1T socket switching.
+        assert_eq!(radio.control.port(), None);
+        radio.control.set_rx_gain(GainMode::Manual, 40.0).unwrap();
+        radio.control.set_tx_attenuation(10.0).unwrap();
+        let phy = t.path().join("sys/iio:device0");
+        let rd = |a: &str| fs::read_to_string(phy.join(a)).unwrap();
+        assert_eq!(rd("in_voltage0_hardwaregain"), "40");
+        assert_eq!(rd("in_voltage1_hardwaregain"), "40");
+        assert_eq!(rd("in_voltage1_gain_control_mode"), rd("in_voltage0_gain_control_mode"));
+        assert_eq!(rd("out_voltage0_hardwaregain"), "-10.00");
+        assert_eq!(rd("out_voltage1_hardwaregain"), "-89.75");
+        // A re-initialisation would restore TX2's default: keying writes it again.
+        fs::write(phy.join("out_voltage1_hardwaregain"), "-10.00").unwrap();
+        radio.control.set_tx_rf(true).unwrap();
+        assert_eq!(rd("out_voltage1_hardwaregain"), "-89.75");
+        radio.control.set_tx_rf(false).unwrap();
     }
 
     #[test]
